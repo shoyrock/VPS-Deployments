@@ -91,7 +91,12 @@ TOOL_DESCRIPTIONS[11]="CapRover — Free self-hostable Heroku alternative (Docke
 TOOL_PORTS[11]="80, 443, 3000, 2377, 7946, 4789 (Swarm)"
 TOOL_CATEGORIES[11]="PaaS / App Platform"
 
-readonly TOOL_COUNT=11
+TOOL_NAMES[12]="harden"
+TOOL_DESCRIPTIONS[12]="🔒 Harden VPS — SSH lockdown, CrowdSec, GeoIP block, auto-updates"
+TOOL_PORTS[12]="—"
+TOOL_CATEGORIES[12]="Security"
+
+readonly TOOL_COUNT=12
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COLORS & UI
@@ -142,6 +147,25 @@ print_tool_detail() {
 # ═══════════════════════════════════════════════════════════════════════════════
 run_tool() {
   local name=$1
+
+  # Special case: harden.sh
+  if [[ "$name" == "harden" ]]; then
+    local hscript="${SCRIPT_DIR}/harden.sh"
+    if [[ -f "$hscript" ]]; then
+      printf "${C_GRN}✔${C_R} Found ${C_B}harden.sh${C_R} locally.\n"
+    else
+      printf "${C_CYN}▶ Downloading harden.sh...${C_R}\n"
+      curl -fsSL -o "$hscript" "${GITHUB_REPO}/harden.sh" 2>/dev/null || { printf "${C_RED}✖ Download failed${C_R}\n"; return 1; }
+      chmod +x "$hscript"
+    fi
+    printf "${C_YEL}⚠${C_R} This will harden SSH, kernel, firewall, install CrowdSec + AIDE,\n"
+    printf "   enable auto-updates, lockdown NPM admin, and configure GeoIP blocking.\n"
+    read -rp "Proceed? [y/N]: " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || { printf "Aborted.\n"; return 1; }
+    printf "\n${C_CYN}▶ Starting system hardening...${C_R}\n\n"
+    exec sudo bash "$hscript"
+  fi
+
   local script="${SCRIPT_DIR}/deploy-${name}.sh"
 
   # Check if script exists locally
@@ -199,6 +223,7 @@ if [[ $# -gt 0 ]]; then
     yunohost|ynh)                     requested="yunohost" ;;
     freedombox|fbx)                   requested="freedombox" ;;
     caprover)                         requested="caprover" ;;
+    harden|security|lockdown)          requested="harden" ;;
     *)
       printf "${C_RED}Unknown tool: ${requested}${C_R}\n"
       printf "Run ${C_B}./deploy.sh${C_R} without arguments for the interactive menu.\n"

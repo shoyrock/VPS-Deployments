@@ -32,6 +32,7 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script incl
 | 9 | `deploy-caprover.sh` | NPM + CapRover | 81 | CapRover's nginx stays on 80/443 |
 | 10 | `deploy-yunohost.sh` | NPM + YunoHost | 81 | YunoHost's nginx stays on 80/443 (Debian 12) |
 | 11 | `deploy-freedombox.sh` | NPM + FreedomBox | 81 | FreedomBox's Apache stays on 80/443 (Debian 12) |
+| 🔒 | **`harden.sh`** | **Full system hardening** | — | Run after deployment — see below |
 
 **Tools with NPM on 80/443/81 (primary proxy)**: Portainer, Dockge, Coolify, Dokploy, CasaOS, Runtipi, Cosmos — their built-in proxies are disabled/reconfigured so NPM handles all HTTP/S traffic.
 
@@ -41,15 +42,30 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script incl
 
 ## How to Use
 
-### Option 1: Unified Menu (Recommended)
+### Option 1: Two-Step Deploy (Recommended)
 
+**Step 1: Deploy your tool**
 ```bash
 curl -fsSL -o deploy.sh https://raw.githubusercontent.com/shoyrock/VPS-Deployments/main/deploy.sh
 chmod +x deploy.sh
-./deploy.sh              # Interactive menu — pick a number
-./deploy.sh portainer    # Direct deploy, skip menu
-./deploy.sh dockge       # Direct deploy
-./deploy.sh coolify      # Direct deploy
+./deploy.sh              # Pick your tool from the menu
+```
+
+Set up your apps in NPM. Get everything working.
+
+**Step 2: Harden (after everything is set up)**
+```bash
+./deploy.sh harden       # Or: ./deploy.sh → pick "🔒 Harden VPS"
+```
+
+**Do NOT run `harden.sh` before deploying.** It locks down port 81 and you won't be able to access the NPM admin UI from the internet to set up your proxy hosts.
+
+### Direct Deploy (skip menu)
+
+```bash
+./deploy.sh portainer    # Deploy Portainer
+./deploy.sh dockge       # Deploy Dockge
+./deploy.sh coolify      # Deploy Coolify
 ```
 
 ### Option 2: Individual Scripts
@@ -85,6 +101,34 @@ INTERNET ──► UFW/Firewalld ──► NPM (80/443/81 or 81 only) ──► 
 - `npm-auth` — NPM login brute force
 - `npm-forceful-browsing` — Bot/scanner detection (custom filter for NPM's log format)
 - `npm-botsearch` — Admin panel enumeration detection
+
+---
+
+## Security Hardening (`harden.sh`)
+
+After deploying any tool, run the hardening script to lock down the VPS. This is **standalone** — no third-party accounts, no Cloudflare, no paid services.
+
+```bash
+./deploy.sh harden          # Via unified menu
+./deploy.sh                 # Pick option 12 (Harden VPS)
+```
+
+### What It Does (all automatic)
+
+| Layer | What | Tool |
+|-------|------|------|
+| **SSH Lockdown** | Disable root login, key-only auth, protocol 2, connection timeouts | OpenSSH config |
+| **Kernel Hardening** | SYN cookies, RP filter, no source routing, ASLR, no ICMP redirects | sysctl |
+| **Firewall Rate Limit** | Throttle connections per IP on 22/80/443 | UFW / firewalld |
+| **GeoIP Block** | Auto-block CN, RU, KP, IR via free ipdeny.com lists | iptables + cron |
+| **Intrusion Detection** | Behavior-based local IDS, SSH + NPM monitoring | CrowdSec (local mode) |
+| **File Integrity** | Daily scan of /bin, /sbin, /usr, /etc for unauthorized changes | AIDE |
+| **Auto Updates** | Security patches only, 24h delay, auto-reboot in maintenance window | unattended-upgrades |
+| **NPM Admin Lockdown** | Port 81 bound to 127.0.0.1 only (access via SSH tunnel) | docker-compose |
+| **Docker Security** | Log rotation (10m/3 files), live-restore, userland-proxy off | daemon.json |
+| **Daily Backups** | /opt + /etc archived to /backups, 7-day retention | tar + cron |
+
+All config changes are backed up with `.harden-backup-<timestamp>` suffix before modification.
 
 ### How Built-in Proxies Are Handled
 
@@ -147,6 +191,7 @@ sudo ufw delete allow 81/tcp && sudo ufw reload
 ```
 .
 ├── deploy.sh                  ← Unified menu (run this)
+├── harden.sh                  ← 🔒 Security hardening (run after deploy)
 ├── deploy-portainer.sh        ← NPM + Portainer
 ├── deploy-dockge.sh           ← NPM + Dockge
 ├── deploy-coolify.sh          ← NPM + Coolify (Traefik disabled)
