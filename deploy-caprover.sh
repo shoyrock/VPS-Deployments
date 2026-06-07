@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Auto-elevate to root if not already running as root
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    exec sudo bash "$0" "$@"
+fi
 # deploy-caprover.sh — Hardened VPS Deployment (Docker Swarm + CapRover + NPM + Fail2Ban)
 # v2.0.0-caprover | Usage: chmod +x deploy-caprover.sh && sudo ./deploy-caprover.sh
 #

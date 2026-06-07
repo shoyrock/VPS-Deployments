@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Auto-elevate to root if not already running as root
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    exec sudo bash "$0" "$@"
+fi
 # deploy-coolify.sh — Docker + NPM + Coolify + Fail2Ban (v2.0.0-coolify)
 # Idempotent VPS deployment. Usage: sudo ./deploy-coolify.sh
 # NPM owns ports 80/443. Coolify UI on 8000, proxied through NPM.

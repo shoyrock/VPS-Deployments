@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Auto-elevate to root if not already running as root
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    exec sudo bash "$0" "$@"
+fi
 # deploy-casaos.sh — Docker + NPM + CasaOS + Fail2Ban
 # v2.0.0-casaos | Usage: sudo ./deploy-casaos.sh
 set -euo pipefail

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Auto-elevate to root if not already running as root
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    exec sudo bash "$0" "$@"
+fi
 # deploy-runtipi.sh — Docker + NPM + Runtipi + Fail2Ban
 # v2.0.0-runtipi | Usage: sudo ./deploy-runtipi.sh
 set -euo pipefail

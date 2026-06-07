@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Auto-elevate to root if not already running as root
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    exec sudo bash "$0" "$@"
+fi
 # deploy-portainer.sh — Docker + NPM + Portainer + Fail2Ban (v2.0.0-portainer)
 # Idempotent VPS deployment. Usage: sudo ./deploy-portainer.sh
 set -euo pipefail

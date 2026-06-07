@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Auto-elevate to root if not already running as root
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    exec sudo bash "$0" "$@"
+fi
 # ═══════════════════════════════════════════════════════════════════════════════
 # deploy.sh — Unified VPS Deployment Menu
 # v1.0.0 | Usage: ./deploy.sh [optional-tool-name]
@@ -174,30 +178,27 @@ run_tool() {
   url="${GITHUB_REPO}/${script_name}"
   tmp_script="/tmp/${script_name}.new"
 
-  # Always try to download the latest version first
-  printf "${C_CYN}▶ Checking for latest ${script_name}...${C_R}\n"
+  # Always download latest from GitHub — GitHub version wins over local
+  printf "${C_CYN}> Downloading latest ${script_name}...${C_R}\n"
   if curl -fsSL -o "$tmp_script" "$url" 2>/dev/null; then
     chmod +x "$tmp_script"
-    # Compare with local copy (if exists)
     if [[ -f "$local_script" ]] && diff -q "$tmp_script" "$local_script" >/dev/null 2>&1; then
-      printf "${C_GRN}✔${C_R} ${script_name} is up to date.\n"
+      printf "${C_GRN}+${C_R} ${script_name} is up to date\n"
       rm -f "$tmp_script"
-      _run_script "$local_script"
     else
-      [[ -f "$local_script" ]] && printf "${C_YEL}⚠${C_R} Newer version found — updating ${script_name}\n"
-      [[ ! -f "$local_script" ]] && printf "${C_GRN}✔${C_R} Downloaded ${script_name}\n"
+      [[ -f "$local_script" ]] && printf "${C_YEL}!${C_R} Updating ${script_name} from GitHub\n"
+      [[ ! -f "$local_script" ]] && printf "${C_GRN}+${C_R} Downloaded ${script_name}\n"
       mv -f "$tmp_script" "$local_script" 2>/dev/null || { cp -f "$tmp_script" "$local_script" && rm -f "$tmp_script"; }
-      _run_script "$local_script"
     fi
+    _run_script "$local_script"
   else
-    # Download failed — fall back to local copy
-    printf "${C_RED}✖${C_R} Could not download latest ${script_name} from GitHub.\n"
+    # GitHub unreachable — fall back to local copy
+    printf "${C_RED}x${C_R} Could not download ${script_name} from GitHub\n"
     if [[ -f "$local_script" ]]; then
-      printf "${C_YEL}⚠${C_R} Using local copy (may be outdated).\n"
+      printf "${C_YEL}!${C_R} Using local ${script_name} (may be outdated)\n"
       _run_script "$local_script"
     else
-      printf "${C_RED}✖${C_R} ${script_name} not found locally either.\n"
-      printf "  ${C_DIM}Check internet connection and GitHub URL:${C_R} ${url}\n"
+      printf "${C_RED}x${C_R} ${script_name} not found locally or on GitHub\n"
       return 1
     fi
   fi

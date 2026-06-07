@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Auto-elevate to root if not already running as root
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    exec sudo bash "$0" "$@"
+fi
 # deploy-freedombox.sh — Hardened VPS Deployment for FreedomBox + NPM
 # v2.1.0-freedombox | Usage: chmod +x deploy-freedombox.sh && sudo ./deploy-freedombox.sh
 #

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Auto-elevate to root if not already running as root
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    exec sudo bash "$0" "$@"
+fi
 # deploy-dockge.sh — Docker + NPM + Dockge + Fail2Ban (v2.0.0-dockge)
 # Idempotent VPS deployment. Usage: sudo ./deploy-dockge.sh
 set -euo pipefail

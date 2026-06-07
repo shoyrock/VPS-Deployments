@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Auto-elevate to root if not already running as root
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    exec sudo bash "$0" "$@"
+fi
 # deploy-dokploy.sh — Hardened VPS Deployment (Docker + NPM + Dokploy + Portainer + Fail2Ban)
 # v2.0.0-dokploy | Usage: chmod +x deploy-dokploy.sh && sudo ./deploy-dokploy.sh
 #

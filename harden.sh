@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Auto-elevate to root if not already running as root
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    exec sudo bash "$0" "$@"
+fi
 # VPS Security Hardening Script — standalone, idempotent, Debian + RHEL
 # No third-party accounts, no Cloudflare, no registration required
 set -euo pipefail

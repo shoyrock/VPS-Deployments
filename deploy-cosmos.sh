@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Auto-elevate to root if not already running as root
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    exec sudo bash "$0" "$@"
+fi
 # deploy-cosmos.sh — Docker + NPM + Cosmos + Fail2Ban
 # v2.0.0-cosmos | Usage: sudo ./deploy-cosmos.sh
 set -euo pipefail

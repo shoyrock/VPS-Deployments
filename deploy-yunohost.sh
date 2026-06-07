@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Auto-elevate to root if not already running as root
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    exec sudo bash "$0" "$@"
+fi
 # deploy-yunohost.sh — Hardened VPS Deployment for YunoHost + NPM
 # v2.1.0-yunohost | Usage: chmod +x deploy-yunohost.sh && sudo ./deploy-yunohost.sh
 #

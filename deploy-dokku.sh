@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Auto-elevate to root if not already running as root
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    exec sudo bash "$0" "$@"
+fi
 # deploy-dokku.sh — Hardened VPS Deployment (Dokku + NPM + Docker + Fail2Ban)
 # v2.0.0-dokku | Usage: chmod +x deploy-dokku.sh && sudo ./deploy-dokku.sh
 #
