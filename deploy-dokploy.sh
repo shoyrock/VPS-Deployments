@@ -31,7 +31,7 @@ fi
 
 # Logging utilities
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
-_log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}" >> "$LOG_FILE"; }
+_log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}" >> "$LOG_FILE" 2>/dev/null || true; }
 info()    { printf "${C_BLU}i${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
 warn()    { printf "${C_YEL}!${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
 error()   { printf "${C_RED}x${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }

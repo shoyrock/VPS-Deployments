@@ -3,7 +3,7 @@
 # v2.0.0-caprover | Usage: chmod +x deploy-caprover.sh && sudo ./deploy-caprover.sh
 #
 # One-shot, idempotent deployment. Installs Docker CE, initializes Swarm, deploys
-# CapRover (80/443), NPM (port 81 supplementary), Fail2Ban, and firewall.
+# CapRover (UI on 3000, proxied through NPM), NPM (80/443/81), Fail2Ban, and firewall.
 # Post-setup: caprover serversetup from your local machine.
 # Supports: Ubuntu 20.04+, Debian 11+, Rocky/Alma 8/9, Fedora 35+, CentOS 7/8,
 #           Oracle Linux, Amazon Linux 2023
@@ -29,7 +29,7 @@ fi
 
 # Logging utilities
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
-_log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}" >> "$LOG_FILE"; }
+_log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}" >> "$LOG_FILE" 2>/dev/null || true; }
 info()    { printf "${C_BLU}i${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
 warn()    { printf "${C_YEL}!${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
 error()   { printf "${C_RED}x${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }
@@ -220,7 +220,10 @@ services:
     image: 'jc21/nginx-proxy-manager:latest'
     restart: always
     container_name: npm
+    hostname: npm
     ports:
+      - '0.0.0.0:80:80'
+      - '0.0.0.0:443:443'
       - '0.0.0.0:81:81'
     volumes:
       - ./data:/data
@@ -293,14 +296,10 @@ setup_caprover() {
   docker rm -f caprover 2>/dev/null || true
 
   info "Deploying CapRover..."
+  # CapRover does NOT get 80/443 — NPM owns those. Port 3000 is exposed for the
+  # initial CLI setup (caprover serversetup). After setup, access via NPM proxy.
   docker run -d \
-    -p 80:80 \
-    -p 443:443 \
     -p 3000:3000 \
-    -p 996:996 \
-    -p 7946:7946 \
-    -p 4789:4789 \
-    -p 2377:2377 \
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v /captain:/captain \
     --name caprover \
@@ -481,12 +480,12 @@ setup_firewall_debian() {
 
   local ssh_port; ssh_port=$(ss -tlnp 2>/dev/null | grep -m1 ':22 ' | awk '{print $4}' | cut -d: -f2 || echo "22")
   ufw allow "${ssh_port:-22}/tcp" comment 'SSH'
-  ufw allow 80/tcp comment 'HTTP (CapRover)'
-  ufw allow 443/tcp comment 'HTTPS (CapRover)'
+  ufw allow 80/tcp comment 'HTTP (NPM)'
+  ufw allow 443/tcp comment 'HTTPS (NPM)'
   ufw allow 81/tcp comment 'NPM Admin (restrict after setup)'
 
-  # CapRover + Docker Swarm overlay ports
-  ufw allow 3000/tcp comment 'CapRover Setup UI'
+  # CapRover UI + Docker Swarm overlay ports
+  ufw allow 3000/tcp comment 'CapRover Setup UI (direct access)'
   ufw allow 2377/tcp comment 'Docker Swarm RAFT'
   ufw allow 7946/tcp comment 'Docker Swarm Gossip TCP'
   ufw allow 7946/udp comment 'Docker Swarm Gossip UDP'
@@ -556,14 +555,15 @@ ${C_B}Duration:${C_R} $(( elapsed / 60 ))m $(( elapsed % 60 ))s
 ${C_B}${C_CYN}-- SERVICES --${C_R}
 
   ${C_B}CapRover${C_R}
-    Setup UI:  http://${ip}:3000
-    HTTP:      http://${ip}:80
-    HTTPS:     https://${ip}:443
+    Setup UI:  http://${ip}:3000  (direct, for initial CLI setup only)
+    Proxied:   Via NPM (add proxy host → http://caprover:3000)
     Data:      /captain
     Default:   captain42
 
-  ${C_B}Nginx Proxy Manager${C_R} (supplementary on port 81)
+  ${C_B}Nginx Proxy Manager${C_R}  ${C_GRN}(MAIN PROXY)${C_R}
     Admin UI:  http://${ip}:81
+    HTTP:      http://${ip}:80
+    HTTPS:     https://${ip}:443
     Data:      ${NPM_DATA_DIR}
     SSL certs: ${NPM_LE_DIR}
     Logs:      ${NPM_LOGS_DIR}
@@ -582,17 +582,19 @@ ${C_B}${C_CYN}-- SERVICES --${C_R}
 
 ${C_B}${C_YEL}-- INITIAL SETUP --${C_R}
 
-  1. ${C_B}CapRover Setup:${C_R} Open http://${ip}:3000
-     Default password: captain42
-     ${C_RED}-> Change password immediately.${C_R}
-
-  2. ${C_B}CapRover CLI (from local machine):${C_R}
+  1. ${C_B}CapRover Setup:${C_R} From your LOCAL machine:
      npm install -g caprover && caprover serversetup
+     → Use http://${ip}:3000 as the CapRover server URL during setup
+     → After serversetup, access via https://captain.yourdomain.com (through NPM)
 
-  3. ${C_B}NPM Admin:${C_R}      Open http://${ip}:81  (admin@example.com / changeme)
+  2. ${C_B}NPM Admin:${C_R}      Open http://${ip}:81  (admin@example.com / changeme)
      ${C_RED}-> Change password immediately.${C_R}
 
-  4. ${C_B}Secure ports:${C_R}
+  3. ${C_B}Proxy Hosts:${C_R}    In NPM, add:
+     - captain.your-domain.com → http://caprover:3000
+     - *.your-domain.com → (for CapRover-deployed apps, if needed)
+
+  4. ${C_B}Secure ports:${C_R}   After setup, restrict direct access:
 $(if [[ "$OS_FAMILY" == "debian" ]]; then
   cat << 'UFWCMD'
      ufw delete allow 3000/tcp && ufw delete allow 81/tcp && ufw reload
