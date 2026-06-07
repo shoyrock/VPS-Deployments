@@ -90,17 +90,12 @@ TOOL_DESCRIPTIONS[10]="FreedomBox — Debian home server with Cockpit admin"
 TOOL_PORTS[10]="80, 443, 9090 (Cockpit) (Debian 12 only)"
 TOOL_CATEGORIES[10]="Debian Server Distro"
 
-TOOL_NAMES[11]="caprover"
-TOOL_DESCRIPTIONS[11]="CapRover — Free self-hostable Heroku alternative (Docker Swarm)"
-TOOL_PORTS[11]="80, 443, 3000, 2377, 7946, 4789 (Swarm)"
-TOOL_CATEGORIES[11]="PaaS / App Platform"
+TOOL_NAMES[11]="harden"
+TOOL_DESCRIPTIONS[11]="🔒 Harden VPS — SSH lockdown, CrowdSec, GeoIP block, auto-updates"
+TOOL_PORTS[11]="—"
+TOOL_CATEGORIES[11]="Security"
 
-TOOL_NAMES[12]="harden"
-TOOL_DESCRIPTIONS[12]="🔒 Harden VPS — SSH lockdown, CrowdSec, GeoIP block, auto-updates"
-TOOL_PORTS[12]="—"
-TOOL_CATEGORIES[12]="Security"
-
-readonly TOOL_COUNT=12
+readonly TOOL_COUNT=11
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COLORS & UI
@@ -221,8 +216,7 @@ if [[ $# -gt 0 ]]; then
     cosmos)                           requested="cosmos" ;;
     yunohost|ynh)                     requested="yunohost" ;;
     freedombox|fbx)                   requested="freedombox" ;;
-    caprover)                         requested="caprover" ;;
-    harden|security|lockdown)          requested="harden" ;;
+    harden|security|lockdown)         requested="harden" ;;
     *)
       printf "${C_RED}Unknown tool: ${requested}${C_R}\n"
       printf "Run ${C_B}./deploy.sh${C_R} without arguments for the interactive menu.\n"
