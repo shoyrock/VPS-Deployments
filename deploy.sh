@@ -143,63 +143,61 @@ print_tool_detail() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# EXECUTION
+# EXECUTION — always fetches latest from GitHub, falls back to local
 # ═══════════════════════════════════════════════════════════════════════════════
+_run_script() {
+  local script_path=$1
+  local script_name=$(basename "$script_path")
+  printf "${C_YEL}⚠${C_R} This will install/configure services. Existing containers may be ${C_RED}DESTROYED${C_R}.\n"
+  read -rp "Proceed? [y/N]: " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { printf "Aborted.\n"; return 1; }
+  printf "\n${C_CYN}▶ Starting ${script_name}...${C_R}\n\n"
+  exec sudo bash "$script_path"
+}
+
 run_tool() {
   local name=$1
+  local script_name=""
+  local url=""
+  local local_script=""
+  local tmp_script=""
 
-  # Special case: harden.sh
+  # Determine script name
   if [[ "$name" == "harden" ]]; then
-    local hscript="${SCRIPT_DIR}/harden.sh"
-    if [[ -f "$hscript" ]]; then
-      printf "${C_GRN}✔${C_R} Found ${C_B}harden.sh${C_R} locally.\n"
+    script_name="harden.sh"
+    local_script="${SCRIPT_DIR}/harden.sh"
+  else
+    script_name="deploy-${name}.sh"
+    local_script="${SCRIPT_DIR}/deploy-${name}.sh"
+  fi
+
+  url="${GITHUB_REPO}/${script_name}"
+  tmp_script="/tmp/${script_name}.new"
+
+  # Always try to download the latest version first
+  printf "${C_CYN}▶ Checking for latest ${script_name}...${C_R}\n"
+  if curl -fsSL -o "$tmp_script" "$url" 2>/dev/null; then
+    chmod +x "$tmp_script"
+    # Compare with local copy (if exists)
+    if [[ -f "$local_script" ]] && diff -q "$tmp_script" "$local_script" >/dev/null 2>&1; then
+      printf "${C_GRN}✔${C_R} ${script_name} is up to date.\n"
+      rm -f "$tmp_script"
+      _run_script "$local_script"
     else
-      printf "${C_CYN}▶ Downloading harden.sh...${C_R}\n"
-      curl -fsSL -o "$hscript" "${GITHUB_REPO}/harden.sh" 2>/dev/null || { printf "${C_RED}✖ Download failed${C_R}\n"; return 1; }
-      chmod +x "$hscript"
+      [[ -f "$local_script" ]] && printf "${C_YEL}⚠${C_R} Newer version found — updating ${script_name}\n"
+      [[ ! -f "$local_script" ]] && printf "${C_GRN}✔${C_R} Downloaded ${script_name}\n"
+      mv -f "$tmp_script" "$local_script" 2>/dev/null || { cp -f "$tmp_script" "$local_script" && rm -f "$tmp_script"; }
+      _run_script "$local_script"
     fi
-    printf "${C_YEL}⚠${C_R} This will harden SSH, kernel, firewall, install CrowdSec + AIDE,\n"
-    printf "   enable auto-updates, lockdown NPM admin, and configure GeoIP blocking.\n"
-    read -rp "Proceed? [y/N]: " confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || { printf "Aborted.\n"; return 1; }
-    printf "\n${C_CYN}▶ Starting system hardening...${C_R}\n\n"
-    exec sudo bash "$hscript"
-  fi
-
-  local script="${SCRIPT_DIR}/deploy-${name}.sh"
-
-  # Check if script exists locally
-  if [[ -f "$script" ]]; then
-    printf "${C_GRN}✔${C_R} Found ${C_B}deploy-${name}.sh${C_R} locally.\n"
-    printf "${C_YEL}⚠${C_R} This will install Docker (if needed), ${name}, Fail2Ban, and firewall rules.\n"
-    printf "${C_YEL}⚠${C_R} Existing Docker containers and data will be ${C_RED}DESTROYED${C_R}.\n"
-    read -rp "Proceed? [y/N]: " confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || { printf "Aborted.\n"; return 1; }
-    printf "\n${C_CYN}▶ Starting deployment of ${name}...${C_R}\n\n"
-    exec sudo bash "$script"
-  fi
-
-  # Not found locally — offer to download
-  printf "${C_YEL}⚠${C_R} deploy-${name}.sh not found in ${SCRIPT_DIR}\n"
-  printf "  ${C_DIM}Would you like to download it from GitHub?${C_R}\n"
-  read -rp "Download and run? [y/N]: " confirm
-  if [[ "$confirm" =~ ^[Yy]$ ]]; then
-    local url="${GITHUB_REPO}/deploy-${name}.sh"
-    local tmp_script="/tmp/deploy-${name}.sh"
-    printf "${C_CYN}▶ Downloading from ${url}...${C_R}\n"
-    if curl -fsSL -o "$tmp_script" "$url" 2>/dev/null; then
-      chmod +x "$tmp_script"
-      printf "${C_GRN}✔${C_R} Downloaded.\n"
-      printf "${C_YEL}⚠${C_R} This will install Docker (if needed), ${name}, Fail2Ban, and firewall rules.\n"
-      printf "${C_YEL}⚠${C_R} Existing Docker containers and data will be ${C_RED}DESTROYED${C_R}.\n"
-      read -rp "Proceed? [y/N]: " confirm2
-      [[ "$confirm2" =~ ^[Yy]$ ]] || { printf "Aborted.\n"; rm -f "$tmp_script"; return 1; }
-      printf "\n${C_CYN}▶ Starting deployment of ${name}...${C_R}\n\n"
-      exec sudo bash "$tmp_script"
+  else
+    # Download failed — fall back to local copy
+    printf "${C_RED}✖${C_R} Could not download latest ${script_name} from GitHub.\n"
+    if [[ -f "$local_script" ]]; then
+      printf "${C_YEL}⚠${C_R} Using local copy (may be outdated).\n"
+      _run_script "$local_script"
     else
-      printf "${C_RED}✖${C_R} Failed to download deploy-${name}.sh\n"
-      printf "  ${C_DIM}Check your internet connection and the GitHub URL:${C_R}\n"
-      printf "  ${C_DIM}${url}${C_R}\n"
+      printf "${C_RED}✖${C_R} ${script_name} not found locally either.\n"
+      printf "  ${C_DIM}Check internet connection and GitHub URL:${C_R} ${url}\n"
       return 1
     fi
   fi
