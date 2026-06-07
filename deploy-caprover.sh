@@ -275,15 +275,21 @@ setup_caprover() {
   step "CapRover"
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
 
+  # CrowdRover REQUIRES Docker Swarm — make it a hard requirement
   info "Initializing Docker Swarm..."
   if ! docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null | grep -q "active"; then
     docker swarm init --advertise-addr "${ip}" 2>/dev/null || true
     sleep 3
   fi
   if ! docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null | grep -q "active"; then
-    warn "Docker Swarm not active — CapRover requires Swarm mode"
-    warn "Try manually: docker swarm init --advertise-addr ${ip}"
+    error "Docker Swarm failed to initialize. CapRover requires Swarm mode."
+    error "Try manually: docker swarm init --advertise-addr ${ip}"
+    return 1
   fi
+  ok "Docker Swarm active"
+
+  # Remove any existing broken CapRover container
+  docker rm -f caprover 2>/dev/null || true
 
   info "Deploying CapRover..."
   docker run -d \
@@ -297,19 +303,38 @@ setup_caprover() {
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v /captain:/captain \
     --name caprover \
+    --hostname caprover \
     --restart always \
     --network proxy \
     caprover/caprover
 
-  docker network connect proxy caprover 2>/dev/null || true
-  info "Waiting for CapRover..."
+  # Verify container is on the proxy network
+  info "Verifying network connectivity..."
+  sleep 2
+  if docker network inspect proxy 2>/dev/null | grep -q '"Name": "caprover"'; then
+    ok "CapRover connected to proxy network"
+  else
+    warn "Retrying network connection..."
+    docker network connect proxy caprover 2>/dev/null || true
+  fi
+
+  # Test hostname resolution from NPM
+  for i in $(seq 1 15); do
+    if docker exec npm getent hosts caprover 2>/dev/null | grep -q caprover; then
+      ok "Hostname 'caprover' resolves from NPM"; break
+    fi
+    [[ $i -eq 15 ]] && warn "Hostname resolution delayed — may need a few seconds"
+    sleep 2
+  done
+
+  info "Waiting for CapRover API..."
   for i in $(seq 1 60); do
     curl -sf --max-time 5 http://127.0.0.1:3000/ &>/dev/null && { success "CapRover responding"; break; }
-    [[ $i -eq 60 ]] && warn "CapRover timed out. Check: docker logs caprover"
+    [[ $i -eq 60 ]] && warn "CapRover timed out (3m). Check: docker logs caprover"
     sleep 3
   done
   success "CapRover deployed: http://${ip}:3000"
-  info "NEXT: npm install -g caprover && caprover serversetup (from local machine)"
+  info "Container reachable via: http://caprover:3000 (from NPM)"
 }
 
 setup_fail2ban() {

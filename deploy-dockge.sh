@@ -225,6 +225,7 @@ networks:
 COMPOSE
 
   docker compose pull
+  docker rm -f npm 2>/dev/null || true
   docker compose up -d
   docker network connect proxy npm 2>/dev/null || true
 
@@ -266,9 +267,9 @@ services:
   dockge:
     image: louislam/dockge:1
     container_name: dockge
+    hostname: dockge
     restart: always
-    ports:
-      - '5001:5001'
+    # No host ports — accessed only via NPM proxy at http://dockge:5001
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./data:/app/data
@@ -289,7 +290,9 @@ networks:
     external: true
 COMPOSE
 
-  docker compose pull && docker compose up -d
+  docker compose pull
+  docker rm -f dockge 2>/dev/null || true
+  docker compose up -d
   docker network connect proxy dockge 2>/dev/null || true
   info "Waiting for Dockge..."
   for i in $(seq 1 40); do

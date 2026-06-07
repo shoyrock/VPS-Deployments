@@ -205,6 +205,7 @@ services:
     image: 'jc21/nginx-proxy-manager:latest'
     restart: always
     container_name: npm
+    hostname: npm
     ports:
       - '0.0.0.0:80:80'
       - '0.0.0.0:443:443'
@@ -228,6 +229,7 @@ COMPOSE
 
   docker compose pull
   info "Starting NPM..."
+  docker rm -f npm 2>/dev/null || true
   docker compose up -d
   docker network connect proxy npm 2>/dev/null || true
 
@@ -272,10 +274,8 @@ services:
     hostname: cosmos-server
     restart: always
     privileged: true
-    ports:
-      - '8080:80'
-      - '8443:443'
-      - '4242:4242/udp'
+    # No host ports — accessed only via NPM proxy at http://cosmos-server:80
+    # For Constellation VPN, add UDP 4242 via UFW or NPM Stream Hosts
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket
@@ -295,7 +295,9 @@ networks:
     external: true
 COMPOSE
 
-  docker compose pull && docker compose up -d
+  docker compose pull
+  docker rm -f cosmos-server 2>/dev/null || true
+  docker compose up -d
   docker network connect proxy cosmos-server 2>/dev/null || true
 
   info "Waiting for Cosmos..."

@@ -204,6 +204,7 @@ services:
     image: 'jc21/nginx-proxy-manager:latest'
     restart: always
     container_name: npm
+    hostname: npm
     ports:
       - '0.0.0.0:80:80'
       - '0.0.0.0:443:443'
@@ -226,11 +227,12 @@ networks:
 COMPOSE
 
   docker compose pull
+  docker rm -f npm 2>/dev/null || true
   docker compose up -d
-  docker network connect proxy npm 2>/dev/null || true
 
   info "Waiting for NPM container..."
   for i in $(seq 1 30); do docker ps --format '{{.Names}}' | grep -qx "npm" && break; sleep 2; done
+  docker network connect proxy npm 2>/dev/null || true
 
   info "Waiting for NPM admin UI (:81)..."
   for i in $(seq 1 60); do
@@ -268,6 +270,7 @@ services:
     image: 'portainer/portainer-ce:latest'
     restart: always
     container_name: portainer
+    hostname: portainer
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - portainer_data:/data
@@ -288,7 +291,9 @@ networks:
     external: true
 COMPOSE
 
-  docker compose pull && docker compose up -d
+  docker compose pull
+  docker rm -f portainer 2>/dev/null || true
+  docker compose up -d
   docker network connect proxy portainer 2>/dev/null || true
   info "Waiting for Portainer..."
   for i in $(seq 1 40); do

@@ -18,25 +18,43 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script incl
 
 ## Quick Reference
 
-| # | Script | What It Deploys | NPM Port | Notes |
-|---|--------|----------------|----------|-------|
-| — | **`deploy.sh`** | **Unified menu** — pick any tool interactively or via CLI | — | Run this for the menu |
-| 1 | `deploy-portainer.sh` | NPM + Portainer | 80/443/81 | Visual container management |
-| 2 | `deploy-dockge.sh` | NPM + Dockge | 80/443/81 | Compose stack manager |
-| 3 | `deploy-coolify.sh` | NPM + Coolify | 80/443/81 | PaaS — Traefik disabled, proxied via NPM |
-| 4 | `deploy-dokploy.sh` | NPM + Dokploy | 80/443/81 | PaaS — Traefik disabled, proxied via NPM |
-| 5 | `deploy-dokku.sh` | NPM + Dokku | 81 | PaaS — Dokku's nginx stays on 80/443 |
-| 6 | `deploy-runtipi.sh` | NPM + Runtipi | 80/443/81 | Runtipi Traefik moved to 8080/8443 |
-| 7 | `deploy-casaos.sh` | NPM + CasaOS | 80/443/81 | CasaOS gateway moved to 8080 |
-| 8 | `deploy-cosmos.sh` | NPM + Cosmos | 80/443/81 | Cosmos moved to bridge mode 8080/8443 |
-| 9 | `deploy-caprover.sh` | NPM + CapRover | 81 | CapRover's nginx stays on 80/443 |
-| 10 | `deploy-yunohost.sh` | NPM + YunoHost | 81 | YunoHost's nginx stays on 80/443 (Debian 12) |
-| 11 | `deploy-freedombox.sh` | NPM + FreedomBox | 81 | FreedomBox's Apache stays on 80/443 (Debian 12) |
+| # | Script | What It Deploys | Exposed Ports | Notes |
+|---|--------|----------------|---------------|-------|
+| — | **`deploy.sh`** | **Unified menu** — pick any tool interactively or via CLI | — | Always fetches latest from GitHub |
+| 1 | `deploy-portainer.sh` | NPM + Portainer | **80, 443, 81** | Visual container management |
+| 2 | `deploy-dockge.sh` | NPM + Dockge | **80, 443, 81** | Compose stack manager |
+| 3 | `deploy-coolify.sh` | NPM + Coolify | **80, 443, 81** | PaaS — Coolify Traefik disabled |
+| 4 | `deploy-dokploy.sh` | NPM + Dokploy | **80, 443, 81** | PaaS — Dokploy Traefik disabled |
+| 5 | `deploy-dokku.sh` | NPM + Dokku | **80, 443, 81** | PaaS — uses Dokku's own nginx |
+| 6 | `deploy-runtipi.sh` | NPM + Runtipi | **80, 443, 81** | Home server + 300 apps |
+| 7 | `deploy-casaos.sh` | NPM + CasaOS | **80, 443, 81** | Home server with app store |
+| 8 | `deploy-cosmos.sh` | NPM + Cosmos | **80, 443, 81** | All-in-one homelab suite |
+| 9 | `deploy-caprover.sh` | NPM + CapRover | **80, 443, 81** | PaaS — uses CapRover's own nginx |
+| 10 | `deploy-yunohost.sh` | NPM + YunoHost | **80, 443, 81** | Debian server distro (Debian 12) |
+| 11 | `deploy-freedombox.sh` | NPM + FreedomBox | **80, 443, 81** | Debian home server (Debian 12) |
 | 🔒 | **`harden.sh`** | **Full system hardening** | — | Run after deployment — see below |
 
-**Tools with NPM on 80/443/81 (primary proxy)**: Portainer, Dockge, Coolify, Dokploy, CasaOS, Runtipi, Cosmos — their built-in proxies are disabled/reconfigured so NPM handles all HTTP/S traffic.
+**All scripts expose only 3 ports to the internet: 80 (HTTP), 443 (HTTPS), 81 (NPM admin).** Individual tool containers have **no host ports** — they communicate internally via Docker's `proxy` network using their container hostnames (see table below).
 
-**Tools with NPM on 81 only (supplementary proxy)**: CapRover, Dokku, YunoHost, FreedomBox — their built-in web servers are essential to their core functionality and cannot be disabled. NPM runs on port 81 for proxying additional services.
+---
+
+## Container Hostnames
+
+All containers connect to the `proxy` Docker network and are reachable by hostname from NPM:
+
+| Container | Hostname | NPM Proxy Host Forward |
+|-----------|----------|----------------------|
+| Nginx Proxy Manager | `npm` | (is the proxy) |
+| Portainer | `portainer` | `http://portainer:9000` |
+| Dockge | `dockge` | `http://dockge:5001` |
+| Coolify | `coolify` | `http://coolify:8000` |
+| Dokploy | `dokploy` | `http://dokploy:3000` |
+| CapRover | `caprover` | `http://caprover:3000` |
+| CasaOS | `casaos` | `http://casaos:8080` |
+| Runtipi | `runtipi` | `http://runtipi:80` |
+| Cosmos | `cosmos-server` | `http://cosmos-server:80` |
+
+**No tool container exposes ports directly to the host.** All traffic flows through NPM on ports 80/443.
 
 ---
 
@@ -93,21 +111,39 @@ sudo ./deploy-tool.sh
 
 ## Architecture
 
-Every script follows this pattern:
+**Only 3 ports are exposed to the internet.** All tool containers are internal-only:
 
 ```
-INTERNET ──► UFW/Firewalld ──► NPM (80/443/81 or 81 only) ──► Dashboard Tool
-                                          │
-                                    Fail2Ban (log monitoring)
-                                          │
-                                    UFW blocks banned IPs
+INTERNET ──► UFW/Firewalld ──► NPM (80/443/81) ──► Docker proxy network
+                                                        │
+                              ┌─────────────────────────┼─────────────────────────┐
+                              │                         │                         │
+                           portainer                 dockge                   coolify
+                           (hostname)               (hostname)               (hostname)
+                           :9000                    :5001                    :8000
 ```
+
+Tool containers have **no host ports exposed**. They communicate with NPM via Docker's internal `proxy` network using their hostnames. NPM is the single entry point for all HTTP/HTTPS traffic.
 
 **Fail2Ban** (all scripts) includes:
 - `sshd` jail — SSH brute force protection
 - `npm-auth` — NPM login brute force
 - `npm-forceful-browsing` — Bot/scanner detection (custom filter for NPM's log format)
 - `npm-botsearch` — Admin panel enumeration detection
+
+### How Built-in Proxies Are Handled
+
+| Tool | Built-in Proxy | Status | What Script Does |
+|------|---------------|--------|-----------------|
+| **Coolify** | Traefik | ✅ Disabled | Stopped, tool proxied via NPM at `http://coolify:8000` |
+| **Dokploy** | Traefik | ✅ Disabled | Stopped, tool proxied via NPM at `http://dokploy:3000` |
+| **CasaOS** | Gateway | ✅ Disabled | Moved to internal port 8080, proxied via NPM |
+| **Runtipi** | Traefik | ✅ Disabled | Moved to internal ports 8080/8443, proxied via NPM |
+| **Cosmos** | Host mode | ✅ Disabled | Changed to bridge mode, proxied via NPM |
+| **CapRover** | nginx | ℹ️ Own proxy | Keeps 80/443 for app routing, NPM on port 81 |
+| **Dokku** | nginx | ℹ️ Own proxy | Keeps 80/443 for app routing, NPM on port 81 |
+| **YunoHost** | nginx | ℹ️ Own proxy | Keeps 80/443, NPM on port 81 |
+| **FreedomBox** | Apache | ℹ️ Own proxy | Keeps 80/443, NPM on port 81 |
 
 ---
 
