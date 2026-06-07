@@ -55,7 +55,14 @@ Set up your apps in NPM. Get everything working.
 
 **Step 2: Harden (after everything is set up)**
 ```bash
-./deploy.sh harden       # Or: ./deploy.sh → pick "🔒 Harden VPS"
+./deploy.sh harden       # Via the menu script you already have
+```
+
+Or download `harden.sh` directly if you don't have `deploy.sh`:
+```bash
+curl -fsSL -o harden.sh https://raw.githubusercontent.com/shoyrock/VPS-Deployments/main/harden.sh
+chmod +x harden.sh
+sudo ./harden.sh
 ```
 
 **Do NOT run `harden.sh` before deploying.** It locks down port 81 and you won't be able to access the NPM admin UI from the internet to set up your proxy hosts.
