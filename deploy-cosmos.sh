@@ -229,6 +229,7 @@ COMPOSE
   docker compose pull
   info "Starting NPM..."
   docker compose up -d
+  docker network connect proxy npm 2>/dev/null || true
 
   info "Waiting for NPM..."
   for i in $(seq 1 30); do docker ps --format '{{.Names}}' | grep -qx "npm" && break; sleep 2; done
@@ -295,6 +296,7 @@ networks:
 COMPOSE
 
   docker compose pull && docker compose up -d
+  docker network connect proxy cosmos-server 2>/dev/null || true
 
   info "Waiting for Cosmos..."
   for i in $(seq 1 60); do

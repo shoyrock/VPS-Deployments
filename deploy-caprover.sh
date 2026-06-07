@@ -276,8 +276,14 @@ setup_caprover() {
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
 
   info "Initializing Docker Swarm..."
-  docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null | grep -q "active" || \
+  if ! docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null | grep -q "active"; then
     docker swarm init --advertise-addr "${ip}" 2>/dev/null || true
+    sleep 3
+  fi
+  if ! docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null | grep -q "active"; then
+    warn "Docker Swarm not active — CapRover requires Swarm mode"
+    warn "Try manually: docker swarm init --advertise-addr ${ip}"
+  fi
 
   info "Deploying CapRover..."
   docker run -d \
@@ -292,8 +298,10 @@ setup_caprover() {
     -v /captain:/captain \
     --name caprover \
     --restart always \
+    --network proxy \
     caprover/caprover
 
+  docker network connect proxy caprover 2>/dev/null || true
   info "Waiting for CapRover..."
   for i in $(seq 1 60); do
     curl -sf --max-time 5 http://127.0.0.1:3000/ &>/dev/null && { success "CapRover responding"; break; }

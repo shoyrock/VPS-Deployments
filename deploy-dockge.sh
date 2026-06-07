@@ -226,6 +226,7 @@ COMPOSE
 
   docker compose pull
   docker compose up -d
+  docker network connect proxy npm 2>/dev/null || true
 
   info "Waiting for NPM container..."
   for i in $(seq 1 30); do docker ps --format '{{.Names}}' | grep -qx "npm" && break; sleep 2; done
@@ -289,6 +290,7 @@ networks:
 COMPOSE
 
   docker compose pull && docker compose up -d
+  docker network connect proxy dockge 2>/dev/null || true
   info "Waiting for Dockge..."
   for i in $(seq 1 40); do
     curl -sf --max-time 5 http://127.0.0.1:5001/ &>/dev/null && { success "Dockge ready"; break; }
