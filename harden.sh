@@ -129,7 +129,7 @@ harden_ssh() {
     [[ "$key_count" -gt 0 ]] && has_keys=true
 
     # Remove old hardening block
-    sed -i '/# --- Security hardening (managed by harden.sh) ---/,/# --- End hardening ---/d' "$sshd"
+    sed -i '/# --- Security hardening (managed by harden.sh) ---/,/# --- End hardening ---/d' "$sshd" 2>/dev/null || true
 
     {
         echo ""
@@ -148,7 +148,9 @@ harden_ssh() {
 
     if sshd -t 2>/dev/null; then
         systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
-        ok "SSH hardened (${has_keys==true ? "key-only" : "keys missing, password kept"})"
+        local ssh_msg="key-only auth"
+        [[ "$has_keys" != true ]] && ssh_msg="keys missing — password kept"
+        ok "SSH hardened ($ssh_msg)"
     else
         error "sshd config test failed — rolling back"
         [[ -f "${sshd}${BAKSUF}" ]] && cp -a "${sshd}${BAKSUF}" "$sshd" && warn "Rolled back sshd_config"
@@ -196,7 +198,7 @@ fs.suid_dumpable=0
 kernel.core_uses_pid=1
 kernel.sysrq=0
 SYSCTL
-    sysctl --system >> "$LOGFILE" 2>&1
+    sysctl --system >> "$LOGFILE" 2>&1 || warn "sysctl --system had errors (some params may be unsupported)"
     ok "Kernel sysctl hardening applied"
     _log "sysctl hardening applied"
 }
@@ -384,8 +386,8 @@ lockdown_npm_admin() {
         for dcf in "$p"/docker-compose.yml "$p"/docker-compose.yaml; do
             [[ -f "$dcf" ]] || continue
             found=1; backup_file "$dcf"
-            sed -i -E "s/([\"']?)0\.0\.0\.0:81:81\1/\1127.0.0.1:81:81\1/g" "$dcf"
-            sed -i -E "s/([\"']?)81:81\1/\1127.0.0.1:81:81\1/g" "$dcf"
+            sed -i -E "s/([\"']?)0\.0\.0\.0:81:81\1/\1127.0.0.1:81:81\1/g" "$dcf" 2>/dev/null || true
+            sed -i -E "s/([\"']?)81:81\1/\1127.0.0.1:81:81\1/g" "$dcf" 2>/dev/null || true
             sed -i '/port.*81:81/s/81:81/127.0.0.1:81:81/' "$dcf" 2>/dev/null || true
             info "Updated: $dcf"
             if command -v docker &>/dev/null; then
