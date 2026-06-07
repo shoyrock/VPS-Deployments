@@ -89,10 +89,9 @@ user_confirm() {
     printf "  OS: %s | Backup suffix: %s\n" "$OS_FAMILY" "$BAKSUF"
     printf "  Log: %s\n\n" "$LOGFILE"
     printf "Measures:\n"
-    printf "  SSH hardening        Kernel sysctl         Firewall rate limit\n"
-    printf "  GeoIP blocking       CrowdSec (local)      AIDE file integrity\n"
-    printf "  Auto security updates  NPM admin lockdown    Docker hardening\n"
-    printf "  Daily local backups\n\n"
+    printf "  Kernel sysctl         Firewall rate limit   GeoIP blocking\n"
+    printf "  CrowdSec (local)      AIDE file integrity   Auto security updates\n"
+    printf "  NPM admin lockdown    Docker hardening      Daily local backups\n\n"
     read -rp $'Proceed? [y/N]: ' ans
     [[ "$ans" =~ ^[Yy]$ ]] || { info "Aborted."; exit 0; }
     ok "Confirmed — hardening..."
@@ -109,7 +108,7 @@ backup_file() {
 backup_configs() {
     info "=== Backing up configs ==="
     local f
-    for f in /etc/ssh/sshd_config /etc/sysctl.conf /etc/ufw/before.rules \
+    for f in /etc/sysctl.conf /etc/ufw/before.rules \
              /etc/ufw/ufw.conf /etc/docker/daemon.json \
              /etc/apt/apt.conf.d/50unattended-upgrades /etc/dnf/automatic.conf; do
         [[ -f "$f" ]] && backup_file "$f"
@@ -118,48 +117,7 @@ backup_configs() {
 }
 
 # ---------------------------------------------------------------------------
-# 1. SSH Hardening — rollback: restore backup + restart sshd
-# ---------------------------------------------------------------------------
-harden_ssh() {
-    info "=== Hardening SSH ==="
-    local sshd="/etc/ssh/sshd_config" has_keys=false key_count=0
-    [[ -f "$sshd" ]] || { warn "sshd_config missing, skipping"; return; }
-
-    key_count=$(find /root/.ssh -name '*.pub' -type f 2>/dev/null | wc -l)
-    [[ "$key_count" -gt 0 ]] && has_keys=true
-
-    # Remove old hardening block
-    sed -i '/# --- Security hardening (managed by harden.sh) ---/,/# --- End hardening ---/d' "$sshd" 2>/dev/null || true
-
-    {
-        echo ""
-        echo "# --- Security hardening (managed by harden.sh) ---"
-        echo "Protocol 2"
-        echo "PermitRootLogin no"
-        echo "MaxAuthTries 3"
-        echo "ClientAliveInterval 300"
-        echo "ClientAliveCountMax 2"
-        echo "LoginGraceTime 30"
-        echo "MaxSessions 2"
-        echo "X11Forwarding no"
-        [[ "$has_keys" == true ]] && echo "PasswordAuthentication no" || echo "PasswordAuthentication yes"
-        echo "# --- End hardening ---"
-    } >> "$sshd"
-
-    if sshd -t 2>/dev/null; then
-        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
-        local ssh_msg="key-only auth"
-        [[ "$has_keys" != true ]] && ssh_msg="keys missing — password kept"
-        ok "SSH hardened ($ssh_msg)"
-    else
-        error "sshd config test failed — rolling back"
-        [[ -f "${sshd}${BAKSUF}" ]] && cp -a "${sshd}${BAKSUF}" "$sshd" && warn "Rolled back sshd_config"
-    fi
-    _log "SSH hardening: has_keys=$has_keys"
-}
-
-# ---------------------------------------------------------------------------
-# 2. Sysctl Kernel Hardening — rollback: rm /etc/sysctl.d/99-harden.conf
+# 1. Sysctl Kernel Hardening — rollback: rm /etc/sysctl.d/99-harden.conf
 # ---------------------------------------------------------------------------
 harden_sysctl() {
     info "=== Applying kernel sysctl hardening ==="
@@ -247,7 +205,6 @@ harden_geoip() {
 
     cat > "${GEOIP_DIR}/apply-geoip.sh" << 'GEOEOF'
 #!/usr/bin/env bash
-set -euo pipefail
 DIR="/usr/local/bin/geoip-block" CHAIN="GEOIP_BLOCK"
 for cmd in iptables ip6tables; do
     command -v "$cmd" &>/dev/null || continue
@@ -267,7 +224,14 @@ done
 echo "$(date '+%Y-%m-%d %H:%M:%S') GeoIP blocks applied" >> /var/log/harden.log
 GEOEOF
     chmod +x "${GEOIP_DIR}/apply-geoip.sh"
-    bash "${GEOIP_DIR}/apply-geoip.sh" >> "$LOGFILE" 2>&1 || warn "GeoIP apply had errors (non-fatal)"
+    info "Applying GeoIP blocks (this may take a minute)..."
+    nohup bash "${GEOIP_DIR}/apply-geoip.sh" >> "$LOGFILE" 2>&1 &
+    local geoip_pid=$!
+    local waited=0
+    while kill -0 "$geoip_pid" 2>/dev/null && [[ "$waited" -lt 60 ]]; do
+        sleep 1; waited=$((waited + 1))
+    done
+    kill -0 "$geoip_pid" 2>/dev/null && warn "GeoIP apply still running in background (PID $geoip_pid)"
 
     local cronline="0 4 * * * ${GEOIP_DIR}/apply-geoip.sh >> /var/log/harden.log 2>&1"
     (crontab -l 2>/dev/null | grep -vF "apply-geoip"; echo "$cronline") | sort -u | crontab -
@@ -486,17 +450,12 @@ verify_hardening() {
     echo "│  HARDENING VERIFICATION                                        │"
     echo "├──────────────────────────────────────────────────────────────────┤"
 
-    # 1. SSH
-    _check "SSH root disabled"       "grep -q '^PermitRootLogin no' /etc/ssh/sshd_config"
-    _check "SSH Protocol 2"          "grep -q '^Protocol 2' /etc/ssh/sshd_config"
-    _check "SSH MaxAuthTries 3"      "grep -q '^MaxAuthTries 3' /etc/ssh/sshd_config"
-
-    # 2. Sysctl
+    # 1. Sysctl
     _check "Kernel SYN cookies"      "[[ \$(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null) == '1' ]]"
     _check "Kernel RP filter"        "[[ \$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null) == '1' ]]"
     _check "No source routing"       "[[ \$(sysctl -n net.ipv4.conf.all.accept_source_route 2>/dev/null) == '0' ]]"
 
-    # 3. Firewall
+    # 2. Firewall
     if [[ "$OS_FAMILY" == "debian" ]]; then
         _check "UFW rate limit SSH"  "ufw status 2>/dev/null | grep -q 'LIMIT.*22'"
         _check "UFW rate limit HTTP" "ufw status 2>/dev/null | grep -q 'LIMIT.*80'"
@@ -504,32 +463,32 @@ verify_hardening() {
         _check "Firewalld rate limit" "firewall-cmd --list-all 2>/dev/null | grep -q 'rich rule'"
     fi
 
-    # 4. GeoIP
+    # 3. GeoIP
     _check "GeoIP zone files"        "[[ -f /usr/local/bin/geoip-block/cn.zone ]]"
     _check "GeoIP iptables chain"    "iptables -L GEOIP_BLOCK -n >/dev/null 2>&1"
 
-    # 5. CrowdSec
+    # 4. CrowdSec
     _check "CrowdSec installed"      "command -v cscli >/dev/null 2>&1"
     _check "CrowdSec running"        "systemctl is-active --quiet crowdsec 2>/dev/null"
     _check "CrowdSec bouncer"        "systemctl is-active --quiet crowdsec-firewall-bouncer 2>/dev/null"
 
-    # 6. AIDE
+    # 5. AIDE
     _check "AIDE installed"          "command -v aide >/dev/null 2>&1"
 
-    # 7. Auto updates
+    # 6. Auto updates
     if [[ "$OS_FAMILY" == "debian" ]]; then
         _check "Auto-updates active" "systemctl is-active --quiet unattended-upgrades 2>/dev/null"
     else
         _check "Auto-updates active" "systemctl is-active --quiet dnf-automatic.timer 2>/dev/null"
     fi
 
-    # 8. NPM lockdown
+    # 7. NPM lockdown
     _check "NPM on localhost:81"     "ss -tln 2>/dev/null | grep -q '127.0.0.1:81'"
 
-    # 9. Docker
+    # 8. Docker
     _check "Docker daemon.json"      "[[ -f /etc/docker/daemon.json ]]"
 
-    # 10. Backups
+    # 9. Backups
     _check "Backup script exists"    "[[ -f /usr/local/bin/vps-backup ]]"
     _check "Backup cron set"         "crontab -l 2>/dev/null | grep -q 'vps-backup'"
 
@@ -551,6 +510,8 @@ verify_hardening() {
     echo "                    Then open http://localhost:8181"
     echo ""
     _log "=== Verification: $pass/$total passed ==="
+    # Clear abort trap on successful completion
+    trap - EXIT
 }
 
 # ---------------------------------------------------------------------------
@@ -563,16 +524,35 @@ print_summary() {
     echo "  Log:       $LOGFILE"
     echo "  Backups:   files with suffix $BAKSUF"
     echo ""
+    echo "${C_BLD}${C_YLW}OPTIONAL: Disable SSH access when setup is done${C_RST}"
+    echo ""
+    echo "  When you've finished configuring your services, disable SSH"
+    echo "  via your cloud provider's security group / firewall (NOT via"
+    echo "  UFW — you'd have no way to re-enable it without SSH):"
+    echo ""
+    echo "    ${C_BLU}Oracle Cloud:${C_RST}  VCN → Security Lists → Remove ingress rule for port 22"
+    echo "    ${C_BLU}AWS:${C_RST}          EC2 → Security Groups → Remove inbound rule for port 22"
+    echo "    ${C_BLU}DigitalOcean:${C_RST} Networking → Firewalls → Remove SSH rule"
+    echo "    ${C_BLU}Hetzner:${C_RST}      Console → Firewalls → Remove SSH rule"
+    echo ""
+    echo "  Your services (NPM, apps, etc.) continue running normally."
+    echo "  To re-enable SSH later, add the ingress rule back from the"
+    echo "  provider's web console — no SSH access required."
+    echo ""
+    echo "  Note: NPM admin (port 81) is already locked to localhost only."
+    echo "  Access it via: ssh -L 8181:127.0.0.1:81 root@<vps-ip>"
+    echo ""
 }
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 main() {
+    # Log any unexpected exit
+    trap '_log "=== SCRIPT ABORTED at line $LINENO ==="' EXIT
     preflight
     user_confirm
     backup_configs
-    harden_ssh
     harden_sysctl
     harden_firewall
     harden_geoip
