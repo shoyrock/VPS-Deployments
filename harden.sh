@@ -163,42 +163,39 @@ harden_ssh() {
 # ---------------------------------------------------------------------------
 harden_sysctl() {
     info "=== Applying kernel sysctl hardening ==="
-    backup_file /etc/sysctl.conf
-    mkdir -p /etc/sysctl.d
-    cat > /etc/sysctl.d/99-harden.conf << 'SYSCTL'
-net.ipv4.ip_forward=0
-net.ipv4.conf.all.send_redirects=0
-net.ipv4.conf.default.send_redirects=0
-net.ipv4.conf.all.accept_redirects=0
-net.ipv4.conf.default.accept_redirects=0
-net.ipv4.conf.all.accept_source_route=0
-net.ipv4.conf.default.accept_source_route=0
-net.ipv4.conf.all.log_martians=1
-net.ipv4.conf.default.log_martians=1
-net.ipv4.conf.all.rp_filter=1
-net.ipv4.conf.default.rp_filter=1
-net.ipv4.tcp_syncookies=1
-net.ipv4.tcp_timestamps=0
-net.ipv4.tcp_max_syn_backlog=2048
-net.ipv4.tcp_synack_retries=2
-net.ipv4.tcp_syn_retries=2
-net.ipv4.tcp_fin_timeout=10
-net.ipv4.tcp_keepalive_time=300
-net.ipv4.tcp_keepalive_probes=5
-net.ipv4.tcp_keepalive_intvl=15
-net.ipv4.icmp_echo_ignore_broadcasts=1
-net.ipv4.icmp_ignore_bogus_error_responses=1
-net.ipv6.conf.all.disable_ipv6=1
-net.ipv6.conf.default.disable_ipv6=1
-net.ipv6.conf.lo.disable_ipv6=0
-kernel.randomize_va_space=2
-kernel.kptr_restrict=2
-kernel.yama.ptrace_scope=1
-fs.suid_dumpable=0
-kernel.core_uses_pid=1
-kernel.sysrq=0
-SYSCTL
-    sysctl --system >> "$LOGFILE" 2>&1 || warn "sysctl --system had errors (some params may be unsupported)"
+    backup_file /etc/sysctl.conf || true
+    mkdir -p /etc/sysctl.d || true
+    {
+        echo "net.ipv4.ip_forward=0"
+        echo "net.ipv4.conf.all.send_redirects=0"
+        echo "net.ipv4.conf.default.send_redirects=0"
+        echo "net.ipv4.conf.all.accept_redirects=0"
+        echo "net.ipv4.conf.default.accept_redirects=0"
+        echo "net.ipv4.conf.all.accept_source_route=0"
+        echo "net.ipv4.conf.default.accept_source_route=0"
+        echo "net.ipv4.conf.all.log_martians=1"
+        echo "net.ipv4.conf.default.log_martians=1"
+        echo "net.ipv4.conf.all.rp_filter=1"
+        echo "net.ipv4.conf.default.rp_filter=1"
+        echo "net.ipv4.tcp_syncookies=1"
+        echo "net.ipv4.tcp_timestamps=0"
+        echo "net.ipv4.tcp_max_syn_backlog=2048"
+        echo "net.ipv4.tcp_synack_retries=2"
+        echo "net.ipv4.tcp_syn_retries=2"
+        echo "net.ipv4.tcp_fin_timeout=10"
+        echo "net.ipv4.tcp_keepalive_time=300"
+        echo "net.ipv4.tcp_keepalive_probes=5"
+        echo "net.ipv4.tcp_keepalive_intvl=15"
+        echo "net.ipv4.icmp_echo_ignore_broadcasts=1"
+        echo "net.ipv4.icmp_ignore_bogus_error_responses=1"
+        echo "kernel.randomize_va_space=2"
+        echo "kernel.kptr_restrict=2"
+        echo "kernel.yama.ptrace_scope=1"
+        echo "fs.suid_dumpable=0"
+        echo "kernel.core_uses_pid=1"
+        echo "kernel.sysrq=0"
+    } > /etc/sysctl.d/99-harden.conf || { warn "Failed to write sysctl config"; return; }
+    sysctl --system >> "$LOGFILE" 2>&1 || warn "sysctl had errors (non-fatal)"
     ok "Kernel sysctl hardening applied"
     _log "sysctl hardening applied"
 }
