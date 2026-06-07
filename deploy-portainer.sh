@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# deploy-dockge.sh — Docker + NPM + Dockge + Fail2Ban (v2.0.0-dockge)
-# Idempotent VPS deployment. Usage: sudo ./deploy-dockge.sh
+# deploy-portainer.sh — Docker + NPM + Portainer + Fail2Ban (v2.0.0-portainer)
+# Idempotent VPS deployment. Usage: sudo ./deploy-portainer.sh
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="2.0.0-dockge"
-readonly SCRIPT_NAME="deploy-dockge.sh"
+readonly SCRIPT_VERSION="2.0.0-portainer"
+readonly SCRIPT_NAME="deploy-portainer.sh"
 readonly START_TIME=$(date +%s)
 readonly NPM_DIR="/opt/npm"
-readonly DOCKGE_DIR="/opt/dockge"
+readonly PORTAINER_DIR="/opt/portainer"
 readonly NPM_DATA_DIR="${NPM_DIR}/data"
 readonly NPM_LE_DIR="${NPM_DIR}/letsencrypt"
 readonly NPM_LOGS_DIR="${NPM_DATA_DIR}/logs"
@@ -109,6 +109,7 @@ idempotent_cleanup() {
   rm -f /usr/local/bin/docker-compose /usr/bin/docker-compose &>/dev/null || true
   systemctl stop firewalld fail2ban ufw 2>/dev/null || true
   systemctl disable firewalld fail2ban ufw 2>/dev/null || true
+  # Flush iptables safely (ACCEPT first to avoid lockout)
   iptables -P INPUT ACCEPT 2>/dev/null || true
   iptables -P FORWARD ACCEPT 2>/dev/null || true
   iptables -P OUTPUT ACCEPT 2>/dev/null || true
@@ -118,7 +119,7 @@ idempotent_cleanup() {
   iptables -X 2>/dev/null || true
   iptables -t nat -X 2>/dev/null || true
   iptables -t mangle -X 2>/dev/null || true
-  rm -rf /var/lib/docker/* /etc/docker/* "$NPM_DIR" "$DOCKGE_DIR" 2>/dev/null || true
+  rm -rf /var/lib/docker/* /etc/docker/* "$NPM_DIR" "$PORTAINER_DIR" 2>/dev/null || true
   success "Cleanup done"
 }
 
@@ -257,31 +258,29 @@ COMPOSE
   success "NPM: http://${ip}:81"
 }
 
-setup_dockge() {
-  step "Dockge"
-  mkdir -p /opt/dockge /opt/stacks && cd /opt/dockge
+setup_portainer() {
+  step "Portainer CE"
+  mkdir -p "$PORTAINER_DIR" && cd "$PORTAINER_DIR"
   cat > docker-compose.yml << 'COMPOSE'
 services:
-  dockge:
-    image: louislam/dockge:1
-    container_name: dockge
+  portainer:
+    image: 'portainer/portainer-ce:latest'
     restart: always
-    ports:
-      - '5001:5001'
+    container_name: portainer
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./data:/app/data
-      - /opt/stacks:/opt/stacks
-    environment:
-      - DOCKGE_STACKS_DIR=/opt/stacks
+      - portainer_data:/data
     networks:
       - proxy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:5001/"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9000/api/status"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 30s
+
+volumes:
+  portainer_data:
 
 networks:
   proxy:
@@ -289,13 +288,14 @@ networks:
 COMPOSE
 
   docker compose pull && docker compose up -d
-  info "Waiting for Dockge..."
+  info "Waiting for Portainer..."
   for i in $(seq 1 40); do
-    curl -sf --max-time 5 http://127.0.0.1:5001/ &>/dev/null && { success "Dockge ready"; break; }
-    [[ $i -eq 40 ]] && warn "Dockge timed out. Check: docker logs dockge"
+    docker exec portainer wget -qO- --timeout=5 http://127.0.0.1:9000/api/status &>/dev/null && { success "Portainer ready"; break; }
+    docker ps --format '{{.Names}}' | grep -qx "portainer" || { [[ $i -eq 40 ]] && warn "Portainer container not found"; }
+    [[ $i -eq 40 ]] && warn "Portainer timed out. Check: docker logs portainer"
     sleep 3
   done
-  success "Dockge: http://${ip}:5001"
+  success "Portainer deployed (access via NPM proxy)"
 }
 
 setup_fail2ban() {
@@ -368,6 +368,7 @@ filter   = sshd
 backend  = systemd
 maxretry = 3
 
+# NPM admin auth brute force (error logs = standard format)
 [npm-auth]
 enabled  = true
 port     = http,https,81
@@ -377,6 +378,7 @@ logpath  = ${NPM_LOGS_DIR}/*_error.log
 maxretry = 3
 findtime = 60
 
+# NPM forceful browsing / bot detection (custom filter for access logs)
 [npm-forceful-browsing]
 enabled  = true
 port     = http,https
@@ -387,6 +389,7 @@ maxretry = 15
 findtime = 60
 bantime  = 3600
 
+# NPM bot search (error log)
 [npm-botsearch]
 enabled  = true
 port     = http,https
@@ -440,7 +443,6 @@ setup_firewall_debian() {
   ufw allow 80/tcp comment 'HTTP'
   ufw allow 443/tcp comment 'HTTPS'
   ufw allow 81/tcp comment 'NPM Admin'
-  ufw allow 5001/tcp comment 'Dockge'
 
   ufw --force enable && ufw reload
   ufw status verbose
@@ -457,7 +459,6 @@ setup_firewall_rhel() {
   firewall-cmd --permanent --add-service=http
   firewall-cmd --permanent --add-service=https
   firewall-cmd --permanent --add-port=81/tcp
-  firewall-cmd --permanent --add-port=5001/tcp
 
   if ! firewall-cmd --get-zones 2>/dev/null | grep -q '\bdocker\b'; then
     firewall-cmd --permanent --new-zone=docker 2>/dev/null || true
@@ -505,11 +506,9 @@ ${C_B}Nginx Proxy Manager${C_R}
   SSL:     ${NPM_LE_DIR}
   Logs:    ${NPM_LOGS_DIR}
 
-${C_B}Dockge${C_R}
-  Direct:  http://${ip}:5001
-  Proxy:   Via NPM (add host → http://dockge:5001)
-  Data:    ${DOCKGE_DIR}/data
-  Stacks:  /opt/stacks
+${C_B}Portainer CE${C_R}
+  Access:  Via NPM proxy (add host → http://portainer:9000)
+  Volume:  portainer_data
 
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
 ${C_B}Compose${C_R}   $(docker compose version --short 2>/dev/null || echo N/A)
@@ -520,14 +519,14 @@ ${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else
 
 ${C_B}${C_YEL}Setup:${C_R}
   1. NPM:     http://${ip}:81  (admin@example.com / changeme) → change password
-  2. Proxy:   Add dockge.your-domain.com → http://dockge:5001
+  2. Proxy:   Add portainer.your-domain.com → http://portainer:9000
   3. SSL:     Use NPM SSL Certificates tab
   4. Secure:  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "ufw delete allow 81/tcp && ufw reload"; else echo "firewall-cmd --permanent --remove-port=81/tcp && firewall-cmd --reload"; fi)
 
 ${C_B}Troubleshooting:${C_R}
-  Logs:    docker logs -f npm    docker logs -f dockge
+  Logs:    docker logs -f npm    docker logs -f portainer
   Restart: cd ${NPM_DIR} && docker compose restart
-           cd ${DOCKGE_DIR} && docker compose restart
+           cd ${PORTAINER_DIR} && docker compose restart
   F2B:     fail2ban-client status    fail2ban-regex -v ${NPM_LOGS_DIR}/proxy-host-1_access.log /etc/fail2ban/filter.d/npm-access.conf
   FW:      ${fw_cmd}
   Log:     ${LOG_FILE}
@@ -536,7 +535,7 @@ EOF
 }
 
 main() {
-  printf "\n${C_B}${C_CYN}VPS Deployment — Docker + NPM + Dockge + Fail2Ban${C_R}\n"
+  printf "\n${C_B}${C_CYN}VPS Deployment — Docker + NPM + Portainer + Fail2Ban${C_R}\n"
   printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
   preflight_checks
   idempotent_cleanup
@@ -545,7 +544,7 @@ main() {
   install_docker
   setup_docker_network
   setup_nginx_proxy_manager
-  setup_dockge
+  setup_portainer
   setup_fail2ban
   setup_firewall
   setup_logrotate

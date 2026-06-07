@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
-# deploy-dockge.sh — Docker + NPM + Dockge + Fail2Ban (v2.0.0-dockge)
-# Idempotent VPS deployment. Usage: sudo ./deploy-dockge.sh
+# deploy-dokku.sh — Hardened VPS Deployment (Dokku + NPM + Docker + Fail2Ban)
+# v2.0.0-dokku | Usage: chmod +x deploy-dokku.sh && sudo ./deploy-dokku.sh
+#
+# One-shot, idempotent deployment. Installs Dokku (which includes Docker CE),
+# Nginx Proxy Manager (admin UI on port 81), Fail2Ban, and host firewall.
+# Dokku manages its own nginx on 80/443; NPM is supplementary on port 81.
+#
+# Supports: Ubuntu 20.04+, Debian 11+, Rocky/Alma 8/9, Fedora 35+,
+#           CentOS 7/8, Oracle Linux, Amazon Linux 2023
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="2.0.0-dockge"
-readonly SCRIPT_NAME="deploy-dockge.sh"
+readonly SCRIPT_VERSION="2.0.0-dokku"
+readonly SCRIPT_NAME="deploy-dokku.sh"
 readonly START_TIME=$(date +%s)
 readonly NPM_DIR="/opt/npm"
-readonly DOCKGE_DIR="/opt/dockge"
 readonly NPM_DATA_DIR="${NPM_DIR}/data"
 readonly NPM_LE_DIR="${NPM_DIR}/letsencrypt"
 readonly NPM_LOGS_DIR="${NPM_DATA_DIR}/logs"
@@ -22,18 +28,19 @@ else
   C_R=''; C_B=''; C_RED=''; C_GRN=''; C_YEL=''; C_BLU=''; C_CYN=''; C_DIM=''
 fi
 
+# Logging utilities
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
 _log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}" >> "$LOG_FILE"; }
-info()    { printf "${C_BLU}ℹ${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
-warn()    { printf "${C_YEL}⚠${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
-error()   { printf "${C_RED}✖${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }
-success() { printf "${C_GRN}✔${C_R}  %s\n" "$*"; _log "SUCCESS" "$@"; }
+info()    { printf "${C_BLU}i${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
+warn()    { printf "${C_YEL}!${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
+error()   { printf "${C_RED}x${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }
+success() { printf "${C_GRN}+${C_R}  %s\n" "$*"; _log "SUCCESS" "$@"; }
 fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; exit 1; }
-step()    { printf "\n${C_B}${C_CYN}── %s ──${C_R}\n" "$*"; _log "STEP" "$@"; }
+step()    { printf "\n${C_B}${C_CYN}-- %s --${C_R}\n" "$*"; _log "STEP" "$@"; }
 
 preflight_checks() {
   step "Pre-flight Checks"
-  if [[ "${EUID:-0}" -ne 0 ]]; then fatal "Run as root (use sudo)."; fi
+  if [[ "${EUID:-0}" -ne 0 ]]; then fatal "Must run as root (use sudo)."; fi
   success "Running as root"
 
   if [[ -f /etc/os-release ]]; then
@@ -44,7 +51,7 @@ preflight_checks() {
     readonly OS_VERSION_ID="${VERSION_ID:-0}"
     readonly OS_LIKE="${ID_LIKE:-}"
   else
-    fatal "/etc/os-release not found."
+    fatal "/etc/os-release not found. Cannot determine OS."
   fi
 
   case "$OS_ID" in
@@ -56,21 +63,21 @@ preflight_checks() {
       else fatal "Unsupported: ${OS_NAME} (${OS_ID}). Need Ubuntu 20.04+, Debian 11+, Rocky/Alma 8+, Fedora 35+, Amazon Linux 2023"; fi
       ;;
   esac
-  success "OS: ${OS_NAME} ${OS_VERSION_ID} (${OS_FAMILY})"
+  success "OS: ${OS_NAME} ${OS_VERSION_ID} (family: ${OS_FAMILY})"
 
   if [[ "$OS_FAMILY" == "debian" ]]; then
     local major_ver="${OS_VERSION_ID%%.*}"
-    if [[ "$OS_ID" == "ubuntu" && "$major_ver" -lt 20 ]]; then fatal "Ubuntu ${OS_VERSION_ID} too old (min 20.04)."; fi
-    if [[ "$OS_ID" == "debian" && "$major_ver" -lt 11 ]]; then fatal "Debian ${OS_VERSION_ID} too old (min 11)."; fi
+    if [[ "$OS_ID" == "ubuntu" && "$major_ver" -lt 20 ]]; then fatal "Ubuntu ${OS_VERSION_ID} too old. Min: 20.04."; fi
+    if [[ "$OS_ID" == "debian" && "$major_ver" -lt 11 ]]; then fatal "Debian ${OS_VERSION_ID} too old. Min: 11."; fi
   fi
 
   readonly ARCH=$(uname -m)
   case "$ARCH" in
     x86_64) readonly DOCKER_ARCH="amd64" ;;
     aarch64|arm64) readonly DOCKER_ARCH="arm64" ;;
-    *) fatal "Unsupported arch: ${ARCH}. Need x86_64 or arm64." ;;
+    *) fatal "Unsupported arch: ${ARCH}. Need x86_64 or arm64/aarch64." ;;
   esac
-  success "Arch: ${ARCH} (${DOCKER_ARCH})"
+  success "Arch: ${ARCH} (Docker: ${DOCKER_ARCH})"
 
   info "Checking internet..."
   if ! curl -sf --max-time 10 https://download.docker.com/ >/dev/null 2>&1 && \
@@ -80,8 +87,17 @@ preflight_checks() {
   success "Internet OK"
 
   local free_mb; free_mb=$(df -m / | awk 'NR==2 {print $4}')
-  if [[ "$free_mb" -lt 2048 ]]; then warn "Low disk: ${free_mb}MB free (recommend >= 2048MB)."
+  if [[ "$free_mb" -lt 2048 ]]; then warn "Low disk: ${free_mb}MB free (recommend >= 2GB)."
   else success "Disk: $(( free_mb / 1024 ))GB free"; fi
+
+  # Dokku requires a valid FQDN
+  local hostname_fqdn; hostname_fqdn=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "localhost")
+  if [[ "$hostname_fqdn" == "localhost" ]] || [[ "$hostname_fqdn" == "localhost.localdomain" ]]; then
+    warn "Hostname not a valid FQDN (got: ${hostname_fqdn})."
+    info "Set with: hostnamectl set-hostname your-hostname.your-domain.com"
+  else
+    success "Hostname: ${hostname_fqdn}"
+  fi
 
   mkdir -p "$(dirname "$LOG_FILE")"
   _log "INFO" "=== ${SCRIPT_NAME} v${SCRIPT_VERSION} started ==="
@@ -89,7 +105,15 @@ preflight_checks() {
 }
 
 idempotent_cleanup() {
-  step "Cleanup"
+  step "Idempotent Cleanup"
+
+  if command -v dokku &>/dev/null; then
+    info "Removing existing Dokku..."
+    apt-get remove -y -qq dokku 2>/dev/null || true
+    apt-get autoremove -y -qq 2>/dev/null || true
+    rm -rf /var/lib/dokku /home/dokku 2>/dev/null || true
+  fi
+
   if command -v docker &>/dev/null; then
     info "Removing existing Docker resources..."
     local containers; containers=$(docker ps -aq 2>/dev/null || true)
@@ -101,14 +125,18 @@ idempotent_cleanup() {
     local images; images=$(docker images -aq 2>/dev/null || true)
     [[ -n "$images" ]] && docker rmi -f $images &>/dev/null || true
   fi
+
   if [[ "$OS_FAMILY" == "debian" ]]; then
     dpkg -l 2>/dev/null | grep -E "docker|containerd|runc" | awk '{print $2}' | xargs -r apt-get remove -y -qq &>/dev/null || true
   else
     rpm -qa 2>/dev/null | grep -E "docker|containerd|runc|podman|buildah" | xargs -r yum remove -y -q &>/dev/null || true
   fi
+
   rm -f /usr/local/bin/docker-compose /usr/bin/docker-compose &>/dev/null || true
   systemctl stop firewalld fail2ban ufw 2>/dev/null || true
   systemctl disable firewalld fail2ban ufw 2>/dev/null || true
+
+  # Flush iptables safely (ACCEPT policies first to avoid lockout)
   iptables -P INPUT ACCEPT 2>/dev/null || true
   iptables -P FORWARD ACCEPT 2>/dev/null || true
   iptables -P OUTPUT ACCEPT 2>/dev/null || true
@@ -118,8 +146,9 @@ idempotent_cleanup() {
   iptables -X 2>/dev/null || true
   iptables -t nat -X 2>/dev/null || true
   iptables -t mangle -X 2>/dev/null || true
-  rm -rf /var/lib/docker/* /etc/docker/* "$NPM_DIR" "$DOCKGE_DIR" 2>/dev/null || true
-  success "Cleanup done"
+
+  rm -rf /var/lib/docker/* /etc/docker/* "$NPM_DIR" 2>/dev/null || true
+  success "Cleanup complete"
 }
 
 system_update() {
@@ -135,20 +164,20 @@ system_update() {
 }
 
 install_dependencies() {
-  step "Dependencies"
+  step "Installing Dependencies"
   if [[ "$OS_FAMILY" == "debian" ]]; then
     apt-get install -y -qq ca-certificates curl gnupg lsb-release \
-      software-properties-common apt-transport-https jq cron logrotate
+      software-properties-common apt-transport-https jq cron wget
   else
     local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
     $pkg install -y -q ca-certificates curl gnupg2 yum-utils \
-      device-mapper-persistent-data lvm2 jq cronie logrotate
+      device-mapper-persistent-data lvm2 jq cronie wget
   fi
   success "Dependencies installed"
 }
 
 install_docker() {
-  step "Docker CE"
+  step "Installing Docker CE"
   if command -v docker &>/dev/null && docker version &>/dev/null; then
     success "Docker already installed: $(docker --version)"; return 0
   fi
@@ -204,8 +233,6 @@ services:
     restart: always
     container_name: npm
     ports:
-      - '0.0.0.0:80:80'
-      - '0.0.0.0:443:443'
       - '0.0.0.0:81:81'
     volumes:
       - ./data:/data
@@ -227,13 +254,13 @@ COMPOSE
   docker compose pull
   docker compose up -d
 
-  info "Waiting for NPM container..."
+  info "Waiting for NPM..."
   for i in $(seq 1 30); do docker ps --format '{{.Names}}' | grep -qx "npm" && break; sleep 2; done
 
-  info "Waiting for NPM admin UI (:81)..."
+  info "Waiting for NPM admin UI (port 81)..."
   for i in $(seq 1 60); do
-    curl -sf --max-time 5 http://127.0.0.1:81/ &>/dev/null && { success "NPM UI ready"; break; }
-    [[ $i -eq 60 ]] && warn "NPM UI timed out (2m)."
+    curl -sf --max-time 5 http://127.0.0.1:81/ &>/dev/null && { success "NPM UI responding"; break; }
+    [[ $i -eq 60 ]] && warn "NPM UI timed out. Still starting?"
     sleep 2
   done
 
@@ -254,52 +281,81 @@ COMPOSE
   done
 
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
-  success "NPM: http://${ip}:81"
+  success "NPM deployed: http://${ip}:81"
 }
 
-setup_dockge() {
-  step "Dockge"
-  mkdir -p /opt/dockge /opt/stacks && cd /opt/dockge
-  cat > docker-compose.yml << 'COMPOSE'
-services:
-  dockge:
-    image: louislam/dockge:1
-    container_name: dockge
-    restart: always
-    ports:
-      - '5001:5001'
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ./data:/app/data
-      - /opt/stacks:/opt/stacks
-    environment:
-      - DOCKGE_STACKS_DIR=/opt/stacks
-    networks:
-      - proxy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:5001/"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
+setup_logrotate() {
+  step "Log Rotation"
+  cat > /etc/logrotate.d/npm << EOF
+${NPM_LOGS_DIR}/*.log {
+    weekly
+    missingok
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    create 0644 root root
+    sharedscripts
+    postrotate
+        docker kill --signal='USR1' npm 2>/dev/null || true
+    endscript
+}
+EOF
+  success "Log rotation: ${NPM_LOGS_DIR}/*.log (14 days)"
+}
 
-networks:
-  proxy:
-    external: true
-COMPOSE
+setup_dokku() {
+  step "Dokku"
 
-  docker compose pull && docker compose up -d
-  info "Waiting for Dockge..."
+  if command -v dokku &>/dev/null; then
+    success "Dokku already installed: $(dokku version)"; return 0
+  fi
+
+  info "Installing Dokku via bootstrap (takes 5-10 minutes)..."
+  local dokku_tag="0.38.18"
+  wget -qO- "https://dokku.com/install/${dokku_tag}/bootstrap.sh" | sudo DOKKU_TAG="${dokku_tag}" bash
+
+  info "Waiting for Dokku..."
   for i in $(seq 1 40); do
-    curl -sf --max-time 5 http://127.0.0.1:5001/ &>/dev/null && { success "Dockge ready"; break; }
-    [[ $i -eq 40 ]] && warn "Dockge timed out. Check: docker logs dockge"
+    curl -sf --max-time 5 http://127.0.0.1:80/ &>/dev/null && { success "Dokploy responding on :80"; break; }
+    [[ $i -eq 40 ]] && warn "Dokku timed out. Check: systemctl status dokku-installer"
     sleep 3
   done
-  success "Dockge: http://${ip}:5001"
+
+  if command -v dokku &>/dev/null; then
+    success "Dokku CLI: $(dokku version 2>/dev/null || echo unknown)"
+  else
+    warn "Dokku CLI not in PATH. Try: hash -r"
+  fi
+
+  local hostname_fqdn; hostname_fqdn=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "localhost")
+  if [[ "$hostname_fqdn" == "localhost" ]] || [[ "$hostname_fqdn" == "localhost.localdomain" ]]; then
+    warn "Hostname is '${hostname_fqdn}'. Set FQDN before creating apps:"
+    info "  hostnamectl set-hostname your-hostname.your-domain.com"
+  fi
+
+  local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
+  success "Dokku deployed: http://${ip}:80"
+}
+
+setup_dokku_plugins() {
+  step "Dokku Plugins (Optional)"
+  info "Install manually as needed:"
+  info "  dokku plugin:install https://github.com/dokku/dokku-postgres.git"
+  info "  dokku plugin:install https://github.com/dokku/dokku-redis.git"
+  info "  dokku plugin:install https://github.com/dokku/dokku-mysql.git"
+  info "  dokku plugin:install https://github.com/dokku/dokku-letsencrypt.git"
+
+  if command -v dokku &>/dev/null; then
+    local installed; installed=$(dokku plugin:list 2>/dev/null | grep -E "postgres|redis|mysql|letsencrypt" || true)
+    [[ -n "$installed" ]] && { info "Already installed:"; echo "$installed" | while read -r line; do info "  ${line}"; done; }
+  fi
+  success "Plugin helper complete"
 }
 
 setup_fail2ban() {
   step "Fail2Ban"
+
   if [[ "$OS_FAMILY" == "debian" ]]; then
     apt-get install -y -qq fail2ban
     local banaction="ufw"
@@ -309,14 +365,13 @@ setup_fail2ban() {
     local banaction="firewallcmd-rich-rules"
   fi
 
-  # NPM uses a custom access log format (IP inside [Client IP]).
-  # Built-in fail2ban nginx filters won't match — custom filter required.
+  # NPM uses a custom access log format — IP is inside [Client IP], not at the start.
+  # Standard fail2ban nginx filters will NOT match. Custom filter required.
   local fdir="/etc/fail2ban/filter.d"
   mkdir -p "$fdir"
 
   cat > "${fdir}/npm-access.conf" << 'FILTER'
-# Fail2Ban filter for NPM access logs.
-# NPM uses a custom format; standard nginx filters will NOT match.
+# Fail2Ban filter for NPM access logs — custom format, standard filters won't match.
 [Definition]
 failregex = ^.*\s+(?:401|403|404)\s+.*\[Client\s+<HOST>\]\s+\[Length\s+\d+\]\s+.*$
 ignoreregex = ^.*\s+(?:404)\s+.*".*\.(?:png|jpe?g|gif|ico|svg|css|js|ttf|woff2?|eot|map)(?:\?[^"]*)?"\s+.*$
@@ -350,8 +405,8 @@ FILTER
   cat > /etc/fail2ban/jail.local << EOF
 # Auto-generated by ${SCRIPT_NAME} v${SCRIPT_VERSION} on $(date -Iseconds)
 #
-# NOTE: NPM uses a custom access log format. Built-in fail2ban nginx-* filters
-# are BROKEN for NPM access logs. Use the custom 'npm-access' filter instead.
+# NOTE: NPM uses a custom access log format. Standard fail2ban nginx-* filters
+# do NOT work. We use a custom 'npm-access' filter for access logs.
 # Log files: ${NPM_LOGS_DIR}/
 
 [DEFAULT]
@@ -368,6 +423,7 @@ filter   = sshd
 backend  = systemd
 maxretry = 3
 
+# NPM admin auth brute force (error logs use standard format)
 [npm-auth]
 enabled  = true
 port     = http,https,81
@@ -377,6 +433,7 @@ logpath  = ${NPM_LOGS_DIR}/*_error.log
 maxretry = 3
 findtime = 60
 
+# Forceful browsing / bot detection (custom filter for access logs)
 [npm-forceful-browsing]
 enabled  = true
 port     = http,https
@@ -387,6 +444,7 @@ maxretry = 15
 findtime = 60
 bantime  = 3600
 
+# Bot search (error log only)
 [npm-botsearch]
 enabled  = true
 port     = http,https
@@ -396,18 +454,22 @@ logpath  = ${NPM_LOGS_DIR}/*_error.log
 maxretry = 2
 findtime = 600
 bantime  = 86400
+
+# DISABLED: nginx-badbots — uses apache-badbots, broken with NPM format.
+# DISABLED: nginx-limit-req — NPM has no rate limiting by default.
 EOF
 
   mkdir -p /var/log/fail2ban
   systemctl restart fail2ban && systemctl enable fail2ban
+
   sleep 2
   local jails; jails=$(fail2ban-client status 2>/dev/null | grep "Jail list" | sed 's/.*://' | tr -d ' ' || true)
-  [[ -n "$jails" ]] && success "Jails: ${jails}" || warn "Check jails: fail2ban-client status"
+  [[ -n "$jails" ]] && success "Active jails: ${jails}" || warn "Check jails: fail2ban-client status"
   success "Fail2Ban configured"
 }
 
 setup_firewall() {
-  step "Firewall"
+  step "Firewall Configuration"
   if [[ "$OS_FAMILY" == "debian" ]]; then setup_firewall_debian
   else setup_firewall_rhel; fi
 }
@@ -417,7 +479,7 @@ setup_firewall_debian() {
   apt-get install -y -qq ufw
 
   # CRITICAL: Docker manipulates iptables directly. UFW's DEFAULT_FORWARD_POLICY=DROP
-  # blocks all container traffic. Must set ACCEPT before enabling UFW.
+  # blocks all container traffic. MUST set to ACCEPT.
   local ufw_def="/etc/default/ufw"
   if [[ -f "$ufw_def" ]]; then
     cp -n "$ufw_def" "${ufw_def}.bak" 2>/dev/null || true
@@ -426,25 +488,20 @@ setup_firewall_debian() {
     else
       echo 'DEFAULT_FORWARD_POLICY="ACCEPT"' >> "$ufw_def"
     fi
-  else
-    echo 'DEFAULT_FORWARD_POLICY="ACCEPT"' > "$ufw_def"
   fi
-  success "UFW DEFAULT_FORWARD_POLICY=ACCEPT"
 
   ufw --force reset
   ufw default deny incoming
   ufw default allow outgoing
 
   local ssh_port; ssh_port=$(ss -tlnp 2>/dev/null | grep -m1 ':22 ' | awk '{print $4}' | cut -d: -f2 || echo "22")
-  ufw allow "${ssh_port:-22}/tcp" comment 'SSH'
-  ufw allow 80/tcp comment 'HTTP'
-  ufw allow 443/tcp comment 'HTTPS'
-  ufw allow 81/tcp comment 'NPM Admin'
-  ufw allow 5001/tcp comment 'Dockge'
+  ufw allow "${ssh_port:-22}/tcp" comment 'SSH + Git Push'
+  ufw allow 80/tcp comment 'Dokku HTTP'
+  ufw allow 443/tcp comment 'Dokku HTTPS'
+  ufw allow 81/tcp comment 'NPM Admin (restrict after setup)'
 
   ufw --force enable && ufw reload
-  ufw status verbose
-  success "UFW configured"
+  success "UFW configured (Docker-compatible FORWARD policy)"
 }
 
 setup_firewall_rhel() {
@@ -457,7 +514,6 @@ setup_firewall_rhel() {
   firewall-cmd --permanent --add-service=http
   firewall-cmd --permanent --add-service=https
   firewall-cmd --permanent --add-port=81/tcp
-  firewall-cmd --permanent --add-port=5001/tcp
 
   if ! firewall-cmd --get-zones 2>/dev/null | grep -q '\bdocker\b'; then
     firewall-cmd --permanent --new-zone=docker 2>/dev/null || true
@@ -465,79 +521,105 @@ setup_firewall_rhel() {
   firewall-cmd --permanent --zone=docker --add-interface=docker0 2>/dev/null || true
   firewall-cmd --permanent --zone=docker --set-target=ACCEPT 2>/dev/null || true
   firewall-cmd --reload
-  firewall-cmd --list-all
   success "Firewalld configured"
-}
-
-setup_logrotate() {
-  step "Log Rotation"
-  cat > /etc/logrotate.d/npm << EOF
-${NPM_LOGS_DIR}/*.log {
-    weekly
-    missingok
-    rotate 14
-    compress
-    delaycompress
-    notifempty
-    create 0644 root root
-    sharedscripts
-    postrotate
-        docker kill --signal='USR1' npm 2>/dev/null || true
-    endscript
-}
-EOF
-  success "Log rotation: ${NPM_LOGS_DIR}/*.log (14 days)"
 }
 
 print_summary() {
   local elapsed=$(( $(date +%s) - START_TIME ))
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
   local fw_cmd; [[ "$OS_FAMILY" == "debian" ]] && fw_cmd="ufw status verbose" || fw_cmd="firewall-cmd --list-all"
+  local dokku_version; dokku_version=$(dokku version 2>/dev/null || echo "N/A")
 
   cat << EOF
-${C_B}${C_GRN}Deployment Complete${C_R}  (${SCRIPT_NAME} v${SCRIPT_VERSION})  ${C_B}$(( elapsed / 60 ))m $(( elapsed % 60 ))s${C_R}
 
-${C_B}Nginx Proxy Manager${C_R}
-  Admin:   http://${ip}:81
-  HTTP:    http://${ip}:80
-  HTTPS:   https://${ip}:443
-  Data:    ${NPM_DATA_DIR}
-  SSL:     ${NPM_LE_DIR}
-  Logs:    ${NPM_LOGS_DIR}
+${C_B}${C_GRN}DEPLOYMENT COMPLETE${C_R}  (${SCRIPT_NAME} v${SCRIPT_VERSION})
+${C_B}Duration:${C_R} $(( elapsed / 60 ))m $(( elapsed % 60 ))s
 
-${C_B}Dockge${C_R}
-  Direct:  http://${ip}:5001
-  Proxy:   Via NPM (add host → http://dockge:5001)
-  Data:    ${DOCKGE_DIR}/data
-  Stacks:  /opt/stacks
+${C_B}${C_CYN}-- SERVICES --${C_R}
 
-${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
-${C_B}Compose${C_R}   $(docker compose version --short 2>/dev/null || echo N/A)
-${C_B}Network${C_R}   proxy (bridge)
+  ${C_B}Dokku${C_R}
+    Version:   ${dokku_version}
+    Web:       http://${ip}:80
+    HTTPS:     https://${ip}:443 (after SSL setup)
 
-${C_B}Fail2Ban${C_R}  Jails: sshd, npm-auth, npm-forceful-browsing, npm-botsearch
-${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
+  ${C_B}Nginx Proxy Manager${C_R}
+    Admin UI:  http://${ip}:81
+    Data:      ${NPM_DATA_DIR}
+    SSL certs: ${NPM_LE_DIR}
+    Logs:      ${NPM_LOGS_DIR}
 
-${C_B}${C_YEL}Setup:${C_R}
-  1. NPM:     http://${ip}:81  (admin@example.com / changeme) → change password
-  2. Proxy:   Add dockge.your-domain.com → http://dockge:5001
-  3. SSL:     Use NPM SSL Certificates tab
-  4. Secure:  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "ufw delete allow 81/tcp && ufw reload"; else echo "firewall-cmd --permanent --remove-port=81/tcp && firewall-cmd --reload"; fi)
+  ${C_B}Docker${C_R}
+    Engine:    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
+    Compose:   $(docker compose version --short 2>/dev/null || echo N/A)
+    Network:   proxy (bridge)
 
-${C_B}Troubleshooting:${C_R}
-  Logs:    docker logs -f npm    docker logs -f dockge
-  Restart: cd ${NPM_DIR} && docker compose restart
-           cd ${DOCKGE_DIR} && docker compose restart
-  F2B:     fail2ban-client status    fail2ban-regex -v ${NPM_LOGS_DIR}/proxy-host-1_access.log /etc/fail2ban/filter.d/npm-access.conf
-  FW:      ${fw_cmd}
-  Log:     ${LOG_FILE}
+  ${C_B}Fail2Ban${C_R}
+    Jails:     sshd, npm-auth, npm-forceful-browsing, npm-botsearch
+    Status:    fail2ban-client status
+
+  ${C_B}Firewall${C_R}   $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
+
+${C_B}${C_CYN}-- QUICK START --${C_R}
+
+  1. ${C_B}NPM Admin:${C_R}  Open http://${ip}:81  (admin@example.com / changeme)
+     ${C_RED}-> Change password immediately.${C_R}
+
+  2. ${C_B}Add SSH key:${C_R}   dokku ssh-keys:add admin ~/.ssh/id_rsa.pub
+
+  3. ${C_B}Set domain:${C_R}    dokku domains:set-global your-domain.com
+
+  4. ${C_B}Create & deploy:${C_R}
+     dokku apps:create myapp
+     git remote add dokku dokku@${ip}:myapp
+     git push dokku main
+
+  5. ${C_B}Database:${C_R}      dokku plugin:install https://github.com/dokku/dokku-postgres.git
+     dokku postgres:create mydb && dokku postgres:link mydb myapp
+
+  6. ${C_B}SSL:${C_R}           dokku plugin:install https://github.com/dokku/dokku-letsencrypt.git
+     dokku letsencrypt:enable myapp && dokku letsencrypt:cron-job --add
+
+${C_B}${C_YEL}-- ESSENTIAL PLUGINS --${C_R}
+
+     dokku plugin:install https://github.com/dokku/dokku-postgres.git
+     dokku plugin:install https://github.com/dokku/dokku-redis.git
+     dokku plugin:install https://github.com/dokku/dokku-mysql.git
+     dokku plugin:install https://github.com/dokku/dokku-letsencrypt.git
+
+${C_B}${C_YEL}-- IMPORTANT NOTES --${C_R}
+
+     - hostname -f must return a valid FQDN before creating apps
+     - Dokku owns 80/443; NPM is on port 81 only for admin UI
+     - Git push uses SSH on port 22; add SSH key before pushing
+
+${C_B}${C_YEL}-- SECURE PORT 81 --${C_R}
+
+     After NPM setup, restrict port 81 access:
+$(if [[ "$OS_FAMILY" == "debian" ]]; then
+  echo "       ufw delete allow 81/tcp && ufw reload"
+else
+  echo "       firewall-cmd --permanent --remove-port=81/tcp"
+  echo "       firewall-cmd --reload"
+fi)
+
+${C_B}${C_CYN}-- TROUBLESHOOTING --${C_R}
+
+     Logs:       dokku logs myapp -t    docker logs -f npm
+     Restart:    dokku ps:restart myapp   cd ${NPM_DIR} && docker compose restart
+     Fail2Ban:   fail2ban-client status
+                 fail2ban-client status npm-forceful-browsing
+                 fail2ban-regex -v ${NPM_LOGS_DIR}/proxy-host-1_access.log /etc/fail2ban/filter.d/npm-access.conf
+     Firewall:   ${fw_cmd}
+     Deploy log: ${LOG_FILE}
+
 EOF
   _log "INFO" "=== Deployment completed in $(( elapsed / 60 ))m $(( elapsed % 60 ))s ==="
 }
 
 main() {
-  printf "\n${C_B}${C_CYN}VPS Deployment — Docker + NPM + Dockge + Fail2Ban${C_R}\n"
-  printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
+  printf "\n${C_B}${C_CYN}  VPS Deployment — Dokku + NPM + Docker + Fail2Ban${C_R}\n"
+  printf "${C_DIM}  ${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
+
   preflight_checks
   idempotent_cleanup
   system_update
@@ -545,7 +627,8 @@ main() {
   install_docker
   setup_docker_network
   setup_nginx_proxy_manager
-  setup_dockge
+  setup_dokku
+  setup_dokku_plugins
   setup_fail2ban
   setup_firewall
   setup_logrotate
