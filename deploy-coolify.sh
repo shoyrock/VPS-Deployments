@@ -85,16 +85,7 @@ preflight_checks() {
   if [[ "$free_mb" -lt 2048 ]]; then warn "Low disk: ${free_mb}MB free (recommend >= 2048MB)."
   else success "Disk: $(( free_mb / 1024 ))GB free"; fi
 
-  info "Checking port conflicts..."
-  local conflict=false
-  for port in 80 443 81 8000; do
-    if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
-      local svc; svc=$(ss -tlnp 2>/dev/null | grep ":${port} " | head -1 | awk '{print $6}' || echo "unknown")
-      warn "Port ${port} in use by: ${svc}"
-      conflict=true
-    fi
-  done
-  [[ "$conflict" == true ]] && warn "Some ports occupied — will be freed during cleanup." || success "Ports 80, 443, 81, 8000 free"
+  success "Pre-flight checks passed"
 
   mkdir -p "$(dirname "$LOG_FILE")"
   _log "INFO" "=== ${SCRIPT_NAME} v${SCRIPT_VERSION} started ==="
@@ -273,8 +264,9 @@ COMPOSE
 setup_coolify() {
   step "Coolify"
   info "Running Coolify installer..."
-  # Coolify's Traefik owns 80/443 but NPM needs them. We stop Traefik post-install
-  # and connect Coolify to the proxy network so NPM routes to Coolify on :8000.
+  # Coolify's Traefik owns 80/443 but NPM needs them. We stop Traefik BEFORE
+  # starting NPM (so NPM can bind 80/443), then connect Coolify to the proxy
+  # network so NPM routes to Coolify on :8000.
   curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash
 
   info "Waiting for Coolify (:8000)..."
@@ -564,8 +556,8 @@ main() {
   install_dependencies
   install_docker
   setup_docker_network
-  setup_nginx_proxy_manager
   setup_coolify
+  setup_nginx_proxy_manager
   verify_coolify
   setup_fail2ban
   setup_firewall

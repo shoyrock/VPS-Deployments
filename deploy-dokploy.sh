@@ -286,7 +286,7 @@ COMPOSE
 setup_dokploy() {
   step "Dokploy"
   info "Installing Dokploy (this takes a few minutes)..."
-  curl -sSL https://dokploy.com/install.sh | sh
+  curl -fsSL https://dokploy.com/install.sh | sh
 
   info "Waiting for Dokploy..."
   for i in $(seq 1 60); do
@@ -298,7 +298,7 @@ setup_dokploy() {
   # Stop Dokploy's Traefik so NPM can own 80/443
   docker service scale dokploy-traefik=0 2>/dev/null || true
   docker service rm dokploy-traefik 2>/dev/null || true
-  docker network connect proxy dokploy 2>/dev/null || true
+  docker service update --network-add proxy dokploy 2>/dev/null || docker network connect proxy dokploy 2>/dev/null || true
 
   success "Dokploy deployed (UI :3000, Traefik stopped — NPM handles 80/443)"
 }

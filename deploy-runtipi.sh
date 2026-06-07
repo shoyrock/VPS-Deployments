@@ -6,7 +6,7 @@ set -euo pipefail
 readonly SCRIPT_VERSION="2.0.0-runtipi"
 readonly SCRIPT_NAME="deploy-runtipi.sh"
 readonly START_TIME=$(date +%s)
-readonly TIPI_DIR="${HOME}/runtipi"
+readonly TIPI_DIR="/opt/runtipi"
 readonly NPM_DIR="/opt/npm"
 readonly NPM_DATA_DIR="${NPM_DIR}/data"
 readonly NPM_LE_DIR="${NPM_DIR}/letsencrypt"
@@ -263,7 +263,7 @@ COMPOSE
 setup_runtipi() {
   step "Runtipi"
   info "Installing Runtipi (this may take a few minutes)..."
-  curl -L https://setup.runtipi.io | sudo bash
+  curl -fsSL https://setup.runtipi.io | bash
 
   info "Reconfiguring Traefik: 80→8080, 443→8443 (NPM takes 80/443)..."
   cd "$TIPI_DIR" && docker compose stop 2>/dev/null || true
@@ -543,8 +543,8 @@ main() {
   install_dependencies
   install_docker
   setup_docker_network
-  setup_nginx_proxy_manager
   setup_runtipi
+  setup_nginx_proxy_manager
   setup_fail2ban
   setup_firewall
   setup_logrotate

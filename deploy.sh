@@ -152,7 +152,7 @@ _run_script() {
   read -rp "Proceed? [y/N]: " confirm
   [[ "$confirm" =~ ^[Yy]$ ]] || { printf "Aborted.\n"; return 1; }
   printf "\n${C_CYN}▶ Starting ${script_name}...${C_R}\n\n"
-  exec sudo bash "$script_path"
+  bash "$script_path"
 }
 
 run_tool() {

@@ -295,7 +295,7 @@ setup_casaos() {
 
   info "Reconfiguring CasaOS gateway: 80 → 8080..."
   if [[ -f /etc/casaos/gateway.ini ]]; then
-    sed -i 's/port = 80/port = 8080/' /etc/casaos/gateway.ini 2>/dev/null || true
+    sed -i 's/port = 80/port = 8080/g' /etc/casaos/gateway.ini 2>/dev/null || true
     systemctl restart casaos-gateway 2>/dev/null || true
     success "CasaOS gateway moved to port 8080"
   else
@@ -579,8 +579,8 @@ main() {
   install_dependencies
   install_docker
   setup_docker_network
-  setup_nginx_proxy_manager
   setup_casaos
+  setup_nginx_proxy_manager
   setup_fail2ban
   setup_firewall
   setup_logrotate

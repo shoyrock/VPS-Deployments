@@ -2,6 +2,7 @@
 # deploy-cosmos.sh — Docker + NPM + Cosmos + Fail2Ban
 # v2.0.0-cosmos | Usage: sudo ./deploy-cosmos.sh
 set -euo pipefail
+IFS=$'\n\t'
 
 readonly SCRIPT_VERSION="2.0.0-cosmos"
 readonly SCRIPT_NAME="deploy-cosmos.sh"
@@ -302,13 +303,13 @@ COMPOSE
 
   info "Waiting for Cosmos..."
   for i in $(seq 1 60); do
-    curl -sf --max-time 5 http://127.0.0.1:8080/ &>/dev/null && { success "Cosmos responding"; break; }
+    docker exec cosmos-server wget -q --spider --timeout=5 http://127.0.0.1:80/ &>/dev/null && { success "Cosmos responding"; break; }
     [[ $i -eq 60 ]] && warn "Cosmos timed out (3m). Check: docker logs cosmos-server"
     sleep 3
   done
 
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
-  success "Cosmos deployed: http://${ip}:8080 | https://${ip}:8443 (proxied via NPM)"
+  success "Cosmos deployed (access via NPM proxy at http://cosmos-server:80)"
 }
 
 setup_fail2ban() {
@@ -445,7 +446,6 @@ setup_firewall_debian() {
   ufw allow 80/tcp comment 'HTTP (NPM)'
   ufw allow 443/tcp comment 'HTTPS (NPM)'
   ufw allow 81/tcp comment 'NPM Admin (restrict after setup)'
-  ufw allow 4242/udp comment 'Cosmos Constellation VPN'
   ufw --force enable && ufw reload
   ufw status verbose
   success "UFW configured"
@@ -460,7 +460,6 @@ setup_firewall_rhel() {
   firewall-cmd --permanent --add-service=http
   firewall-cmd --permanent --add-service=https
   firewall-cmd --permanent --add-port=81/tcp
-  firewall-cmd --permanent --add-port=4242/udp
   firewall-cmd --reload
   firewall-cmd --list-all
   success "Firewalld configured"
@@ -507,7 +506,6 @@ ${C_B}Nginx Proxy Manager${C_R}
   Logs:      ${NPM_LOGS_DIR}
 
 ${C_B}Cosmos Server${C_R}
-  Direct:    http://${ip}:8080 | https://${ip}:8443
   Proxied:   Via NPM at :80/:443 (add proxy host → http://cosmos-server:80)
   Data:      ${COSMOS_DATA_DIR}
   Compose:   ${COSMOS_DIR}/docker-compose.yml
@@ -523,7 +521,7 @@ ${C_B}Fail2Ban${C_R}
   Status:    fail2ban-client status
 
 ${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
-  Ports:     22/tcp (SSH), 80/tcp (HTTP), 443/tcp (HTTPS), 81/tcp (NPM Admin), 4242/udp (Cosmos VPN)
+  Ports:     22/tcp (SSH), 80/tcp (HTTP), 443/tcp (HTTPS), 81/tcp (NPM Admin)
 
 ${C_B}${C_YEL}-- INITIAL SETUP --${C_R}
 

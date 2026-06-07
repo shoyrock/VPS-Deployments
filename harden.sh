@@ -15,7 +15,7 @@ OS_FAMILY="" PKG_MANAGER="" PKG_INSTALL=""
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-_log()   { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOGFILE"; }
+_log()   { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOGFILE" || true; }
 info()   { printf "${C_BLU}[INFO]${C_RST}  %s\n" "$*"; _log "INFO: $*"; }
 warn()   { printf "${C_YLW}[WARN]${C_RST}  %s\n" "$*"; _log "WARN: $*"; }
 ok()     { printf "${C_GRN}[OK]${C_RST}    %s\n" "$*"; _log "OK: $*"; }
@@ -168,9 +168,9 @@ harden_firewall() {
         ufw --force reset >> "$LOGFILE" 2>&1 || true
         ufw default deny incoming  >> "$LOGFILE" 2>&1 || true
         ufw default allow outgoing >> "$LOGFILE" 2>&1 || true
-        ufw limit in on any port 22  proto tcp comment 'SSH rate limit'    >> "$LOGFILE" 2>&1 || true
-        ufw limit in on any port 80  proto tcp comment 'HTTP rate limit'   >> "$LOGFILE" 2>&1 || true
-        ufw limit in on any port 443 proto tcp comment 'HTTPS rate limit'  >> "$LOGFILE" 2>&1 || true
+        ufw limit 22/tcp  comment 'SSH rate limit'    >> "$LOGFILE" 2>&1 || true
+        ufw limit 80/tcp  comment 'HTTP rate limit'   >> "$LOGFILE" 2>&1 || true
+        ufw limit 443/tcp comment 'HTTPS rate limit'  >> "$LOGFILE" 2>&1 || true
         ufw delete allow 81/tcp >> "$LOGFILE" 2>&1 || true
         ufw --force enable >> "$LOGFILE" 2>&1 || true
         ok "UFW rate limiting configured"
@@ -196,7 +196,7 @@ harden_geoip() {
     mkdir -p "$GEOIP_DIR"
     local c updated=0
     for c in cn ru kp ir; do
-        curl -fsSL --max-time 30 "http://www.ipdeny.com/ipblocks/data/countries/${c}.zone" -o "${GEOIP_DIR}/${c}.zone" >> "$LOGFILE" 2>&1 && {
+        curl -fsSL --max-time 30 "https://www.ipdeny.com/ipblocks/data/countries/${c}.zone" -o "${GEOIP_DIR}/${c}.zone" >> "$LOGFILE" 2>&1 && {
             updated=$((updated+1))
             _log "GeoIP zone downloaded: ${c}.zone"
         } || warn "Failed to download zone: $c"
@@ -341,8 +341,12 @@ DNFAUTO
 # ---------------------------------------------------------------------------
 lockdown_npm_admin() {
     info "=== Locking down NPM admin panel ==="
+    local dcf="${NPM_DIR:-/opt/npm}/docker-compose.yml"
+    if grep -q '127\.0\.0\.1:81:81' "$dcf" 2>/dev/null; then
+        info "NPM admin already locked to localhost"; return 0
+    fi
     local paths=(/opt/npm /root/npm /home/*/npm /opt/nginx-proxy-manager)
-    local found=0 dcf
+    local found=0
     for p in "${paths[@]}"; do
         for dcf in "$p"/docker-compose.yml "$p"/docker-compose.yaml; do
             [[ -f "$dcf" ]] || continue
@@ -511,7 +515,7 @@ verify_hardening() {
     echo ""
     _log "=== Verification: $pass/$total passed ==="
     # Clear abort trap on successful completion
-    trap - EXIT
+    trap - ERR
 }
 
 # ---------------------------------------------------------------------------
@@ -548,8 +552,8 @@ print_summary() {
 # Main
 # ---------------------------------------------------------------------------
 main() {
-    # Log any unexpected exit
-    trap '_log "=== SCRIPT ABORTED at line $LINENO ==="' EXIT
+    # Log any unexpected error (does not fire on normal exit)
+    trap '_log "=== SCRIPT ABORTED at line $LINENO ==="' ERR
     preflight
     user_confirm
     backup_configs

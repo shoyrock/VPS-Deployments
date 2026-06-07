@@ -29,7 +29,7 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script incl
 | 6 | `deploy-runtipi.sh` | NPM + Runtipi | **80, 443, 81** | Home server + 300 apps |
 | 7 | `deploy-casaos.sh` | NPM + CasaOS | **80, 443, 81** | Home server with app store |
 | 8 | `deploy-cosmos.sh` | NPM + Cosmos | **80, 443, 81** | All-in-one homelab suite |
-| 9 | `deploy-caprover.sh` | NPM + CapRover | **80, 443, 81** | PaaS — uses CapRover's own nginx |
+| 9 | `deploy-caprover.sh` | NPM + CapRover | **80, 443, 81** | PaaS — CapRover UI on 3000, proxied via NPM |
 | 10 | `deploy-yunohost.sh` | NPM + YunoHost | **80, 443, 81** | Debian server distro (Debian 12) |
 | 11 | `deploy-freedombox.sh` | NPM + FreedomBox | **80, 443, 81** | Debian home server (Debian 12) |
 | 🔒 | **`harden.sh`** | **Full system hardening** | — | Run after deployment — see below |
@@ -140,7 +140,7 @@ Tool containers have **no host ports exposed**. They communicate with NPM via Do
 | **CasaOS** | Gateway | ✅ Disabled | Moved to internal port 8080, proxied via NPM |
 | **Runtipi** | Traefik | ✅ Disabled | Moved to internal ports 8080/8443, proxied via NPM |
 | **Cosmos** | Host mode | ✅ Disabled | Changed to bridge mode, proxied via NPM |
-| **CapRover** | nginx | ℹ️ Own proxy | Keeps 80/443 for app routing, NPM on port 81 |
+| **CapRover** | nginx | ✅ Disabled | Removed 80/443 bindings, tool proxied via NPM at `http://caprover:3000` |
 | **Dokku** | nginx | ℹ️ Own proxy | Keeps 80/443 for app routing, NPM on port 81 |
 | **YunoHost** | nginx | ℹ️ Own proxy | Keeps 80/443, NPM on port 81 |
 | **FreedomBox** | Apache | ℹ️ Own proxy | Keeps 80/443, NPM on port 81 |
@@ -182,7 +182,7 @@ All config changes are backed up with `.harden-backup-<timestamp>` suffix before
 | **CasaOS** | Gateway on 80 | Reconfigured to port 8080 |
 | **Runtipi** | Traefik on 80/443 | Reconfigured to port 8080/8443 |
 | **Cosmos** | Host mode on 80/443 | Changed to bridge mode with ports 8080/8443 |
-| **CapRover** | nginx on 80/443 | **Cannot be disabled** — essential for app routing |
+| **CapRover** | nginx on 80/443 | Port bindings removed, tool proxied via NPM at `http://caprover:3000` |
 | **Dokku** | nginx on 80/443 | **Cannot be disabled** — essential for app routing |
 | **YunoHost** | nginx on 80/443 | **Cannot be disabled** — essential for app routing |
 | **FreedomBox** | Apache on 80/443 | **Cannot be disabled** — essential for app routing |
@@ -242,7 +242,7 @@ sudo ufw delete allow 81/tcp && sudo ufw reload
 ├── deploy-cosmos.sh           ← NPM + Cosmos (bridge mode)
 ├── deploy-casaos.sh           ← NPM + CasaOS (port 8080)
 ├── deploy-runtipi.sh          ← NPM + Runtipi (Traefik on 8080)
-├── deploy-caprover.sh         ← NPM (81) + CapRover
+├── deploy-caprover.sh         ← NPM + CapRover (UI on 3000)
 ├── deploy-dokku.sh            ← NPM (81) + Dokku
 ├── deploy-yunohost.sh         ← NPM (81) + YunoHost (Debian 12)
 ├── deploy-freedombox.sh       ← NPM (81) + FreedomBox (Debian 12)

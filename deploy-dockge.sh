@@ -203,6 +203,7 @@ services:
     image: 'jc21/nginx-proxy-manager:latest'
     restart: always
     container_name: npm
+    hostname: npm
     ports:
       - '0.0.0.0:80:80'
       - '0.0.0.0:443:443'
@@ -261,6 +262,7 @@ COMPOSE
 
 setup_dockge() {
   step "Dockge"
+  local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
   mkdir -p /opt/dockge /opt/stacks && cd /opt/dockge
   cat > docker-compose.yml << 'COMPOSE'
 services:
@@ -296,7 +298,7 @@ COMPOSE
   docker network connect proxy dockge 2>/dev/null || true
   info "Waiting for Dockge..."
   for i in $(seq 1 40); do
-    curl -sf --max-time 5 http://127.0.0.1:5001/ &>/dev/null && { success "Dockge ready"; break; }
+    docker exec dockge curl -sf --max-time 5 http://127.0.0.1:5001/ &>/dev/null && { success "Dockge ready"; break; }
     [[ $i -eq 40 ]] && warn "Dockge timed out. Check: docker logs dockge"
     sleep 3
   done
@@ -445,7 +447,6 @@ setup_firewall_debian() {
   ufw allow 80/tcp comment 'HTTP'
   ufw allow 443/tcp comment 'HTTPS'
   ufw allow 81/tcp comment 'NPM Admin'
-  ufw allow 5001/tcp comment 'Dockge'
 
   ufw --force enable && ufw reload
   ufw status verbose
@@ -462,7 +463,6 @@ setup_firewall_rhel() {
   firewall-cmd --permanent --add-service=http
   firewall-cmd --permanent --add-service=https
   firewall-cmd --permanent --add-port=81/tcp
-  firewall-cmd --permanent --add-port=5001/tcp
 
   if ! firewall-cmd --get-zones 2>/dev/null | grep -q '\bdocker\b'; then
     firewall-cmd --permanent --new-zone=docker 2>/dev/null || true
@@ -511,7 +511,6 @@ ${C_B}Nginx Proxy Manager${C_R}
   Logs:    ${NPM_LOGS_DIR}
 
 ${C_B}Dockge${C_R}
-  Direct:  http://${ip}:5001
   Proxy:   Via NPM (add host → http://dockge:5001)
   Data:    ${DOCKGE_DIR}/data
   Stacks:  /opt/stacks
@@ -551,7 +550,7 @@ main() {
   setup_docker_network
   setup_nginx_proxy_manager
   setup_dockge
-  setup_fail2ban
+   setup_fail2ban
   setup_firewall
   setup_logrotate
   print_summary
