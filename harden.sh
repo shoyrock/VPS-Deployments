@@ -462,43 +462,107 @@ LIMITS
 }
 
 # ---------------------------------------------------------------------------
+# 12. Self-Verification — checks every module and reports PASS/FAIL
+# ---------------------------------------------------------------------------
+verify_hardening() {
+    info "=== Verifying hardening ==="
+    local total=0 pass=0
+    local status val
+
+    _check() {
+        total=$((total + 1))
+        if eval "$2" >> "$LOGFILE" 2>&1; then
+            pass=$((pass + 1))
+            printf "  ${C_GRN}[PASS]${C_RST}  %s\n" "$1"
+            _log "VERIFY PASS: $1"
+        else
+            printf "  ${C_RED}[FAIL]${C_RST}  %s\n" "$1"
+            _log "VERIFY FAIL: $1"
+        fi
+    }
+
+    echo ""
+    echo "┌──────────────────────────────────────────────────────────────────┐"
+    echo "│  HARDENING VERIFICATION                                        │"
+    echo "├──────────────────────────────────────────────────────────────────┤"
+
+    # 1. SSH
+    _check "SSH root disabled"       "grep -q '^PermitRootLogin no' /etc/ssh/sshd_config"
+    _check "SSH Protocol 2"          "grep -q '^Protocol 2' /etc/ssh/sshd_config"
+    _check "SSH MaxAuthTries 3"      "grep -q '^MaxAuthTries 3' /etc/ssh/sshd_config"
+
+    # 2. Sysctl
+    _check "Kernel SYN cookies"      "[[ \$(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null) == '1' ]]"
+    _check "Kernel RP filter"        "[[ \$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null) == '1' ]]"
+    _check "No source routing"       "[[ \$(sysctl -n net.ipv4.conf.all.accept_source_route 2>/dev/null) == '0' ]]"
+
+    # 3. Firewall
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+        _check "UFW rate limit SSH"  "ufw status 2>/dev/null | grep -q 'LIMIT.*22'"
+        _check "UFW rate limit HTTP" "ufw status 2>/dev/null | grep -q 'LIMIT.*80'"
+    else
+        _check "Firewalld rate limit" "firewall-cmd --list-all 2>/dev/null | grep -q 'rich rule'"
+    fi
+
+    # 4. GeoIP
+    _check "GeoIP zone files"        "[[ -f /usr/local/bin/geoip-block/cn.zone ]]"
+    _check "GeoIP iptables chain"    "iptables -L GEOIP_BLOCK -n >/dev/null 2>&1"
+
+    # 5. CrowdSec
+    _check "CrowdSec installed"      "command -v cscli >/dev/null 2>&1"
+    _check "CrowdSec running"        "systemctl is-active --quiet crowdsec 2>/dev/null"
+    _check "CrowdSec bouncer"        "systemctl is-active --quiet crowdsec-firewall-bouncer 2>/dev/null"
+
+    # 6. AIDE
+    _check "AIDE installed"          "command -v aide >/dev/null 2>&1"
+
+    # 7. Auto updates
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+        _check "Auto-updates active" "systemctl is-active --quiet unattended-upgrades 2>/dev/null"
+    else
+        _check "Auto-updates active" "systemctl is-active --quiet dnf-automatic.timer 2>/dev/null"
+    fi
+
+    # 8. NPM lockdown
+    _check "NPM on localhost:81"     "ss -tln 2>/dev/null | grep -q '127.0.0.1:81'"
+
+    # 9. Docker
+    _check "Docker daemon.json"      "[[ -f /etc/docker/daemon.json ]]"
+
+    # 10. Backups
+    _check "Backup script exists"    "[[ -f /usr/local/bin/vps-backup ]]"
+    _check "Backup cron set"         "crontab -l 2>/dev/null | grep -q 'vps-backup'"
+
+    echo "├──────────────────────────────────────────────────────────────────┤"
+    printf "│  Result: ${C_BLD}%d/%d${C_RST} checks passed                                  │\n" "$pass" "$total"
+    echo "└──────────────────────────────────────────────────────────────────┘"
+    echo ""
+
+    if [[ "$pass" -lt "$total" ]]; then
+        local fail=$((total - pass))
+        warn "$fail check(s) failed — review output above"
+        echo "  Failed items can be re-run individually. Check log: $LOGFILE"
+        echo "  All configs backed up with suffix: $BAKSUF"
+    else
+        ok "All $total checks passed"
+    fi
+
+    echo "  ${C_YLW}Access NPM Admin:${C_RST}  ssh -L 8181:127.0.0.1:81 root@<vps-ip>"
+    echo "                    Then open http://localhost:8181"
+    echo ""
+    _log "=== Verification: $pass/$total passed ==="
+}
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 print_summary() {
-    local ssh_status="active"
-    systemctl is-active --quiet sshd 2>/dev/null || systemctl is-active --quiet ssh 2>/dev/null || ssh_status="inactive"
-    local cs_status; cs_status=$(systemctl is-active crowdsec 2>/dev/null || echo "inactive")
-
+    info "=== Hardening complete ==="
     echo ""
-    echo "╔══════════════════════════════════════════════════════════════════╗"
-    echo "║          ${C_GRN}${C_BLD}VPS HARDENING COMPLETE${C_RST}                            ║"
-    echo "╠══════════════════════════════════════════════════════════════════╣"
-    echo "║  Module                    │ Status                              ║"
-    echo "╠════════════════════════════╪═════════════════════════════════════╣"
-    printf "║  %-26s │ ${C_GRN}%-18s${C_RST}    ║\n" "SSH Hardening" "$ssh_status"
-    printf "║  %-26s │ ${C_GRN}%-18s${C_RST}    ║\n" "Kernel Sysctl" "applied"
-    printf "║  %-26s │ ${C_GRN}%-18s${C_RST}    ║\n" "Firewall Rate Limit" "active"
-    printf "║  %-26s │ ${C_GRN}%-18s${C_RST}    ║\n" "GeoIP Block (CN,RU,KP,IR)" "active"
-    printf "║  %-26s │ ${C_GRN}%-18s${C_RST}    ║\n" "CrowdSec (local mode)" "$cs_status"
-    printf "║  %-26s │ ${C_GRN}%-18s${C_RST}    ║\n" "AIDE File Integrity" "installed"
-    printf "║  %-26s │ ${C_GRN}%-18s${C_RST}    ║\n" "Auto Security Updates" "enabled"
-    printf "║  %-26s │ ${C_GRN}%-18s${C_RST}    ║\n" "NPM Admin Lockdown" "127.0.0.1:81"
-    printf "║  %-26s │ ${C_GRN}%-18s${C_RST}    ║\n" "Docker Hardening" "applied"
-    printf "║  %-26s │ ${C_GRN}%-18s${C_RST}    ║\n" "Daily Backups" "03:00 / 7d"
-    echo "╠══════════════════════════════════════════════════════════════════╣"
-    printf "║  ${C_BLU}Log:${C_RST} %s\n" "$LOGFILE"
-    printf "║  ${C_BLU}Backup suffix:${C_RST} %s\n" "$BAKSUF"
-    echo "╠══════════════════════════════════════════════════════════════════╣"
-    echo "║  ${C_YLW}Access NPM Admin:${C_RST}  ssh -L 81:localhost:81 root@<vps-ip>        ║"
-    echo "║                    Then open http://localhost:81                 ║"
-    echo "╠══════════════════════════════════════════════════════════════════╣"
-    echo "║  ${C_YLW}Verify:${C_RST}  sshd -T | grep -E 'permityes|passwordauth|maxauthtries'  ║"
-    echo "║          sysctl net.ipv4.tcp_syncookies                          ║"
-    echo "║          iptables -L GEOIP_BLOCK -n | head                       ║"
-    echo "║          cscli metrics                                           ║"
-    echo "╚══════════════════════════════════════════════════════════════════╝"
+    echo "${C_BLD}${C_GRN}VPS hardening complete.${C_RST}"
+    echo "  Log:       $LOGFILE"
+    echo "  Backups:   files with suffix $BAKSUF"
     echo ""
-    _log "=== Hardening complete ==="
 }
 
 # ---------------------------------------------------------------------------
@@ -519,6 +583,7 @@ main() {
     harden_docker
     harden_misc
     setup_backups
+    verify_hardening
     print_summary
 }
 
