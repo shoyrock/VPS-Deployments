@@ -209,8 +209,8 @@ harden_firewall() {
     if [[ "$OS_FAMILY" == "debian" ]]; then
         command -v ufw &>/dev/null || { info "Installing UFW"; $PKG_INSTALL ufw >> "$LOGFILE" 2>&1; }
         ufw --force reset >> "$LOGFILE" 2>&1 || true
-        ufw default deny incoming  >> "$LOGFILE" 2>&1
-        ufw default allow outgoing >> "$LOGFILE" 2>&1
+        ufw default deny incoming  >> "$LOGFILE" 2>&1 || true
+        ufw default allow outgoing >> "$LOGFILE" 2>&1 || true
         ufw limit in on any port 22  proto tcp comment 'SSH rate limit'    >> "$LOGFILE" 2>&1 || true
         ufw limit in on any port 80  proto tcp comment 'HTTP rate limit'   >> "$LOGFILE" 2>&1 || true
         ufw limit in on any port 443 proto tcp comment 'HTTPS rate limit'  >> "$LOGFILE" 2>&1 || true
