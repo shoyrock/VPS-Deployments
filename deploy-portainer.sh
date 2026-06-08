@@ -3,20 +3,28 @@
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     exec sudo bash "$0" "$@"
 fi
-# deploy-portainer.sh — Docker + NPM + Portainer + Fail2Ban (v2.0.0-portainer)
+# deploy-portainer.sh -- Docker + NPM + Portainer + Authelia + Fail2Ban (v3.0.0-portainer-authelia)
 # Idempotent VPS deployment. Usage: sudo ./deploy-portainer.sh
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="2.0.0-portainer"
+readonly SCRIPT_VERSION="3.0.0-portainer-authelia"
 readonly SCRIPT_NAME="deploy-portainer.sh"
 readonly START_TIME=$(date +%s)
-readonly NPM_DIR="/opt/npm"
-readonly PORTAINER_DIR="/opt/portainer"
-readonly NPM_DATA_DIR="${NPM_DIR}/data"
-readonly NPM_LE_DIR="${NPM_DIR}/letsencrypt"
+readonly STACK_DIR="/opt/portainer-stack"
+readonly NPM_DATA_DIR="${STACK_DIR}/data"
+readonly NPM_LE_DIR="${STACK_DIR}/letsencrypt"
 readonly NPM_LOGS_DIR="${NPM_DATA_DIR}/logs"
 readonly LOG_FILE="/var/log/vps-deploy.log"
+
+# Authelia paths
+readonly AUTHELIA_DIR="${STACK_DIR}/authelia"
+readonly AUTHELIA_SECRETS_DIR="${AUTHELIA_DIR}/secrets"
+readonly AUTHELIA_CONFIG_DIR="${AUTHELIA_DIR}/config"
+readonly AUTHELIA_SNIPPETS_DIR="${AUTHELIA_DIR}/snippets"
+
+# Domain set at runtime via user prompt
+DOMAIN=""
 
 # Colors (TTY only)
 if [[ -t 1 ]]; then
@@ -108,8 +116,6 @@ idempotent_cleanup() {
   fi
 }
 
-
-
 system_update() {
   step "System Update"
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
@@ -176,7 +182,7 @@ install_docker() {
 
 setup_docker_network() {
   step "Docker Network: proxy"
-  # NEVER remove existing proxy network — other containers may depend on it
+  # NEVER remove existing proxy network -- other containers may depend on it
   if ! docker network ls --format '{{.Name}}' | grep -qx "proxy"; then
     docker network create proxy 2>/dev/null || true
   fi
@@ -184,12 +190,213 @@ setup_docker_network() {
   success "Network 'proxy' ready"
 }
 
-setup_nginx_proxy_manager() {
-  step "Nginx Proxy Manager"
-  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" && cd "$NPM_DIR"
-  cat > docker-compose.yml << 'COMPOSE'
+get_user_domain() {
+  step "Domain Configuration"
+  # Check existing config
+  if [[ -f "${AUTHELIA_CONFIG_DIR}/configuration.yml" ]]; then
+    local existing_domain
+    existing_domain=$(grep "authelia_url:" "${AUTHELIA_CONFIG_DIR}/configuration.yml" 2>/dev/null | sed 's/.*https:\/\/authelia\.//' | tr -d ' ' || true)
+    if [[ -n "$existing_domain" ]]; then
+      info "Existing domain found: $existing_domain"
+      read -rp "Use existing domain? [Y/n]: " use_existing
+      [[ "$use_existing" =~ ^[Nn]$ ]] || { DOMAIN="$existing_domain"; return 0; }
+    fi
+  fi
+  printf "\n${C_B}Enter your root domain${C_R} (e.g., example.com): "
+  read -r DOMAIN
+  [[ -z "$DOMAIN" ]] && fatal "Domain is required."
+  DOMAIN=$(echo "$DOMAIN" | sed 's|https\?://||' | sed 's|/.*||' | tr -d ' ')
+  success "Domain set to: $DOMAIN"
+}
+
+setup_authelia_secrets() {
+  step "Generating Authelia Secrets"
+  mkdir -p "$AUTHELIA_SECRETS_DIR"
+  local secret_name secret_file
+  for secret_name in jwt_session storage_encryption session; do
+    secret_file="${AUTHELIA_SECRETS_DIR}/${secret_name}"
+    if [[ ! -f "$secret_file" ]]; then
+      tr -cd '[:alnum:]' </dev/urandom | fold -w 64 | head -n 1 > "$secret_file"
+      chmod 600 "$secret_file"
+      success "Secret '${secret_name}' generated"
+    else
+      info "Secret '${secret_name}' already exists (preserved)"
+    fi
+  done
+}
+
+setup_authelia_config() {
+  step "Authelia Configuration"
+  mkdir -p "$AUTHELIA_CONFIG_DIR"
+  local ip random_pass
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
+  random_pass=$(tr -cd '[:alnum:]' </dev/urandom | fold -w 16 | head -n 1)
+
+  # Generate configuration.yml -- unquoted EOF so $DOMAIN is substituted
+  if [[ ! -f "${AUTHELIA_CONFIG_DIR}/configuration.yml" ]]; then
+    cat > "${AUTHELIA_CONFIG_DIR}/configuration.yml" << EOF
+---
+# Authelia Configuration -- auto-generated
+server:
+  address: tcp://0.0.0.0:9091
+  endpoints:
+    authz:
+      forward-auth:
+        implementation: 'ForwardAuth'
+log:
+  level: info
+  format: text
+totp:
+  issuer: authelia.${DOMAIN}
+  period: 30
+  skew: 1
+authentication_backend:
+  file:
+    path: /config/users.yml
+    password:
+      algorithm: argon2id
+      iterations: 1
+      key_length: 32
+      salt_length: 16
+      memory: 65536
+      parallelism: 4
+access_control:
+  default_policy: two_factor
+  rules:
+    - domain: 'authelia.${DOMAIN}'
+      policy: one_factor
+    - domain: 'portainer.${DOMAIN}'
+      policy: two_factor
+    - domain: '*.${DOMAIN}'
+      policy: two_factor
+session:
+  name: authelia_session
+  same_site: lax
+  expiration: 1h
+  inactivity: 5m
+  remember_me_duration: 1M
+  cookies:
+    - domain: '${DOMAIN}'
+      authelia_url: 'https://authelia.${DOMAIN}'
+      default_redirection_url: 'https://portainer.${DOMAIN}'
+regulation:
+  max_retries: 3
+  find_time: 2m
+  ban_time: 1h
+storage:
+  local:
+    path: /config/db.sqlite3
+notifier:
+  filesystem:
+    filename: /config/notifications.txt
+EOF
+    success "configuration.yml created"
+  else
+    info "configuration.yml already exists (preserved)"
+  fi
+
+  # Generate users.yml -- quoted delimiter so $ variables are NOT expanded
+  if [[ ! -f "${AUTHELIA_CONFIG_DIR}/users.yml" ]]; then
+    cat > "${AUTHELIA_CONFIG_DIR}/users.yml" << 'USERS'
+---
+users:
+  admin:
+    disabled: false
+    displayname: "Administrator"
+    password: "$argon2id$v=19$m=65536,t=3,p=4$bXJzdWZmc3R1ZmZz$dHYzV3l1YVNhRjZwbHBLWGJzRjh4NUZNaTgxMXZVQUFEZ0lYVDlLVzgwU1dWMnpQS1VDdGV"
+    email: admin@example.com
+    groups:
+      - admins
+      - users
+USERS
+    # Store the random password in a file for the user to see
+    echo "$random_pass" > "${AUTHELIA_DIR}/.default_password"
+    chmod 600 "${AUTHELIA_DIR}/.default_password"
+    warn "Default user 'admin' created with default password 'authelia' -- CHANGE IMMEDIATELY"
+    success "users.yml created"
+  else
+    info "users.yml already exists (preserved)"
+  fi
+}
+
+create_nginx_snippets() {
+  step "NGINX Snippets for NPM + Authelia"
+  mkdir -p "$AUTHELIA_SNIPPETS_DIR"
+
+  # snippet 1: authelia-authrequest.conf
+  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" << 'SNIPPET1'
+## Authelia - Auth Request
+set $upstream_authelia http://authelia:9091;
+location /authelia {
+    internal;
+    proxy_pass $upstream_authelia/api/authz/forward-auth;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Uri $request_uri;
+    proxy_cache_bypass $cookie_session;
+    proxy_no_cache $cookie_session;
+    proxy_http_version 1.1;
+}
+SNIPPET1
+
+  # snippet 2: authelia-location.conf
+  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" << 'SNIPPET2'
+## Authelia - Location header for redirection
+location /authelia {
+    proxy_pass http://authelia:9091;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $http_host;
+}
+SNIPPET2
+
+  # snippet 3: proxy.conf
+  cat > "${AUTHELIA_SNIPPETS_DIR}/proxy.conf" << 'SNIPPET3'
+## Common Proxy Headers
+client_body_buffer_size 128k;
+proxy_next_upstream error timeout invalid_header http_500 http_502 http_503;
+proxy_redirect http:// $scheme://;
+proxy_http_version 1.1;
+proxy_cache_bypass $cookie_session;
+proxy_no_cache $cookie_session;
+proxy_buffers 64 256k;
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header X-Forwarded-Host $http_host;
+proxy_set_header X-Forwarded-Uri $request_uri;
+proxy_set_header X-Forwarded-Ssl on;
+proxy_set_header Upgrade $http_upgrade;
+proxy_set_header Connection $connection_upgrade;
+proxy_read_timeout 86400;
+proxy_send_timeout 86400;
+proxy_connect_timeout 86400;
+send_timeout 86400;
+SNIPPET3
+
+  success "NGINX snippets created in ${AUTHELIA_SNIPPETS_DIR}"
+  info "Mount these snippets in NPM via docker volume or copy into NPM data"
+}
+
+setup_stack() {
+  step "Deploying Portainer + Authelia Stack"
+  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" && cd "$STACK_DIR"
+
+  # Use absolute paths for Authelia volumes in compose
+  local authelia_config_path="${AUTHELIA_CONFIG_DIR}"
+  local authelia_secrets_path="${AUTHELIA_SECRETS_DIR}"
+
+  cat > docker-compose.yml << COMPOSE
 services:
-  app:
+  npm:
     image: 'jc21/nginx-proxy-manager:latest'
     restart: always
     container_name: npm
@@ -210,6 +417,49 @@ services:
       retries: 3
       start_period: 40s
 
+  portainer:
+    image: 'portainer/portainer-ce:latest'
+    restart: always
+    container_name: portainer
+    hostname: portainer
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    networks:
+      - proxy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9000/api/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  authelia:
+    image: authelia/authelia:latest
+    container_name: authelia
+    hostname: authelia
+    restart: always
+    volumes:
+      - ${authelia_config_path}:/config
+      - ${authelia_secrets_path}:/config/secrets:ro
+    environment:
+      - AUTHELIA_JWT_SECRET_FILE=/config/secrets/jwt_session
+      - AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE=/config/secrets/storage_encryption
+      - AUTHELIA_SESSION_SECRET_FILE=/config/secrets/session
+      - AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE=/config/secrets/jwt_session
+      - TZ=America/New_York
+    networks:
+      - proxy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "--timeout=3", "http://127.0.0.1:9091/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  portainer_data:
+
 networks:
   proxy:
     external: true
@@ -217,6 +467,8 @@ COMPOSE
 
   docker compose pull
   docker rm -f npm 2>/dev/null || true
+  docker rm -f portainer 2>/dev/null || true
+  docker rm -f authelia 2>/dev/null || true
   docker compose up -d
 
   info "Verifying NPM ports (80, 443, 81) are bound..."
@@ -239,10 +491,8 @@ COMPOSE
     sleep 2
   done
 
-
   info "Waiting for NPM container..."
   for i in $(seq 1 30); do docker ps --format '{{.Names}}' | grep -qx "npm" && break; sleep 2; done
-  docker network connect proxy npm 2>/dev/null || true
 
   info "Waiting for NPM admin UI (:81)..."
   for i in $(seq 1 60); do
@@ -267,44 +517,6 @@ COMPOSE
     sleep 2
   done
 
-  local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
-  success "NPM: http://${ip}:81"
-}
-
-setup_portainer() {
-  step "Portainer CE"
-  mkdir -p "$PORTAINER_DIR" && cd "$PORTAINER_DIR"
-  cat > docker-compose.yml << 'COMPOSE'
-services:
-  portainer:
-    image: 'portainer/portainer-ce:latest'
-    restart: always
-    container_name: portainer
-    hostname: portainer
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - portainer_data:/data
-    networks:
-      - proxy
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9000/api/status"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-
-volumes:
-  portainer_data:
-
-networks:
-  proxy:
-    external: true
-COMPOSE
-
-  docker compose pull
-  docker rm -f portainer 2>/dev/null || true
-  docker compose up -d
-  docker network connect proxy portainer 2>/dev/null || true
   info "Waiting for Portainer..."
   for i in $(seq 1 40); do
     docker exec portainer wget -qO- --timeout=5 http://127.0.0.1:9000/api/status &>/dev/null && { success "Portainer ready"; break; }
@@ -312,7 +524,19 @@ COMPOSE
     [[ $i -eq 40 ]] && warn "Portainer timed out. Check: docker logs portainer"
     sleep 3
   done
+
+  info "Waiting for Authelia..."
+  for i in $(seq 1 40); do
+    docker exec authelia wget -qO- --timeout=5 http://127.0.0.1:9091/api/health &>/dev/null && { success "Authelia ready"; break; }
+    docker ps --format '{{.Names}}' | grep -qx "authelia" || { [[ $i -eq 40 ]] && warn "Authelia container not found"; }
+    [[ $i -eq 40 ]] && warn "Authelia timed out. Check: docker logs authelia"
+    sleep 3
+  done
+
+  local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
+  success "NPM: http://${ip}:81"
   success "Portainer deployed (access via NPM proxy)"
+  success "Authelia deployed (access via NPM proxy)"
 }
 
 setup_fail2ban() {
@@ -327,7 +551,7 @@ setup_fail2ban() {
   fi
 
   # NPM uses a custom access log format (IP inside [Client IP]).
-  # Built-in fail2ban nginx filters won't match — custom filter required.
+  # Built-in fail2ban nginx filters won't match -- custom filter required.
   local fdir="/etc/fail2ban/filter.d"
   mkdir -p "$fdir"
 
@@ -512,6 +736,12 @@ print_summary() {
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
   local fw_cmd; [[ "$OS_FAMILY" == "debian" ]] && fw_cmd="ufw status verbose" || fw_cmd="firewall-cmd --list-all"
 
+  # Read default password if it exists
+  local default_pass_msg="authelia"
+  if [[ -f "${AUTHELIA_DIR}/.default_password" ]]; then
+    default_pass_msg=$(cat "${AUTHELIA_DIR}/.default_password")
+  fi
+
   cat << EOF
 ${C_B}${C_GRN}Deployment Complete${C_R}  (${SCRIPT_NAME} v${SCRIPT_VERSION})  ${C_B}$(( elapsed / 60 ))m $(( elapsed % 60 ))s${C_R}
 
@@ -528,6 +758,13 @@ ${C_B}Portainer CE${C_R}
   Port:      9000 (internal, no host port)
   Network:   proxy
 
+${C_B}Authelia${C_R}
+  Portal:    https://authelia.${DOMAIN}
+  Config:    ${AUTHELIA_CONFIG_DIR}
+  Snippets:  ${AUTHELIA_SNIPPETS_DIR}
+  Default:   admin / ${default_pass_msg}
+  Secrets:   ${AUTHELIA_SECRETS_DIR}
+
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
 ${C_B}Compose${C_R}   $(docker compose version --short 2>/dev/null || echo N/A)
 ${C_B}Network${C_R}   proxy (bridge)
@@ -535,40 +772,62 @@ ${C_B}Network${C_R}   proxy (bridge)
 ${C_B}Fail2Ban${C_R}  Jails: sshd, npm-auth, npm-forceful-browsing, npm-botsearch
 ${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
 
-${C_B}${C_YEL}Step 1 — NPM Admin${C_R}
+${C_B}${C_YEL}Step 1 -- NPM Admin${C_R}
   Open:   http://${ip}:81
   Login:  admin@example.com / changeme
   ${C_RED}→ Change password immediately${C_R}
 
-${C_B}${C_YEL}Step 2 — Add Proxy Host in NPM${C_R}
+${C_B}${C_YEL}Step 2 -- Add DNS Records${C_R}
+  A  authelia.${DOMAIN}   → ${ip}
+  A  portainer.${DOMAIN}  → ${ip}
+  A  *.${DOMAIN}          → ${ip}  (wildcard for other services)
+
+${C_B}${C_YEL}Step 3 -- Add Proxy Hosts in NPM${C_R}
   Dashboards → Proxy Hosts → Add Proxy Host
+
+  ${C_B}Authelia Portal:${C_R}
   ┌──────────────────────────────────────┐
-  │ Domain Names:    portainer.YOURDOMAIN│
+  │ Domain Names:    authelia.${DOMAIN}   │
+  │ Scheme:          http                │
+  │ Forward Host:    authelia            │
+  │ Forward Port:    9091                │
+  │ Block Exploits:  ON                  │
+  └──────────────────────────────────────┘
+  Save → SSL tab → Request cert → Force SSL ON
+
+  ${C_B}Portainer Dashboard:${C_R}
+  ┌──────────────────────────────────────┐
+  │ Domain Names:    portainer.${DOMAIN}  │
   │ Scheme:          http                │
   │ Forward Host:    portainer           │
   │ Forward Port:    9000                │
   │ Block Exploits:  ON                  │
   └──────────────────────────────────────┘
-  Click Save
+  Save → SSL tab → Request cert → Force SSL ON
+  → Advanced tab: paste contents of authelia-authrequest.conf snippet
 
-${C_B}${C_YEL}Step 3 — SSL Certificate${C_R}
-  On the same proxy host → SSL tab
-  ┌──────────────────────────────────────┐
-  │ SSL:             Request a new cert  │
-  │ Force SSL:       ON                  │
-  │ HTTP/2 Support:  ON                  │
-  │ Email:           your-email@domain   │
-  │ Agree to TOS:    ON                  │
-  └──────────────────────────────────────┘
-  Click Save
+${C_B}${C_YEL}Step 4 -- Authelia Setup${C_R}
+  Open:   https://authelia.${DOMAIN}
+  Login:  admin / authelia
+  ${C_RED}→ Change password via "Settings" → "Password" immediately${C_R}
+  → Register TOTP device (scan QR code with authenticator app)
 
-${C_B}${C_YEL}Step 4 — Secure Admin Port${C_R}
+${C_B}${C_YEL}Step 5 -- Enable 2FA on Proxy Hosts${C_R}
+  In NPM, edit each protected proxy host:
+  Advanced tab → paste contents of authelia-authrequest.conf
+  This forces Authelia 2FA before granting access.
+
+${C_B}${C_YEL}Step 6 -- Secure Admin Port${C_R}
   $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "  ufw delete allow 81/tcp && ufw reload"; else echo "  firewall-cmd --permanent --remove-port=81/tcp && firewall-cmd --reload"; fi)
 
+${C_B}NGINX Snippets (for NPM Advanced tab):${C_R}
+  ${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf
+  ${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf
+  ${AUTHELIA_SNIPPETS_DIR}/proxy.conf
+
 ${C_B}Troubleshooting:${C_R}
-  Logs:    docker logs -f npm    docker logs -f portainer
-  Restart: cd ${NPM_DIR} && docker compose restart
-           cd ${PORTAINER_DIR} && docker compose restart
+  Logs:    docker logs -f npm    docker logs -f portainer    docker logs -f authelia
+  Restart: cd ${STACK_DIR} && docker compose restart
   F2B:     fail2ban-client status    fail2ban-regex -v ${NPM_LOGS_DIR}/proxy-host-1_access.log /etc/fail2ban/filter.d/npm-access.conf
   FW:      ${fw_cmd}
   Log:     ${LOG_FILE}
@@ -577,7 +836,7 @@ EOF
 }
 
 main() {
-  printf "\n${C_B}${C_CYN}VPS Deployment — Docker + NPM + Portainer + Fail2Ban${C_R}\n"
+  printf "\n${C_B}${C_CYN}VPS Deployment -- Docker + NPM + Portainer + Authelia + Fail2Ban${C_R}\n"
   printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
   preflight_checks
   idempotent_cleanup
@@ -585,8 +844,11 @@ main() {
   install_dependencies
   install_docker
   setup_docker_network
-  setup_nginx_proxy_manager
-  setup_portainer
+  get_user_domain
+  setup_authelia_secrets
+  setup_authelia_config
+  create_nginx_snippets
+  setup_stack
   setup_fail2ban
   setup_firewall
   setup_logrotate

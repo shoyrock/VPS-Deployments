@@ -39,63 +39,58 @@ declare -A TOOL_CATEGORIES
 # --- NPM + Container Manager ---
 TOOL_NAMES[1]="portainer"
 TOOL_DESCRIPTIONS[1]="Nginx Proxy Manager + Portainer — Visual container management with proxy"
-TOOL_PORTS[1]="80, 443, 81 (NPM admin)"
+TOOL_PORTS[1]="80, 443, 81"
 TOOL_CATEGORIES[1]="NPM + Container Manager"
 
 TOOL_NAMES[2]="dockge"
 TOOL_DESCRIPTIONS[2]="Nginx Proxy Manager + Dockge — Compose stack manager with proxy"
-TOOL_PORTS[2]="80, 443, 81 (NPM admin), 5001 (Dockge direct)"
+TOOL_PORTS[2]="80, 443, 81"
 TOOL_CATEGORIES[2]="NPM + Container Manager"
 
 # --- PaaS / App Platforms ---
 TOOL_NAMES[3]="coolify"
 TOOL_DESCRIPTIONS[3]="Coolify — Open-source PaaS (Heroku/Netlify alternative)"
-TOOL_PORTS[3]="80, 443, 8000 (Coolify UI)"
+TOOL_PORTS[3]="80, 443, 81"
 TOOL_CATEGORIES[3]="PaaS / App Platform"
 
 TOOL_NAMES[4]="dokploy"
 TOOL_DESCRIPTIONS[4]="Dokploy — Docker Swarm orchestration platform"
-TOOL_PORTS[4]="80, 443, 3000 (Dokploy UI)"
+TOOL_PORTS[4]="80, 443, 81"
 TOOL_CATEGORIES[4]="PaaS / App Platform"
 
-TOOL_NAMES[5]="dokku"
-TOOL_DESCRIPTIONS[5]="Dokku — Docker-powered mini-Heroku (git push to deploy)"
-TOOL_PORTS[5]="80, 443, 22 (SSH/git)"
-TOOL_CATEGORIES[5]="PaaS / App Platform"
+# --- Home Server OS ---
+TOOL_NAMES[5]="casaos"
+TOOL_DESCRIPTIONS[5]="CasaOS — Simple, elegant home server with app store"
+TOOL_PORTS[5]="80, 443, 81"
+TOOL_CATEGORIES[5]="Home Server OS"
 
 TOOL_NAMES[6]="runtipi"
 TOOL_DESCRIPTIONS[6]="Runtipi — Home server with 300+ one-click apps"
-TOOL_PORTS[6]="80, 443"
-TOOL_CATEGORIES[6]="PaaS / App Platform"
+TOOL_PORTS[6]="80, 443, 81"
+TOOL_CATEGORIES[6]="Home Server OS"
 
-# --- Home Server OS ---
-TOOL_NAMES[7]="casaos"
-TOOL_DESCRIPTIONS[7]="CasaOS — Simple, elegant home server with app store"
-TOOL_PORTS[7]="80 (CasaOS Web UI)"
+TOOL_NAMES[7]="cosmos"
+TOOL_DESCRIPTIONS[7]="Cosmos Server — All-in-one homelab suite with built-in proxy"
+TOOL_PORTS[7]="80, 443, 81"
 TOOL_CATEGORIES[7]="Home Server OS"
 
-TOOL_NAMES[8]="cosmos"
-TOOL_DESCRIPTIONS[8]="Cosmos Server — All-in-one homelab suite with built-in proxy"
-TOOL_PORTS[8]="80, 443, 4242/udp (VPN)"
-TOOL_CATEGORIES[8]="Home Server OS"
-
 # --- Debian Server Distributions ---
-TOOL_NAMES[9]="yunohost"
-TOOL_DESCRIPTIONS[9]="YunoHost — All-in-one Debian server (mail, LDAP, apps)"
-TOOL_PORTS[9]="22, 25, 80, 443, 587, 993 (Debian 12 only)"
+TOOL_NAMES[8]="yunohost"
+TOOL_DESCRIPTIONS[8]="YunoHost — All-in-one Debian server (mail, LDAP, apps)"
+TOOL_PORTS[8]="80, 443, 81 (Debian 12 only)"
+TOOL_CATEGORIES[8]="Debian Server Distro"
+
+TOOL_NAMES[9]="freedombox"
+TOOL_DESCRIPTIONS[9]="FreedomBox — Debian home server with Cockpit admin"
+TOOL_PORTS[9]="80, 443, 81 (Debian 12 only)"
 TOOL_CATEGORIES[9]="Debian Server Distro"
 
-TOOL_NAMES[10]="freedombox"
-TOOL_DESCRIPTIONS[10]="FreedomBox — Debian home server with Cockpit admin"
-TOOL_PORTS[10]="80, 443, 9090 (Cockpit) (Debian 12 only)"
-TOOL_CATEGORIES[10]="Debian Server Distro"
+TOOL_NAMES[10]="harden"
+TOOL_DESCRIPTIONS[10]="🔒 Harden VPS — SSH lockdown, CrowdSec, GeoIP block, auto-updates"
+TOOL_PORTS[10]="—"
+TOOL_CATEGORIES[10]="Security"
 
-TOOL_NAMES[11]="harden"
-TOOL_DESCRIPTIONS[11]="🔒 Harden VPS — SSH lockdown, CrowdSec, GeoIP block, auto-updates"
-TOOL_PORTS[11]="—"
-TOOL_CATEGORIES[11]="Security"
-
-readonly TOOL_COUNT=11
+readonly TOOL_COUNT=10
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COLORS & UI
@@ -152,10 +147,6 @@ _run_script() {
     harden.sh)
       printf "${C_YEL}!${C_R} This will harden system security (firewall, CrowdSec, auto-updates).\n"
       printf "  ${C_GRN}✔${C_R} Docker containers will NOT be affected.\n"
-      ;;
-    deploy-authelia.sh)
-      printf "${C_YEL}!${C_R} This will add the Authelia 2FA container to your existing setup.\n"
-      printf "  ${C_GRN}✔${C_R} Existing containers will NOT be affected.\n"
       ;;
     *)
       printf "${C_YEL}⚠${C_R} This will install/configure services. Existing containers may be ${C_RED}DESTROYED${C_R}.\n"
@@ -223,7 +214,7 @@ if [[ $# -gt 0 ]]; then
     dockge)                           requested="dockge" ;;
     coolify)                          requested="coolify" ;;
     dokploy)                          requested="dokploy" ;;
-    dokku)                            requested="dokku" ;;
+
     runtipi|tipi)                     requested="runtipi" ;;
     casaos|casa)                      requested="casaos" ;;
     cosmos)                           requested="cosmos" ;;
@@ -271,7 +262,7 @@ while true; do
     printf "\n${C_DIM}Press Enter to return to menu...${C_R}"
     read -r
   else
-    printf "${C_RED}Invalid choice. Please enter 0-${TOOL_COUNT} or q.${C_R}\n"
+    printf "${C_RED}Invalid choice. Please enter 1-${TOOL_COUNT} or q.${C_R}\n"
     sleep 1
   fi
 done

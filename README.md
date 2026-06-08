@@ -22,19 +22,16 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script incl
 
 | # | Option | What It Deploys | Notes |
 |---|--------|----------------|-------|
-| **0** | **Lite Bundle** | **NPM + Portainer** only | Minimal setup (~200MB RAM). Add more dashboards later. |
 | 1 | Portainer | NPM + Portainer | Visual container management |
 | 2 | Dockge | NPM + Dockge | Compose stack manager |
-| 3 | Coolify | NPM + Coolify | PaaS — **native 2FA** — Coolify Traefik disabled |
-| 4 | Dokploy | NPM + Dokploy | PaaS — **native 2FA** — Dokploy Traefik disabled |
-| 5 | Dokku | NPM + Dokku | PaaS — uses Dokku's own nginx |
+| 3 | Coolify | NPM + Coolify | PaaS — **native 2FA** |
+| 4 | Dokploy | NPM + Dokploy | PaaS — **native 2FA** |
+| 5 | CasaOS | NPM + CasaOS | Home server with app store |
 | 6 | Runtipi | NPM + Runtipi | Home server + 300 apps |
-| 7 | CasaOS | NPM + CasaOS | Home server with app store |
-| 8 | Cosmos | NPM + Cosmos | All-in-one homelab suite |
-| 9 | YunoHost | NPM + YunoHost | Debian server distro (Debian 12 only) |
-| 10 | FreedomBox | NPM + FreedomBox | Debian home server (Debian 12 only) |
-| 11 | **Authelia** | **SSO + TOTP 2FA portal** | Optional — adds 2FA login to ALL dashboards |
-| 12 | **Harden** | **Full system hardening** | Run after deployment — see below |
+| 7 | Cosmos | NPM + Cosmos | All-in-one homelab suite |
+| 8 | YunoHost | NPM + YunoHost | Debian server distro (Debian 12 only) |
+| 9 | FreedomBox | NPM + FreedomBox | Debian home server (Debian 12 only) |
+| 10 | **Harden** | **Full system hardening** | Run after deployment — see below |
 
 **All scripts expose only 3 ports: 80 (HTTP), 443 (HTTPS), 81 (NPM admin).** Individual tool containers have **no host ports** — they communicate internally via Docker's `proxy` network using their container hostnames (see table below).
 
@@ -62,51 +59,28 @@ All containers connect to the `proxy` Docker network and are reachable by hostna
 
 ## How to Use
 
-### Option 1: Lite Bundle (Recommended for Fresh VPS)
-
-The fastest way to get started. Deploys **NPM + Portainer** only — minimal resource usage, expand later.
+### Option 1: Use the Menu (Recommended)
 
 ```bash
 curl -fsSL -o deploy.sh https://raw.githubusercontent.com/shoyrock/VPS-Deployments/main/deploy.sh
 chmod +x deploy.sh
-./deploy.sh              # Pick [0] Lite Bundle from the menu
-# Or directly: ./deploy.sh lite
+./deploy.sh
 ```
 
-**After deploy:**
-1. Access NPM at `http://YOUR_VPS_IP:81` (default: admin@example.com / changeme)
-2. Add proxy host for Portainer: `portainer.yourdomain.com` → `http://portainer:9000`
-3. Request SSL certificate
-4. **Add more dashboards anytime:** `./deploy.sh` → pick another tool
+Pick your tool from the menu and follow the prompts.
 
-### Option 2: Deploy with 2FA (Authelia)
-
-For full protection, deploy Authelia after the lite bundle. It adds a login gate with TOTP 2FA (Google/Microsoft Authenticator) to **all** your dashboards.
-
-```bash
-./deploy.sh lite         # Step 1: deploy minimal setup
-./deploy.sh authelia     # Step 2: add 2FA portal
-```
-
-**After Authelia deploy:**
-1. Add DNS: `authelia.yourdomain.com` → your VPS IP
-2. In NPM, add proxy host: `authelia.yourdomain.com` → `http://authelia:9091`
-3. Visit `https://authelia.yourdomain.com`, login with default credentials
-4. Register your Authenticator app (scan QR code)
-5. For each dashboard proxy host, add the forward-auth config from `/opt/authelia/authelia-configure.sh`
-
-### Option 3: Deploy Individual Tools
+### Option 2: Direct Deploy
 
 ```bash
 ./deploy.sh portainer    # Deploy Portainer
 ./deploy.sh dockge       # Deploy Dockge
-./deploy.sh coolify      # Deploy Coolify (has native 2FA toggle)
-./deploy.sh dokploy      # Deploy Dokploy (has native 2FA toggle)
-./deploy.sh authelia     # Deploy Authelia 2FA portal
+./deploy.sh coolify      # Deploy Coolify
+./deploy.sh dokploy      # Deploy Dokploy
+./deploy.sh casaos       # Deploy CasaOS
 ./deploy.sh harden       # Harden the system
 ```
 
-### Option 4: Direct Script Download (skip menu)
+### Option 3: Direct Script Download (skip menu)
 
 ```bash
 curl -fsSL -o deploy-portainer.sh https://raw.githubusercontent.com/shoyrock/VPS-Deployments/main/deploy-portainer.sh
@@ -124,7 +98,56 @@ chmod +x deploy-portainer.sh
 
 ## Architecture
 
-**Only 3 ports are exposed to the internet.** All tool containers are internal-only:
+### Docker Compose Stacks
+
+Each deployment uses **Docker Compose** — but the structure depends on the tool type:
+
+| Tier | Tools | Compose Structure | Why |
+|------|-------|-------------------|-----|
+| **Unified Stack** | Portainer, Dockge, Cosmos | **Single** `docker-compose.yml` with both NPM + tool | Pure Docker containers — can coexist in one compose file |
+| **Hybrid** | Coolify, Dokploy, CasaOS, Runtipi | NPM in compose + tool via `curl \| bash` installer | Tool requires systemd services, custom networking, or non-Docker components |
+| **OS Distro** | YunoHost, FreedomBox | NPM in compose + full Debian OS install | These are complete Debian server distributions, not just containers |
+
+### Unified Stack (Portainer, Dockge, Cosmos)
+
+These scripts create a **single directory** and **single `docker-compose.yml`**:
+
+```
+/opt/portainer-stack/
+├── docker-compose.yml     ← npm + portainer services together
+├── data/                  ← NPM data
+├── letsencrypt/           ← NPM SSL certificates
+└── ...
+
+/opt/dockge-stack/
+├── docker-compose.yml     ← npm + dockge services together
+├── ...
+
+/opt/cosmos-stack/
+├── docker-compose.yml     ← npm + cosmos-server services together
+├── ...
+```
+
+One `docker compose up -d` starts both NPM and the dashboard. Both services attach to the external `proxy` network automatically.
+
+### Hybrid Stack (Coolify, Dokploy, CasaOS, Runtipi)
+
+These tools use their official `curl | bash` installers which set up systemd services, custom Docker networks, and non-container components. The script:
+
+1. Creates `/opt/npm/docker-compose.yml` for Nginx Proxy Manager
+2. Runs the tool's official installer
+3. Disables the tool's built-in proxy to prevent port conflicts
+4. Connects the tool's container to the `proxy` network
+
+### OS Distro (YunoHost, FreedomBox)
+
+These are full Debian server distributions. The script:
+
+1. Installs the Debian-based OS/distro on the VPS
+2. Creates `/opt/npm/docker-compose.yml` for Nginx Proxy Manager (on port 81)
+3. The distro keeps its own web server on ports 80/443
+
+### Network Flow
 
 ```
 INTERNET ──► UFW/Firewalld ──► NPM (80/443/81) ──► Docker proxy network
@@ -136,7 +159,7 @@ INTERNET ──► UFW/Firewalld ──► NPM (80/443/81) ──► Docker prox
                            :9000                    :5001                    :8000
 ```
 
-Tool containers have **no host ports exposed**. They communicate with NPM via Docker's internal `proxy` network using their hostnames. NPM is the single entry point for all HTTP/HTTPS traffic.
+**Only 3 ports are exposed to the internet.** All tool containers are internal-only — no host ports. They communicate with NPM via Docker's internal `proxy` network using their hostnames. NPM is the single entry point for all HTTP/HTTPS traffic.
 
 **Fail2Ban** (all scripts) includes:
 - `sshd` jail — SSH brute force protection
@@ -153,7 +176,6 @@ Tool containers have **no host ports exposed**. They communicate with NPM via Do
 | **CasaOS** | Gateway | ✅ Disabled | Moved to internal port 8080, proxied via NPM |
 | **Runtipi** | Traefik | ✅ Disabled | Moved to internal ports 8080/8443, proxied via NPM |
 | **Cosmos** | Host mode | ✅ Disabled | Changed to bridge mode, proxied via NPM |
-| **Dokku** | nginx | ℹ️ Own proxy | Keeps 80/443 for app routing, NPM on port 81 |
 | **YunoHost** | nginx | ℹ️ Own proxy | Keeps 80/443, NPM on port 81 |
 | **FreedomBox** | Apache | ℹ️ Own proxy | Keeps 80/443, NPM on port 81 |
 
@@ -196,7 +218,6 @@ All config changes are backed up with `.harden-backup-<timestamp>` suffix before
 | **CasaOS** | Gateway on 80 | Reconfigured to port 8080 |
 | **Runtipi** | Traefik on 80/443 | Reconfigured to port 8080/8443 |
 | **Cosmos** | Host mode on 80/443 | Changed to bridge mode with ports 8080/8443 |
-| **Dokku** | nginx on 80/443 | **Cannot be disabled** — essential for app routing |
 | **YunoHost** | nginx on 80/443 | **Cannot be disabled** — essential for app routing |
 | **FreedomBox** | Apache on 80/443 | **Cannot be disabled** — essential for app routing |
 
@@ -227,12 +248,12 @@ User → portainer.example.com → Authelia login gate → password + 6-digit co
 
 **Deploy:**
 ```bash
-./deploy.sh authelia       # After deploying your dashboards
+curl -fsSL -o deploy-authelia.sh https://raw.githubusercontent.com/shoyrock/VPS-Deployments/main/deploy-authelia.sh
+chmod +x deploy-authelia.sh
+./deploy-authelia.sh
 ```
 
-**Best for:** If you use multiple dashboards (Portainer, Dockge, CasaOS, etc.) and want one login with 2FA for all of them.
-
-**Can be added anytime later** — it does not modify or break existing containers.
+**Best for:** Multiple dashboards with one login + 2FA for all. Can be added anytime later.
 
 ---
 
@@ -271,30 +292,64 @@ sudo ufw delete allow 81/tcp && sudo ufw reload
 | `Permission denied to socket` | Use `sudo` for `fail2ban-client` |
 | Containers unreachable | `grep DEFAULT_FORWARD_POLICY /etc/default/ufw` — should be `ACCEPT` |
 | Port 80/443 conflict | `ss -tlnp \| grep ':80 '` — another service may still be bound |
-| Fail2Ban not catching | `sudo fail2ban-regex -v /opt/npm/data/logs/proxy-host-1_access.log /etc/fail2ban/filter.d/npm-access.conf` |
+| Fail2Ban not catching | `sudo fail2ban-regex -v /opt/npm/data/logs/proxy-host-1_access.log /etc/fail2ban/filter.d/npm-access.conf` (or `/opt/<tool>-stack/data/logs/` for unified stacks) |
 | Script failed | Check `/var/log/vps-deploy.log` |
+
+### Restarting Stacks
+
+**Unified stacks** (Portainer, Dockge, Cosmos):
+```bash
+cd /opt/portainer-stack && docker compose restart   # Restart NPM + Portainer
+cd /opt/dockge-stack && docker compose restart      # Restart NPM + Dockge
+cd /opt/cosmos-stack && docker compose restart      # Restart NPM + Cosmos
+```
+
+**Hybrid stacks** (Coolify, Dokploy, CasaOS, Runtipi):
+```bash
+cd /opt/npm && docker compose restart               # Restart NPM only
+docker restart coolify                              # Restart Coolify only
+docker restart dokploy                              # Restart Dokploy only
+```
 
 ---
 
 ## File Layout
 
+### Repository Files
+
 ```
 .
 ├── deploy.sh                  ← Unified menu (run this first)
 ├── harden.sh                  ← 🔒 Security hardening (run after deploy)
-├── deploy-authelia.sh         ← 🔐 Optional SSO + TOTP 2FA portal
-├── deploy-portainer.sh        ← NPM + Portainer (lite bundle default)
-├── deploy-dockge.sh           ← NPM + Dockge
-├── deploy-coolify.sh          ← NPM + Coolify (native 2FA, Traefik disabled)
-├── deploy-dokploy.sh          ← NPM + Dokploy (native 2FA, Traefik disabled)
-├── deploy-cosmos.sh           ← NPM + Cosmos (bridge mode)
-├── deploy-casaos.sh           ← NPM + CasaOS (port 8080)
-├── deploy-runtipi.sh          ← NPM + Runtipi (Traefik on 8080)
-├── deploy-dokku.sh            ← NPM (81) + Dokku
-├── deploy-yunohost.sh         ← NPM (81) + YunoHost (Debian 12)
-├── deploy-freedombox.sh       ← NPM (81) + FreedomBox (Debian 12)
+├── deploy-portainer.sh        ← Unified compose: NPM + Portainer
+├── deploy-dockge.sh           ← Unified compose: NPM + Dockge
+├── deploy-cosmos.sh           ← Unified compose: NPM + Cosmos
+├── deploy-coolify.sh          ← Hybrid: NPM compose + Coolify installer
+├── deploy-dokploy.sh          ← Hybrid: NPM compose + Dokploy installer
+├── deploy-casaos.sh           ← Hybrid: NPM compose + CasaOS installer
+├── deploy-runtipi.sh          ← Hybrid: NPM compose + Runtipi installer
+├── deploy-yunohost.sh         ← OS distro: NPM (81) + YunoHost
+├── deploy-freedombox.sh       ← OS distro: NPM (81) + FreedomBox
+├── deploy-authelia.sh         ← Optional 2FA portal (manual install)
 └── README.md                  ← This file
 ```
+
+### Runtime Directories
+
+After deployment, you'll find:
+
+| Script | Directory | What's Inside |
+|--------|-----------|---------------|
+| `deploy-portainer.sh` | `/opt/portainer-stack/` | `docker-compose.yml` with `npm` + `portainer` |
+| `deploy-dockge.sh` | `/opt/dockge-stack/` | `docker-compose.yml` with `npm` + `dockge` |
+| `deploy-cosmos.sh` | `/opt/cosmos-stack/` | `docker-compose.yml` with `npm` + `cosmos-server` |
+| `deploy-coolify.sh` | `/opt/npm/` + `/data/coolify/` | NPM compose + Coolify's own files |
+| `deploy-dokploy.sh` | `/opt/npm/` + `/etc/dokploy/` | NPM compose + Dokploy's own files |
+| `deploy-casaos.sh` | `/opt/npm/` + `/casaos/` | NPM compose + CasaOS's own files |
+| `deploy-runtipi.sh` | `/opt/npm/` + `~/runtipi/` | NPM compose + Runtipi's own files |
+| `deploy-yunohost.sh` | `/opt/npm/` | NPM compose only (YunoHost is system-level) |
+| `deploy-freedombox.sh` | `/opt/npm/` | NPM compose only (FreedomBox is system-level) |
+| `deploy-authelia.sh` | `/opt/authelia/` | Authelia compose + config + snippets |
 
 ---
 
