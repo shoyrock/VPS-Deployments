@@ -18,13 +18,20 @@ readonly SECRETS_DIR="/opt/authelia/secrets"
 DOMAIN=""
 
 # ─── Styling ──────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+  C_R='\033[0m'; C_B='\033[1m'; C_RED='\033[0;31m'; C_GRN='\033[0;32m'
+  C_YEL='\033[0;33m'; C_BLU='\033[0;34m'; C_CYN='\033[0;36m'; C_DIM='\033[2m'
+else
+  C_R=''; C_B=''; C_RED=''; C_GRN=''; C_YEL=''; C_BLU=''; C_CYN=''; C_DIM=''
+fi
+
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
 _log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}" >> "$LOGFILE" 2>/dev/null || true; }
-ok()   { printf "\033[1;32m✔\033[0m %s\n" "$*"; _log "OK" "$*"; }
-warn() { printf "\033[1;33m!\033[0m %s\n" "$*"; _log "WARN" "$*"; }
-info() { printf "\033[1;34m→\033[0m %s\n" "$*"; _log "INFO" "$*"; }
-step() { printf "\n\033[1m▶ %s\033[0m\n" "$*"; _log "STEP" "$*"; }
-fatal(){ printf "\033[1;31m✖ %s\033[0m\n" "$*" >&2; _log "FATAL" "$*"; exit 1; }
+ok()   { printf "${C_GRN}✔${C_R} %s\n" "$*"; _log "OK" "$*"; }
+warn() { printf "${C_YEL}!${C_R} %s\n" "$*"; _log "WARN" "$*"; }
+info() { printf "${C_BLU}→${C_R} %s\n" "$*"; _log "INFO" "$*"; }
+step() { printf "\n${C_B}▶ %s${C_R}\n" "$*"; _log "STEP" "$*"; }
+fatal(){ printf "${C_RED}✖ %s${C_R}\n" "$*" >&2; _log "FATAL" "$*"; exit 1; }
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PRE-FLIGHT CHECKS
