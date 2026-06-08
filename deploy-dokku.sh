@@ -304,19 +304,24 @@ setup_dokku() {
 
   info "Installing Dokku via bootstrap (takes 5-10 minutes)..."
   local dokku_tag="0.38.18"
-  wget -qO- "https://dokku.com/install/${dokku_tag}/bootstrap.sh" | sudo DOKKU_TAG="${dokku_tag}" bash
+  if ! wget -qO- "https://dokku.com/install/${dokku_tag}/bootstrap.sh" | sudo DOKKU_TAG="${dokku_tag}" bash; then
+    fatal "Dokku bootstrap failed. Check: https://dokku.com/docs/getting-started/installation/"
+  fi
 
   info "Waiting for Dokku..."
+  local dokku_ok=false
   for i in $(seq 1 40); do
-    curl -sf --max-time 5 http://127.0.0.1:80/ &>/dev/null && { success "Dokploy responding on :80"; break; }
-    [[ $i -eq 40 ]] && warn "Dokku timed out. Check: systemctl status dokku-installer"
+    curl -sf --max-time 5 http://127.0.0.1:80/ &>/dev/null && { success "Dokku responding on :80"; dokku_ok=true; break; }
+    [[ $i -eq 40 ]] && fatal "Dokku timed out (2m). Check: systemctl status dokku-installer && journalctl -u dokku-installer -n 20"
     sleep 3
   done
 
+  # Verify Dokku CLI is available
+  hash -r 2>/dev/null || true
   if command -v dokku &>/dev/null; then
     success "Dokku CLI: $(dokku version 2>/dev/null || echo unknown)"
   else
-    warn "Dokku CLI not in PATH. Try: hash -r"
+    fatal "Dokku CLI not found after install. Try: hash -r && dokku version"
   fi
 
   local hostname_fqdn; hostname_fqdn=$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo "localhost")
