@@ -277,12 +277,23 @@ setup_casaos() {
   curl -fsSL https://get.casaos.io | bash
 
   info "Waiting for CasaOS gateway to start..."
+  local health_ok=false
   for i in $(seq 1 60); do
-    if curl -sf --max-time 5 http://127.0.0.1:80/v1/gateway/health &>/dev/null; then
-      success "CasaOS gateway responding on port 80"
+    # Try multiple health endpoints — CasaOS versions differ
+    for endpoint in "/v1/gateway/health" "/ping" "/health" "/"; do
+      if curl -sf --max-time 5 "http://127.0.0.1:80${endpoint}" &>/dev/null; then
+        success "CasaOS gateway responding on port 80 (endpoint: ${endpoint})"
+        health_ok=true
+        break 2
+      fi
+    done
+    # Also check if the service is at least active
+    if [[ $i -eq 30 ]] && systemctl is-active --quiet casaos-gateway 2>/dev/null; then
+      success "CasaOS gateway service is active (health endpoint may differ)"
+      health_ok=true
       break
     fi
-    [[ $i -eq 60 ]] && fatal "CasaOS failed to start. Check: systemctl status casaos-gateway"
+    [[ $i -eq 60 ]] && fatal "CasaOS gateway not responding after 3 minutes. Check: systemctl status casaos-gateway && journalctl -u casaos-gateway -n 20"
     sleep 3
   done
 

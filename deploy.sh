@@ -90,17 +90,12 @@ TOOL_DESCRIPTIONS[10]="FreedomBox — Debian home server with Cockpit admin"
 TOOL_PORTS[10]="80, 443, 9090 (Cockpit) (Debian 12 only)"
 TOOL_CATEGORIES[10]="Debian Server Distro"
 
-TOOL_NAMES[11]="authelia"
-TOOL_DESCRIPTIONS[11]="Authelia — SSO + TOTP 2FA portal for all services behind NPM"
-TOOL_PORTS[11]="9091 (internal, proxied via NPM)"
-TOOL_CATEGORIES[11]="Authentication / MFA"
+TOOL_NAMES[11]="harden"
+TOOL_DESCRIPTIONS[11]="🔒 Harden VPS — SSH lockdown, CrowdSec, GeoIP block, auto-updates"
+TOOL_PORTS[11]="—"
+TOOL_CATEGORIES[11]="Security"
 
-TOOL_NAMES[12]="harden"
-TOOL_DESCRIPTIONS[12]="🔒 Harden VPS — SSH lockdown, CrowdSec, GeoIP block, auto-updates"
-TOOL_PORTS[12]="—"
-TOOL_CATEGORIES[12]="Security"
-
-readonly TOOL_COUNT=12
+readonly TOOL_COUNT=11
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COLORS & UI
@@ -125,11 +120,6 @@ header() {
 }
 
 print_menu() {
-  # Quick setup option
-  printf "\n${C_B}${C_GRN}── Quick Setup ──${C_R}\n"
-  printf "  ${C_B} 0)${C_R} ${C_GRN}%-12s${C_R} %s\n" "lite" "NPM + Portainer (minimal, expand later)"
-  printf "\n${C_DIM}  Or choose individual tools below:${C_R}"
-
   local current_category=""
   for i in $(seq 1 $TOOL_COUNT); do
     local category="${TOOL_CATEGORIES[$i]}"
@@ -154,88 +144,6 @@ print_tool_detail() {
 # ═══════════════════════════════════════════════════════════════════════════════
 # EXECUTION — always fetches latest from GitHub, falls back to local
 # ═══════════════════════════════════════════════════════════════════════════════
-# ═══════════════════════════════════════════════════════════════════════════════
-# LITE BUNDLE — NPM + Portainer only (NON-DESTRUCTIVE)
-# ═══════════════════════════════════════════════════════════════════════════════
-run_lite_bundle() {
-  header
-  printf "${C_B}${C_GRN}Lite Bundle Setup${C_R}\n"
-  printf "Deploys: Nginx Proxy Manager + Portainer (minimal, ~200MB RAM)\n"
-  printf "${C_YEL}Non-destructive:${C_R} existing containers are preserved.\n\n"
-
-  # Show what's already installed
-  local has_npm=false has_portainer=false
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^npm$' && has_npm=true
-  docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^portainer$' && has_portainer=true
-
-  if $has_npm && $has_portainer; then
-    printf "${C_GRN}✔${C_R} NPM and Portainer are already running.\n"
-    printf "  NPM Admin: http://$(hostname -I | awk '{print $1}'):81\n\n"
-    return 0
-  fi
-
-  $has_npm && printf "${C_GRN}✔${C_R} NPM already running — skipping\n"
-  $has_portainer && printf "${C_GRN}✔${C_R} Portainer already running — skipping\n"
-
-  read -rp "Deploy missing components? [y/N]: " confirm
-  [[ "$confirm" =~ ^[Yy]$ ]] || { printf "Aborted.\n"; return 1; }
-
-  # Ensure Docker and network exist
-  command -v docker &>/dev/null || { printf "${C_RED}Docker required.${C_R}\n"; return 1; }
-  if ! docker network ls --format '{{.Name}}' | grep -q '^proxy$'; then
-    docker network create proxy || { printf "${C_RED}Failed to create proxy network.${C_R}\n"; return 1; }
-    printf "${C_GRN}✔${C_R} Created proxy network\n"
-  fi
-
-  local ip
-  ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
-
-  # Deploy NPM if missing
-  if ! $has_npm; then
-    printf "\n${C_B}▶ Deploying NPM...${C_R}\n"
-    docker rm -f npm 2>/dev/null || true
-    mkdir -p /opt/npm/data /opt/npm/letsencrypt /opt/npm/logs
-    docker run -d \
-      --name npm \
-      --hostname npm \
-      --restart always \
-      --network proxy \
-      -p '0.0.0.0:80:80' \
-      -p '0.0.0.0:443:443' \
-      -p '0.0.0.0:81:81' \
-      -v /opt/npm/data:/data \
-      -v /opt/npm/letsencrypt:/etc/letsencrypt \
-      -v /opt/npm/logs:/var/log/nginx \
-      -e TZ=America/New_York \
-      jc21/nginx-proxy-manager:latest
-    printf "${C_GRN}✔${C_R} NPM deployed — http://${ip}:81 (admin@example.com / changeme)\n"
-  fi
-
-  # Deploy Portainer if missing
-  if ! $has_portainer; then
-    printf "\n${C_B}▶ Deploying Portainer...${C_R}\n"
-    docker rm -f portainer 2>/dev/null || true
-    docker run -d \
-      --name portainer \
-      --hostname portainer \
-      --restart always \
-      --network proxy \
-      -v /var/run/docker.sock:/var/run/docker.sock \
-      -v portainer_data:/data \
-      -e TZ=America/New_York \
-      portainer/portainer-ce:latest
-    printf "${C_GRN}✔${C_R} Portainer deployed — add proxy host in NPM: portainer.YOURDOMAIN → http://portainer:9000\n"
-  fi
-
-  printf "\n${C_B}${C_GRN}Lite bundle ready!${C_R}\n"
-  printf "  NPM:      http://${ip}:81\n"
-  printf "  Portainer internal: http://portainer:9000\n\n"
-  printf "To add 2FA (Authelia): ./deploy.sh authelia\n"
-  printf "To add more tools:     ./deploy.sh\n"
-  printf "\n${C_DIM}Press Enter to return to menu...${C_R}"
-  read -r
-}
-
 _run_script() {
   local script_path=$1
   local script_name=$(basename "$script_path")
@@ -321,8 +229,6 @@ if [[ $# -gt 0 ]]; then
     cosmos)                           requested="cosmos" ;;
     yunohost|ynh)                     requested="yunohost" ;;
     freedombox|fbx)                   requested="freedombox" ;;
-    lite|light|minimal|quick)              requested="lite" ;;
-    authelia|mfa|2fa|sso)             requested="authelia" ;;
     harden|security|lockdown)         requested="harden" ;;
     *)
       printf "${C_RED}Unknown tool: ${requested}${C_R}\n"
@@ -334,12 +240,6 @@ if [[ $# -gt 0 ]]; then
       exit 1
       ;;
   esac
-
-  # Handle lite bundle
-  if [[ "$requested" == "lite" ]]; then
-    run_lite_bundle
-    exit $?
-  fi
 
   header
   # Find the tool number
@@ -359,16 +259,10 @@ while true; do
   header
   print_menu
 
-  read -rp "Enter [0] for lite bundle, [1-${TOOL_COUNT}] for individual tool, or [q] to quit: " choice
+  read -rp "Enter [1-${TOOL_COUNT}] for tool, or [q] to quit: " choice
 
   # Handle quit
   [[ "$choice" =~ ^[Qq]$ ]] && { printf "\n${C_DIM}Goodbye!${C_R}\n\n"; exit 0; }
-
-  # Handle lite bundle (0)
-  if [[ "$choice" == "0" ]]; then
-    run_lite_bundle
-    continue
-  fi
 
   # Validate number
   if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le $TOOL_COUNT ]]; then
