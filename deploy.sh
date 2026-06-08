@@ -147,7 +147,13 @@ print_tool_detail() {
 _run_script() {
   local script_path=$1
   local script_name=$(basename "$script_path")
-  printf "${C_YEL}⚠${C_R} This will install/configure services. Existing containers may be ${C_RED}DESTROYED${C_R}.\n"
+  # Show appropriate warning based on script type
+  if [[ "$script_name" == "harden.sh" ]]; then
+    printf "${C_YEL}!${C_R} This will harden system security (firewall, CrowdSec, auto-updates).\n"
+    printf "  ${C_GRN}✔${C_R} Docker containers will NOT be affected.\n"
+  else
+    printf "${C_YEL}⚠${C_R} This will install/configure services. Existing containers may be ${C_RED}DESTROYED${C_R}.\n"
+  fi
   read -rp "Proceed? [y/N]: " confirm
   [[ "$confirm" =~ ^[Yy]$ ]] || { printf "Aborted.\n"; return 1; }
   printf "\n${C_CYN}▶ Starting ${script_name}...${C_R}\n\n"
