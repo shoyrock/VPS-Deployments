@@ -346,24 +346,13 @@ notifier:
     filename: /config/notifications.txt
 EOF
 
-  # -- users.yml (quoted 'USERS' delimiter -- NO variable expansion) --
-  cat > "${AUTHELIA_CONFIG_DIR}/users.yml" << 'USERS'
-users:
-  admin:
-    disabled: false
-    displayname: "Administrator"
-    password: "$argon2id$v=19$m=65536,t=3,p=4$bXJzdWZmc3R1ZmZz$dHYzV3l1YVNhRjZwbHBLWGJzRjh4NUZNaTgxMXZVQUFEZ0lYVDlLVzgwU1dWMnpQS1VDdGV"
-    email: admin@__DOMAIN_PLACEHOLDER__
-    groups:
-      - admins
-      - users
-USERS
-
-  # Fix the email domain placeholder using sed
-  sed -i "s|admin@__DOMAIN_PLACEHOLDER__|admin@${DOMAIN}|" "${AUTHELIA_CONFIG_DIR}/users.yml"
-
-  success "Authelia configuration written to ${AUTHELIA_CONFIG_DIR}"
-  warn "Default Authelia password is 'authelia' -- CHANGE IMMEDIATELY after first login"
+  # Generate random password for admin account (hash created after container starts)
+  local random_pass
+  random_pass=$(openssl rand -hex 8)
+  echo "$random_pass" > "${AUTHELIA_DIR}/.default_password"
+  chmod 600 "${AUTHELIA_DIR}/.default_password"
+  info "Random password generated for Authelia admin account"
+  info "users.yml will be created after authelia container starts"
 }
 
 create_nginx_snippets() {
@@ -421,6 +410,66 @@ error_page 401 = @authelia_signin;
 SNIPPET
 
   success "Nginx snippets created in ${AUTHELIA_SNIPPETS_DIR}"
+}
+
+setup_authelia_users() {
+  step "Creating Authelia User Account"
+
+  if [[ -f "${AUTHELIA_CONFIG_DIR}/users.yml" ]]; then
+    info "users.yml already exists (preserved)"
+    return 0
+  fi
+
+  local random_pass=""
+  if [[ -f "${AUTHELIA_DIR}/.default_password" ]]; then
+    random_pass=$(cat "${AUTHELIA_DIR}/.default_password")
+  fi
+  if [[ -z "$random_pass" ]]; then
+    warn "No random password found, generating fallback"
+    random_pass=$(openssl rand -hex 8)
+    echo "$random_pass" > "${AUTHELIA_DIR}/.default_password"
+    chmod 600 "${AUTHELIA_DIR}/.default_password"
+  fi
+
+  info "Generating password hash using the Authelia container..."
+  local hash_output
+  hash_output=$(docker exec authelia authelia crypto hash generate argon2 --password "$random_pass" 2>&1) || true
+  local pass_hash
+  pass_hash=$(echo "$hash_output" | grep -o 'Digest: .*' | sed 's/Digest: //' | tr -d ' \t\n\r') || true
+
+  if [[ -z "$pass_hash" ]] || [[ ! "$pass_hash" == \$argon2id\$* ]]; then
+    warn "Retrying hash generation..."
+    pass_hash=$(docker exec authelia sh -c "authelia crypto hash generate argon2 --password '$random_pass' 2>&1" | grep -o 'Digest: .*' | sed 's/Digest: //' | tr -d ' \t\n\r') || true
+  fi
+
+  if [[ -z "$pass_hash" ]] || [[ ! "$pass_hash" == \$argon2id\$* ]]; then
+    fatal "Could not generate a valid password hash. Check: docker logs authelia"
+  fi
+
+  cat > "${AUTHELIA_CONFIG_DIR}/users.yml" << USEREOF
+---
+users:
+  admin:
+    disabled: false
+    displayname: "Administrator"
+    password: "${pass_hash}"
+    email: admin@${DOMAIN}
+    groups:
+      - admins
+      - users
+USEREOF
+
+  success "Authelia user 'admin' created with random password"
+  info "Restarting Authelia to load user database..."
+  docker restart authelia >/dev/null 2>&1
+
+  for i in $(seq 1 30); do
+    docker exec authelia wget -qO- --timeout=3 http://127.0.0.1:9091/api/health 2>/dev/null | grep -q "ok" && { success "Authelia ready"; break; }
+    printf "${C_DIM}  Waiting for Authelia restart... (%d/30)${C_R}\r" "$i"
+    [[ $i -eq 30 ]] && warn "Authelia restart timed out"
+    sleep 2
+  done
+  printf "\n"
 }
 
 setup_stack() {
@@ -801,12 +850,23 @@ ${C_B}Cosmos Server${C_R}
   Port:      80 (internal, no host port)
   Network:   proxy
 
-${C_B}Authelia 2FA${C_R}
-  Portal:    https://authelia.${DOMAIN}
-  Config:    ${AUTHELIA_CONFIG_DIR}
-  Secrets:   ${AUTHELIA_SECRETS_DIR}
-  Snippets:  ${AUTHELIA_SNIPPETS_DIR}
-  Default:   admin@${DOMAIN} / authelia
+${C_B}${C_YEL}════════════════════════════════════════════════════════════════${C_R}
+${C_B}${C_YEL}  🔐  AUTHELIA LOGIN CREDENTIALS (SAVE THESE)${C_R}
+${C_B}${C_YEL}════════════════════════════════════════════════════════════════${C_R}
+
+  ${C_B}URL:${C_R}       https://authelia.${DOMAIN}
+  ${C_B}Username:${C_R}  ${C_CYN}admin${C_R}
+  ${C_B}Config:${C_R}    ${AUTHELIA_CONFIG_DIR}
+  ${C_B}Secrets:${C_R}   ${AUTHELIA_SECRETS_DIR}
+  ${C_B}Snippets:${C_R}  ${AUTHELIA_SNIPPETS_DIR}
+EOF
+
+  local display_pass="<unknown>"
+  [[ -f "${AUTHELIA_DIR}/.default_password" ]] && display_pass=$(cat "${AUTHELIA_DIR}/.default_password")
+  printf "  ${C_B}Password:${C_R}  ${C_CYN}%s${C_R}\n" "$display_pass"
+  printf "\n  ${C_RED}⚠️  Change this password immediately after first login!${C_R}\n"
+
+cat << EOF
 
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
 ${C_B}Compose${C_R}   $(docker compose version --short 2>/dev/null || echo N/A)
@@ -903,6 +963,7 @@ main() {
   setup_authelia_config
   create_nginx_snippets
   setup_stack
+  setup_authelia_users
   setup_fail2ban
   setup_firewall
   setup_logrotate
