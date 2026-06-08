@@ -99,36 +99,17 @@ preflight_checks() {
 idempotent_cleanup() {
   step "Cleanup"
   if command -v docker &>/dev/null; then
-    info "Removing existing Docker resources..."
-    local containers; containers=$(docker ps -aq 2>/dev/null || true)
-    [[ -n "$containers" ]] && { docker stop $containers &>/dev/null || true; docker rm -f $containers &>/dev/null || true; }
-    local networks; networks=$(docker network ls -q --filter type=custom 2>/dev/null || true)
-    [[ -n "$networks" ]] && docker network rm $networks &>/dev/null || true
-    local volumes; volumes=$(docker volume ls -q 2>/dev/null || true)
-    [[ -n "$volumes" ]] && docker volume rm -f $volumes &>/dev/null || true
-    local images; images=$(docker images -aq 2>/dev/null || true)
-    [[ -n "$images" ]] && docker rmi -f $images &>/dev/null || true
+    info "Removing existing tool containers (preserving others)..."
+    docker rm -f npm 2>/dev/null || true
   fi
   if [[ "$OS_FAMILY" == "debian" ]]; then
     dpkg -l 2>/dev/null | grep -E "docker|containerd|runc" | awk '{print $2}' | xargs -r apt-get remove -y -qq &>/dev/null || true
+    apt-get autoremove -y -qq &>/dev/null || true
   else
-    rpm -qa 2>/dev/null | grep -E "docker|containerd|runc|podman|buildah" | xargs -r yum remove -y -q &>/dev/null || true
+    yum remove -y -q docker-ce docker-ce-cli containerd.io 2>/dev/null || true
   fi
-  rm -f /usr/local/bin/docker-compose /usr/bin/docker-compose &>/dev/null || true
-  systemctl stop firewalld fail2ban ufw 2>/dev/null || true
-  systemctl disable firewalld fail2ban ufw 2>/dev/null || true
-  iptables -P INPUT ACCEPT 2>/dev/null || true
-  iptables -P FORWARD ACCEPT 2>/dev/null || true
-  iptables -P OUTPUT ACCEPT 2>/dev/null || true
-  iptables -F 2>/dev/null || true
-  iptables -t nat -F 2>/dev/null || true
-  iptables -t mangle -F 2>/dev/null || true
-  iptables -X 2>/dev/null || true
-  iptables -t nat -X 2>/dev/null || true
-  iptables -t mangle -X 2>/dev/null || true
-  rm -rf /var/lib/docker/* /etc/docker/* "$NPM_DIR" "$COOLIFY_DIR" 2>/dev/null || true
-  success "Cleanup done"
 }
+
 
 system_update() {
   step "System Update"
@@ -196,8 +177,10 @@ install_docker() {
 
 setup_docker_network() {
   step "Docker Network: proxy"
-  docker network ls --format '{{.Name}}' | grep -qx "proxy" && docker network rm proxy &>/dev/null || true
-  docker network create proxy 2>/dev/null || true
+  # NEVER remove existing proxy network — other containers may depend on it
+  if ! docker network ls --format '{{.Name}}' | grep -qx "proxy"; then
+    docker network create proxy 2>/dev/null || true
+  fi
   docker network ls --format '{{.Name}}' | grep -qx "proxy" || fatal "Failed to create 'proxy' network"
   success "Network 'proxy' ready"
 }

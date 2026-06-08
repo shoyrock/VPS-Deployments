@@ -155,23 +155,83 @@ print_tool_detail() {
 # EXECUTION — always fetches latest from GitHub, falls back to local
 # ═══════════════════════════════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════════════════════════════
-# LIGHT BUNDLE — NPM + Portainer only
+# LITE BUNDLE — NPM + Portainer only (NON-DESTRUCTIVE)
 # ═══════════════════════════════════════════════════════════════════════════════
 run_lite_bundle() {
   header
   printf "${C_B}${C_GRN}Lite Bundle Setup${C_R}\n"
   printf "Deploys: Nginx Proxy Manager + Portainer (minimal, ~200MB RAM)\n"
-  printf "You can add more dashboards or Authelia (2FA) anytime later.\n\n"
+  printf "${C_YEL}Non-destructive:${C_R} existing containers are preserved.\n\n"
 
-  read -rp "Deploy lite bundle? [y/N]: " confirm
+  # Show what's already installed
+  local has_npm=false has_portainer=false
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^npm$' && has_npm=true
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^portainer$' && has_portainer=true
+
+  if $has_npm && $has_portainer; then
+    printf "${C_GRN}✔${C_R} NPM and Portainer are already running.\n"
+    printf "  NPM Admin: http://$(hostname -I | awk '{print $1}'):81\n\n"
+    return 0
+  fi
+
+  $has_npm && printf "${C_GRN}✔${C_R} NPM already running — skipping\n"
+  $has_portainer && printf "${C_GRN}✔${C_R} Portainer already running — skipping\n"
+
+  read -rp "Deploy missing components? [y/N]: " confirm
   [[ "$confirm" =~ ^[Yy]$ ]] || { printf "Aborted.\n"; return 1; }
 
-  # Deploy NPM + Portainer
-  run_tool "portainer"
+  # Ensure Docker and network exist
+  command -v docker &>/dev/null || { printf "${C_RED}Docker required.${C_R}\n"; return 1; }
+  if ! docker network ls --format '{{.Name}}' | grep -q '^proxy$'; then
+    docker network create proxy || { printf "${C_RED}Failed to create proxy network.${C_R}\n"; return 1; }
+    printf "${C_GRN}✔${C_R} Created proxy network\n"
+  fi
 
-  printf "\n${C_B}${C_GRN}Lite bundle deployed!${C_R}\n"
-  printf "\nTo add more dashboards later, run: ./deploy.sh\n"
-  printf "To add 2FA (Authelia) later, run: ./deploy.sh authelia\n"
+  local ip
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
+
+  # Deploy NPM if missing
+  if ! $has_npm; then
+    printf "\n${C_B}▶ Deploying NPM...${C_R}\n"
+    docker rm -f npm 2>/dev/null || true
+    mkdir -p /opt/npm/data /opt/npm/letsencrypt /opt/npm/logs
+    docker run -d \
+      --name npm \
+      --hostname npm \
+      --restart always \
+      --network proxy \
+      -p '0.0.0.0:80:80' \
+      -p '0.0.0.0:443:443' \
+      -p '0.0.0.0:81:81' \
+      -v /opt/npm/data:/data \
+      -v /opt/npm/letsencrypt:/etc/letsencrypt \
+      -v /opt/npm/logs:/var/log/nginx \
+      -e TZ=America/New_York \
+      jc21/nginx-proxy-manager:latest
+    printf "${C_GRN}✔${C_R} NPM deployed — http://${ip}:81 (admin@example.com / changeme)\n"
+  fi
+
+  # Deploy Portainer if missing
+  if ! $has_portainer; then
+    printf "\n${C_B}▶ Deploying Portainer...${C_R}\n"
+    docker rm -f portainer 2>/dev/null || true
+    docker run -d \
+      --name portainer \
+      --hostname portainer \
+      --restart always \
+      --network proxy \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      -v portainer_data:/data \
+      -e TZ=America/New_York \
+      portainer/portainer-ce:latest
+    printf "${C_GRN}✔${C_R} Portainer deployed — add proxy host in NPM: portainer.YOURDOMAIN → http://portainer:9000\n"
+  fi
+
+  printf "\n${C_B}${C_GRN}Lite bundle ready!${C_R}\n"
+  printf "  NPM:      http://${ip}:81\n"
+  printf "  Portainer internal: http://portainer:9000\n\n"
+  printf "To add 2FA (Authelia): ./deploy.sh authelia\n"
+  printf "To add more tools:     ./deploy.sh\n"
   printf "\n${C_DIM}Press Enter to return to menu...${C_R}"
   read -r
 }
