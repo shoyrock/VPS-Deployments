@@ -212,6 +212,25 @@ COMPOSE
   info "Starting NPM..."
   docker compose up -d
 
+  info "Verifying NPM ports (80, 443, 81) are bound..."
+  local ports_ok=false
+  for i in $(seq 1 30); do
+    local has_80=false has_443=false has_81=false
+    ss -tlnp 2>/dev/null | grep -q ':80[[:space:]]' && has_80=true
+    ss -tlnp 2>/dev/null | grep -q ':443[[:space:]]' && has_443=true
+    ss -tlnp 2>/dev/null | grep -q ':81[[:space:]]' && has_81=true
+    if $has_80 && $has_443 && $has_81; then
+      success "NPM bound all ports: 80, 443, 81"
+      ports_ok=true
+      break
+    fi
+    [[ $i -eq 30 ]] && {
+      echo ""; echo "  Port 80 bound:  $has_80"; echo "  Port 443 bound: $has_443"; echo "  Port 81 bound:  $has_81"; echo ""
+      ss -tlnp 2>/dev/null | grep -E ':80 |:443 |:81 ' || true; echo ""
+      fatal "NPM failed to bind required ports. Check: docker logs npm"
+    }
+    sleep 2
+  done
   info "Waiting for NPM..."
   for i in $(seq 1 30); do docker ps --format '{{.Names}}' | grep -qx "npm" && break; sleep 2; done
 

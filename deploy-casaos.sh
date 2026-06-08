@@ -218,10 +218,36 @@ COMPOSE
   info "Waiting for NPM..."
   for i in $(seq 1 30); do docker ps --format '{{.Names}}' | grep -qx "npm" && break; sleep 2; done
 
+  info "Verifying NPM ports (80, 443, 81) are bound..."
+  local ports_ok=false
+  for i in $(seq 1 30); do
+    local has_80=false has_443=false has_81=false
+    ss -tlnp 2>/dev/null | grep -q ':80[[:space:]]' && has_80=true
+    ss -tlnp 2>/dev/null | grep -q ':443[[:space:]]' && has_443=true
+    ss -tlnp 2>/dev/null | grep -q ':81[[:space:]]' && has_81=true
+
+    if $has_80 && $has_443 && $has_81; then
+      success "NPM bound all ports: 80, 443, 81"
+      ports_ok=true
+      break
+    fi
+    [[ $i -eq 30 ]] && {
+      echo ""
+      echo "  Port 80 bound:  $has_80"
+      echo "  Port 443 bound: $has_443"
+      echo "  Port 81 bound:  $has_81"
+      echo ""
+      ss -tlnp 2>/dev/null | grep -E ':80 |:443 |:81 ' || true
+      echo ""
+      fatal "NPM failed to bind required ports. Check: docker logs npm"
+    }
+    sleep 2
+  done
+
   info "Waiting for NPM admin UI (port 81)..."
   for i in $(seq 1 60); do
     curl -sf --max-time 5 http://127.0.0.1:81/ &>/dev/null && { success "NPM admin UI responding"; break; }
-    [[ $i -eq 60 ]] && warn "NPM UI timed out (2m). Still starting?"
+    [[ $i -eq 60 ]] && warn "NPM UI timed out (2m). Check: docker logs npm"
     sleep 2
   done
 
@@ -250,15 +276,13 @@ setup_casaos() {
   info "Installing CasaOS (this may take a few minutes)..."
   curl -fsSL https://get.casaos.io | bash
 
-  info "Waiting for CasaOS health endpoint..."
-  local health_ok=false
+  info "Waiting for CasaOS gateway to start..."
   for i in $(seq 1 60); do
     if curl -sf --max-time 5 http://127.0.0.1:80/v1/gateway/health &>/dev/null; then
-      success "CasaOS health endpoint responding"
-      health_ok=true
+      success "CasaOS gateway responding on port 80"
       break
     fi
-    [[ $i -eq 60 ]] && warn "CasaOS timed out (3m). Check: systemctl status casaos-gateway"
+    [[ $i -eq 60 ]] && fatal "CasaOS failed to start. Check: systemctl status casaos-gateway"
     sleep 3
   done
 
@@ -275,31 +299,112 @@ setup_casaos() {
   done
   info "CasaOS services: ${active_count}/${#svcs[@]} active"
 
-  info "Reconfiguring CasaOS gateway: 80 → 8080..."
-  if [[ -f /etc/casaos/gateway.ini ]]; then
-    sed -i 's/port = 80/port = 8080/g' /etc/casaos/gateway.ini 2>/dev/null || true
-    systemctl restart casaos-gateway 2>/dev/null || true
-    success "CasaOS gateway moved to port 8080"
-  else
-    warn "gateway.ini not found; may need manual port change"
+  # ── CRITICAL: Move CasaOS off port 80 BEFORE NPM starts ──
+  step "Reconfiguring CasaOS: 80 → 8080"
+
+  # 1. STOP CasaOS gateway completely (frees port 80)
+  info "Stopping CasaOS gateway to free port 80..."
+  systemctl stop casaos-gateway 2>/dev/null || true
+  sleep 2
+
+  # 2. Find the config file
+  local gateway_conf=""
+  for f in /etc/casaos/gateway.ini /usr/share/casaos/conf/gateway.ini "${HOME}/.casaos/gateway.ini"; do
+    [[ -f "$f" ]] && { gateway_conf="$f"; break; }
+  done
+
+  if [[ -z "$gateway_conf" ]]; then
+    # Fallback: search for it
+    gateway_conf=$(find /etc /usr/share /opt "${HOME}" -name "gateway.ini" 2>/dev/null | grep -i casaos | head -n1)
   fi
 
-  info "Connecting CasaOS gateway to proxy network..."
-  docker network connect proxy casaos-gateway 2>/dev/null || true
-  success "Gateway connected to 'proxy' network"
+  if [[ -n "$gateway_conf" ]]; then
+    info "Found config: ${gateway_conf}"
+    cat "${gateway_conf}" | grep -i "port" | head -3 || true
 
-  info "Waiting for CasaOS on port 8080..."
+    # Change port 80 → 8080 (case-insensitive)
+    sed -i 's/[Pp][Oo][Rr][Tt] *= *80/PORT = 8080/g' "$gateway_conf" 2>/dev/null || true
+
+    # Verify change
+    if grep -qE "PORT *= *8080" "$gateway_conf" 2>/dev/null; then
+      success "Config updated: port 80 → 8080"
+    else
+      warn "Sed may not have matched — trying alternative method..."
+      # Direct rewrite of the port line
+      sed -i '/^[Pp][Oo][Rr][Tt]/c\PORT = 8080' "$gateway_conf" 2>/dev/null || true
+    fi
+  else
+    warn "Could not find gateway.ini — attempting system-wide search..."
+    find / -name "gateway.ini" 2>/dev/null | head -5 || true
+  fi
+
+  # 3. START CasaOS gateway on new port
+  info "Starting CasaOS gateway on port 8080..."
+  systemctl start casaos-gateway 2>/dev/null || true
+  sleep 3
+
+  # 4. VERIFY: CasaOS is on 8080, port 80 is FREE
+  info "Verifying port configuration..."
+  local port_80_free=false port_8080_active=false
+
   for i in $(seq 1 30); do
-    if curl -sf --max-time 5 http://127.0.0.1:8080/v1/gateway/health &>/dev/null; then
-      success "CasaOS responding on port 8080"
+    # Check port 80 is free (nothing listening)
+    if ! ss -tlnp 2>/dev/null | grep -q ':80[[:space:]]'; then
+      port_80_free=true
+    fi
+    # Check port 8080 has CasaOS
+    if ss -tlnp 2>/dev/null | grep -q ':8080[[:space:]]'; then
+      port_8080_active=true
+    fi
+
+    if $port_80_free && $port_8080_active; then
+      success "Port 80 is FREE — CasaOS is on port 8080"
       break
     fi
-    [[ $i -eq 30 ]] && warn "CasaOS port 8080 not responding"
     sleep 2
   done
 
-  local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
-  success "CasaOS deployed: http://${ip}:8080 (behind NPM)"
+  # 5. HARD FAIL if port 80 is still in use — NPM will break otherwise
+  if ! $port_80_free; then
+    echo ""
+    fatal "CRITICAL: Port 80 is still in use after CasaOS reconfiguration. NPM cannot start.
+
+This means CasaOS (or another service) is still binding port 80.
+
+Manual fix steps:
+  1. Find what's on port 80:
+     ss -tlnp | grep ':80 '
+
+  2. Check CasaOS gateway config:
+     cat ${gateway_conf:-/etc/casaos/gateway.ini}
+     # Ensure it says: PORT = 8080
+
+  3. Restart CasaOS gateway:
+     systemctl stop casaos-gateway
+     systemctl start casaos-gateway
+
+  4. Verify port 80 is free:
+     ss -tlnp | grep ':80 '
+     # Should show NOTHING (or docker-proxy for NPM if already running)
+
+After fixing, run this script again."
+  fi
+
+  # 6. Connect gateway to proxy network
+  info "Connecting CasaOS gateway to proxy network..."
+  docker network connect proxy casaos-gateway 2>/dev/null || true
+
+  # 7. Verify CasaOS is healthy on 8080
+  local health_ok=false
+  for i in $(seq 1 30); do
+    if curl -sf --max-time 5 http://127.0.0.1:8080/v1/gateway/health &>/dev/null; then
+      success "CasaOS healthy on port 8080"
+      health_ok=true
+      break
+    fi
+    sleep 2
+  done
+  $health_ok || warn "CasaOS not responding on 8080 — check: systemctl status casaos-gateway"
 }
 
 setup_fail2ban() {
