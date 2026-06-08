@@ -322,20 +322,26 @@ setup_casaos() {
     info "Found config: ${gateway_conf}"
     cat "${gateway_conf}" | grep -i "port" | head -3 || true
 
-    # Change port 80 → 8080 (case-insensitive)
-    sed -i 's/[Pp][Oo][Rr][Tt] *= *80/PORT = 8080/g' "$gateway_conf" 2>/dev/null || true
+    # CasaOS uses format: port=80 (no spaces). Handle both formats.
+    # 1. Replace any existing port line
+    sed -i '/^[Pp][Oo][Rr][Tt][[:space:]]*=/d' "$gateway_conf" 2>/dev/null || true
+    # 2. Insert clean port=8080 line in the [gateway] section
+    if grep -q '^\[gateway\]' "$gateway_conf" 2>/dev/null; then
+      sed -i '/^\[gateway\]/a port=8080' "$gateway_conf" 2>/dev/null || true
+    else
+      # No [gateway] section — append to end
+      echo "port=8080" >> "$gateway_conf"
+    fi
 
     # Verify change
-    if grep -qE "PORT *= *8080" "$gateway_conf" 2>/dev/null; then
-      success "Config updated: port 80 → 8080"
+    if grep -qE "^[Pp][Oo][Rr][Tt][[:space:]]*=[[:space:]]*8080" "$gateway_conf" 2>/dev/null; then
+      success "Config updated: port → 8080"
     else
-      warn "Sed may not have matched — trying alternative method..."
-      # Direct rewrite of the port line
-      sed -i '/^[Pp][Oo][Rr][Tt]/c\PORT = 8080' "$gateway_conf" 2>/dev/null || true
+      warn "Config may not have updated correctly"
     fi
   else
-    warn "Could not find gateway.ini — attempting system-wide search..."
-    find / -name "gateway.ini" 2>/dev/null | head -5 || true
+    warn "Could not find gateway.ini"
+    find /etc /usr/share /opt "${HOME}" -name "gateway.ini" 2>/dev/null | head -5 || true
   fi
 
   # 3. START CasaOS gateway on new port
