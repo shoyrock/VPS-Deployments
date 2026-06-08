@@ -18,22 +18,25 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script incl
 
 ## Quick Reference
 
-| # | Script | What It Deploys | Exposed Ports | Notes |
-|---|--------|----------------|---------------|-------|
-| — | **`deploy.sh`** | **Unified menu** — pick any tool interactively or via CLI | — | Always fetches latest from GitHub |
-| 1 | `deploy-portainer.sh` | NPM + Portainer | **80, 443, 81** | Visual container management |
-| 2 | `deploy-dockge.sh` | NPM + Dockge | **80, 443, 81** | Compose stack manager |
-| 3 | `deploy-coolify.sh` | NPM + Coolify | **80, 443, 81** | PaaS — Coolify Traefik disabled |
-| 4 | `deploy-dokploy.sh` | NPM + Dokploy | **80, 443, 81** | PaaS — Dokploy Traefik disabled |
-| 5 | `deploy-dokku.sh` | NPM + Dokku | **80, 443, 81** | PaaS — uses Dokku's own nginx |
-| 6 | `deploy-runtipi.sh` | NPM + Runtipi | **80, 443, 81** | Home server + 300 apps |
-| 7 | `deploy-casaos.sh` | NPM + CasaOS | **80, 443, 81** | Home server with app store |
-| 8 | `deploy-cosmos.sh` | NPM + Cosmos | **80, 443, 81** | All-in-one homelab suite |
-| 9 | `deploy-yunohost.sh` | NPM + YunoHost | **80, 443, 81** | Debian server distro (Debian 12) |
-| 10 | `deploy-freedombox.sh` | NPM + FreedomBox | **80, 443, 81** | Debian home server (Debian 12) |
-| 🔒 | **`harden.sh`** | **Full system hardening** | — | Run after deployment — see below |
+### Menu Options
 
-**All scripts expose only 3 ports to the internet: 80 (HTTP), 443 (HTTPS), 81 (NPM admin).** Individual tool containers have **no host ports** — they communicate internally via Docker's `proxy` network using their container hostnames (see table below).
+| # | Option | What It Deploys | Notes |
+|---|--------|----------------|-------|
+| **0** | **Light Bundle** | **NPM + Portainer** only | Minimal setup (~200MB RAM). Add more dashboards later. |
+| 1 | Portainer | NPM + Portainer | Visual container management |
+| 2 | Dockge | NPM + Dockge | Compose stack manager |
+| 3 | Coolify | NPM + Coolify | PaaS — **native 2FA** — Coolify Traefik disabled |
+| 4 | Dokploy | NPM + Dokploy | PaaS — **native 2FA** — Dokploy Traefik disabled |
+| 5 | Dokku | NPM + Dokku | PaaS — uses Dokku's own nginx |
+| 6 | Runtipi | NPM + Runtipi | Home server + 300 apps |
+| 7 | CasaOS | NPM + CasaOS | Home server with app store |
+| 8 | Cosmos | NPM + Cosmos | All-in-one homelab suite |
+| 9 | YunoHost | NPM + YunoHost | Debian server distro (Debian 12 only) |
+| 10 | FreedomBox | NPM + FreedomBox | Debian home server (Debian 12 only) |
+| 11 | **Authelia** | **SSO + TOTP 2FA portal** | Optional — adds 2FA login to ALL dashboards |
+| 12 | **Harden** | **Full system hardening** | Run after deployment — see below |
+
+**All scripts expose only 3 ports: 80 (HTTP), 443 (HTTPS), 81 (NPM admin).** Individual tool containers have **no host ports** — they communicate internally via Docker's `proxy` network using their container hostnames (see table below).
 
 ---
 
@@ -51,6 +54,7 @@ All containers connect to the `proxy` Docker network and are reachable by hostna
 | CasaOS | `casaos` | `http://casaos:8080` |
 | Runtipi | `runtipi` | `http://runtipi:80` |
 | Cosmos | `cosmos-server` | `http://cosmos-server:80` |
+| Authelia | `authelia` | `http://authelia:9091` (internal-only, not exposed) |
 
 **No tool container exposes ports directly to the host.** All traffic flows through NPM on ports 80/443.
 
@@ -58,45 +62,56 @@ All containers connect to the `proxy` Docker network and are reachable by hostna
 
 ## How to Use
 
-### Option 1: Two-Step Deploy (Recommended)
+### Option 1: Light Bundle (Recommended for Fresh VPS)
 
-**Step 1: Deploy your tool**
+The fastest way to get started. Deploys **NPM + Portainer** only — minimal resource usage, expand later.
+
 ```bash
 curl -fsSL -o deploy.sh https://raw.githubusercontent.com/shoyrock/VPS-Deployments/main/deploy.sh
 chmod +x deploy.sh
-./deploy.sh              # Pick your tool from the menu
+./deploy.sh              # Pick [0] Light Bundle from the menu
+# Or directly: ./deploy.sh light
 ```
 
-Set up your apps in NPM. Get everything working.
+**After deploy:**
+1. Access NPM at `http://YOUR_VPS_IP:81` (default: admin@example.com / changeme)
+2. Add proxy host for Portainer: `portainer.yourdomain.com` → `http://portainer:9000`
+3. Request SSL certificate
+4. **Add more dashboards anytime:** `./deploy.sh` → pick another tool
 
-**Step 2: Harden (after everything is set up)**
+### Option 2: Deploy with 2FA (Authelia)
+
+For full protection, deploy Authelia after the light bundle. It adds a login gate with TOTP 2FA (Google/Microsoft Authenticator) to **all** your dashboards.
+
 ```bash
-./deploy.sh harden       # Via the menu script you already have
+./deploy.sh light        # Step 1: deploy minimal setup
+./deploy.sh authelia     # Step 2: add 2FA portal
 ```
 
-Or download `harden.sh` directly if you don't have `deploy.sh`:
-```bash
-curl -fsSL -o harden.sh https://raw.githubusercontent.com/shoyrock/VPS-Deployments/main/harden.sh
-chmod +x harden.sh
-sudo ./harden.sh
-```
+**After Authelia deploy:**
+1. Add DNS: `authelia.yourdomain.com` → your VPS IP
+2. In NPM, add proxy host: `authelia.yourdomain.com` → `http://authelia:9091`
+3. Visit `https://authelia.yourdomain.com`, login with default credentials
+4. Register your Authenticator app (scan QR code)
+5. For each dashboard proxy host, add the forward-auth config from `/opt/authelia/authelia-configure.sh`
 
-**Do NOT run `harden.sh` before deploying.** It locks down port 81 and you won't be able to access the NPM admin UI from the internet to set up your proxy hosts.
-
-### Direct Deploy (skip menu)
+### Option 3: Deploy Individual Tools
 
 ```bash
 ./deploy.sh portainer    # Deploy Portainer
 ./deploy.sh dockge       # Deploy Dockge
-./deploy.sh coolify      # Deploy Coolify
+./deploy.sh coolify      # Deploy Coolify (has native 2FA toggle)
+./deploy.sh dokploy      # Deploy Dokploy (has native 2FA toggle)
+./deploy.sh authelia     # Deploy Authelia 2FA portal
+./deploy.sh harden       # Harden the system
 ```
 
-### Option 2: Individual Scripts
+### Option 4: Direct Script Download (skip menu)
 
 ```bash
-curl -fsSL -o deploy-tool.sh https://raw.githubusercontent.com/shoyrock/VPS-Deployments/main/deploy-tool.sh
-chmod +x deploy-tool.sh
-sudo ./deploy-tool.sh
+curl -fsSL -o deploy-portainer.sh https://raw.githubusercontent.com/shoyrock/VPS-Deployments/main/deploy-portainer.sh
+chmod +x deploy-portainer.sh
+./deploy-portainer.sh
 ```
 
 **Supported OS:** Ubuntu 20.04+, Debian 11+, Rocky/AlmaLinux 8/9, Fedora 35+, CentOS 7/8
@@ -153,6 +168,8 @@ After deploying any tool, run the hardening script to lock down the VPS. This is
 ./deploy.sh                 # Pick option 12 (Harden VPS)
 ```
 
+**Do NOT run `harden.sh` before deploying.** It does not destroy containers, but it locks down port 81 to localhost-only and enables CrowdSec — you want your dashboards accessible first, then hardened after setup.
+
 ### What It Does (all automatic)
 
 | Layer | What | Tool |
@@ -182,6 +199,40 @@ All config changes are backed up with `.harden-backup-<timestamp>` suffix before
 | **Dokku** | nginx on 80/443 | **Cannot be disabled** — essential for app routing |
 | **YunoHost** | nginx on 80/443 | **Cannot be disabled** — essential for app routing |
 | **FreedomBox** | Apache on 80/443 | **Cannot be disabled** — essential for app routing |
+
+---
+
+## Two-Factor Authentication (2FA) Options
+
+### Option A: Native 2FA (Simplest — No Extra Containers)
+
+Some dashboards have built-in 2FA toggles. Just enable them in their settings:
+
+| Dashboard | Has Native 2FA | How to Enable |
+|-----------|---------------|---------------|
+| **Coolify** | ✅ Yes | Settings → Security → Enable 2FA → scan QR code |
+| **Dokploy** | ✅ Yes | Settings → Security → Enable 2FA → scan QR code |
+| Portainer, Dockge, CasaOS, Cosmos, Runtipi | ❌ No | Use Option B (Authelia) below |
+
+**Best for:** If you only use Coolify and/or Dokploy as your main platforms.
+
+### Option B: Authelia 2FA (Universal — Protects ALL Dashboards)
+
+Authelia is a separate container that adds a login portal with TOTP 2FA to **every** dashboard behind NPM — even those without native 2FA.
+
+**How it works:**
+```
+User → portainer.example.com → Authelia login gate → password + 6-digit code → Portainer
+```
+
+**Deploy:**
+```bash
+./deploy.sh authelia       # After deploying your dashboards
+```
+
+**Best for:** If you use multiple dashboards (Portainer, Dockge, CasaOS, etc.) and want one login with 2FA for all of them.
+
+**Can be added anytime later** — it does not modify or break existing containers.
 
 ---
 
@@ -229,12 +280,13 @@ sudo ufw delete allow 81/tcp && sudo ufw reload
 
 ```
 .
-├── deploy.sh                  ← Unified menu (run this)
+├── deploy.sh                  ← Unified menu (run this first)
 ├── harden.sh                  ← 🔒 Security hardening (run after deploy)
-├── deploy-portainer.sh        ← NPM + Portainer
+├── deploy-authelia.sh         ← 🔐 Optional SSO + TOTP 2FA portal
+├── deploy-portainer.sh        ← NPM + Portainer (light bundle default)
 ├── deploy-dockge.sh           ← NPM + Dockge
-├── deploy-coolify.sh          ← NPM + Coolify (Traefik disabled)
-├── deploy-dokploy.sh          ← NPM + Dokploy (Traefik disabled)
+├── deploy-coolify.sh          ← NPM + Coolify (native 2FA, Traefik disabled)
+├── deploy-dokploy.sh          ← NPM + Dokploy (native 2FA, Traefik disabled)
 ├── deploy-cosmos.sh           ← NPM + Cosmos (bridge mode)
 ├── deploy-casaos.sh           ← NPM + CasaOS (port 8080)
 ├── deploy-runtipi.sh          ← NPM + Runtipi (Traefik on 8080)

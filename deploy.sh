@@ -90,12 +90,17 @@ TOOL_DESCRIPTIONS[10]="FreedomBox — Debian home server with Cockpit admin"
 TOOL_PORTS[10]="80, 443, 9090 (Cockpit) (Debian 12 only)"
 TOOL_CATEGORIES[10]="Debian Server Distro"
 
-TOOL_NAMES[11]="harden"
-TOOL_DESCRIPTIONS[11]="🔒 Harden VPS — SSH lockdown, CrowdSec, GeoIP block, auto-updates"
-TOOL_PORTS[11]="—"
-TOOL_CATEGORIES[11]="Security"
+TOOL_NAMES[11]="authelia"
+TOOL_DESCRIPTIONS[11]="Authelia — SSO + TOTP 2FA portal for all services behind NPM"
+TOOL_PORTS[11]="9091 (internal, proxied via NPM)"
+TOOL_CATEGORIES[11]="Authentication / MFA"
 
-readonly TOOL_COUNT=11
+TOOL_NAMES[12]="harden"
+TOOL_DESCRIPTIONS[12]="🔒 Harden VPS — SSH lockdown, CrowdSec, GeoIP block, auto-updates"
+TOOL_PORTS[12]="—"
+TOOL_CATEGORIES[12]="Security"
+
+readonly TOOL_COUNT=12
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COLORS & UI
@@ -120,6 +125,11 @@ header() {
 }
 
 print_menu() {
+  # Quick setup option
+  printf "\n${C_B}${C_GRN}── Quick Setup ──${C_R}\n"
+  printf "  ${C_B} 0)${C_R} ${C_GRN}%-12s${C_R} %s\n" "light" "NPM + Portainer (minimal, expand later)"
+  printf "\n${C_DIM}  Or choose individual tools below:${C_R}"
+
   local current_category=""
   for i in $(seq 1 $TOOL_COUNT); do
     local category="${TOOL_CATEGORIES[$i]}"
@@ -144,6 +154,28 @@ print_tool_detail() {
 # ═══════════════════════════════════════════════════════════════════════════════
 # EXECUTION — always fetches latest from GitHub, falls back to local
 # ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# LIGHT BUNDLE — NPM + Portainer only
+# ═══════════════════════════════════════════════════════════════════════════════
+run_light_bundle() {
+  header
+  printf "${C_B}${C_GRN}Light Bundle Setup${C_R}\n"
+  printf "Deploys: Nginx Proxy Manager + Portainer (minimal, ~200MB RAM)\n"
+  printf "You can add more dashboards or Authelia (2FA) anytime later.\n\n"
+
+  read -rp "Deploy light bundle? [y/N]: " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { printf "Aborted.\n"; return 1; }
+
+  # Deploy NPM + Portainer
+  run_tool "portainer"
+
+  printf "\n${C_B}${C_GRN}Light bundle deployed!${C_R}\n"
+  printf "\nTo add more dashboards later, run: ./deploy.sh\n"
+  printf "To add 2FA (Authelia) later, run: ./deploy.sh authelia\n"
+  printf "\n${C_DIM}Press Enter to return to menu...${C_R}"
+  read -r
+}
+
 _run_script() {
   local script_path=$1
   local script_name=$(basename "$script_path")
@@ -222,6 +254,8 @@ if [[ $# -gt 0 ]]; then
     cosmos)                           requested="cosmos" ;;
     yunohost|ynh)                     requested="yunohost" ;;
     freedombox|fbx)                   requested="freedombox" ;;
+    light|minimal|quick)              requested="light" ;;
+    authelia|mfa|2fa|sso)             requested="authelia" ;;
     harden|security|lockdown)         requested="harden" ;;
     *)
       printf "${C_RED}Unknown tool: ${requested}${C_R}\n"
@@ -233,6 +267,12 @@ if [[ $# -gt 0 ]]; then
       exit 1
       ;;
   esac
+
+  # Handle light bundle
+  if [[ "$requested" == "light" ]]; then
+    run_light_bundle
+    exit $?
+  fi
 
   header
   # Find the tool number
@@ -252,10 +292,16 @@ while true; do
   header
   print_menu
 
-  read -rp "Enter number [1-${TOOL_COUNT}] or [q] to quit: " choice
+  read -rp "Enter [0] for light bundle, [1-${TOOL_COUNT}] for individual tool, or [q] to quit: " choice
 
   # Handle quit
   [[ "$choice" =~ ^[Qq]$ ]] && { printf "\n${C_DIM}Goodbye!${C_R}\n\n"; exit 0; }
+
+  # Handle light bundle (0)
+  if [[ "$choice" == "0" ]]; then
+    run_light_bundle
+    continue
+  fi
 
   # Validate number
   if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le $TOOL_COUNT ]]; then
@@ -264,7 +310,7 @@ while true; do
     printf "\n${C_DIM}Press Enter to return to menu...${C_R}"
     read -r
   else
-    printf "${C_RED}Invalid choice. Please enter 1-${TOOL_COUNT} or q.${C_R}\n"
+    printf "${C_RED}Invalid choice. Please enter 0-${TOOL_COUNT} or q.${C_R}\n"
     sleep 1
   fi
 done
