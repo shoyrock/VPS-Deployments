@@ -111,8 +111,10 @@ preflight_checks() {
 idempotent_cleanup() {
   step "Cleanup"
   if command -v docker &>/dev/null; then
-    info "Removing existing tool containers (preserving others)..."
-    docker rm -f npm 2>/dev/null || true
+    info "Removing ALL existing containers and volumes..."
+    docker ps -aq 2>/dev/null | xargs -r docker stop &>/dev/null || true
+    docker ps -aq 2>/dev/null | xargs -r docker rm -f &>/dev/null || true
+    docker volume ls -q 2>/dev/null | xargs -r docker volume rm -f &>/dev/null || true
   fi
   if [[ "$OS_FAMILY" == "debian" ]]; then
     dpkg -l 2>/dev/null | grep -E "docker|containerd|runc" | awk '{print $2}' | xargs -r apt-get remove -y -qq &>/dev/null || true
@@ -121,6 +123,7 @@ idempotent_cleanup() {
     yum remove -y -q docker-ce docker-ce-cli containerd.io 2>/dev/null || true
   fi
 }
+
 
 
 system_update() {

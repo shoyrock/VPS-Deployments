@@ -95,11 +95,10 @@ preflight_checks() {
 idempotent_cleanup() {
   step "Cleanup"
   if command -v docker &>/dev/null; then
-    info "Removing existing tool containers (preserving others)..."
-    docker rm -f npm 2>/dev/null || true
-    docker rm -f portainer 2>/dev/null || true
-
-    docker volume rm -f portainer_data 2>/dev/null || true
+    info "Removing ALL existing containers and volumes..."
+    docker ps -aq 2>/dev/null | xargs -r docker stop &>/dev/null || true
+    docker ps -aq 2>/dev/null | xargs -r docker rm -f &>/dev/null || true
+    docker volume ls -q 2>/dev/null | xargs -r docker volume rm -f &>/dev/null || true
   fi
   if [[ "$OS_FAMILY" == "debian" ]]; then
     dpkg -l 2>/dev/null | grep -E "docker|containerd|runc" | awk '{print $2}' | xargs -r apt-get remove -y -qq &>/dev/null || true
@@ -108,6 +107,7 @@ idempotent_cleanup() {
     yum remove -y -q docker-ce docker-ce-cli containerd.io 2>/dev/null || true
   fi
 }
+
 
 
 system_update() {
@@ -524,8 +524,9 @@ ${C_B}Nginx Proxy Manager${C_R}
   Logs:    ${NPM_LOGS_DIR}
 
 ${C_B}Portainer CE${C_R}
-  Access:  Via NPM proxy (add host → http://portainer:9000)
-  Volume:  portainer_data
+  Container: portainer
+  Port:      9000 (internal, no host port)
+  Network:   proxy
 
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
 ${C_B}Compose${C_R}   $(docker compose version --short 2>/dev/null || echo N/A)
@@ -534,11 +535,35 @@ ${C_B}Network${C_R}   proxy (bridge)
 ${C_B}Fail2Ban${C_R}  Jails: sshd, npm-auth, npm-forceful-browsing, npm-botsearch
 ${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
 
-${C_B}${C_YEL}Setup:${C_R}
-  1. NPM:     http://${ip}:81  (admin@example.com / changeme) → change password
-  2. Proxy:   Add portainer.your-domain.com → http://portainer:9000
-  3. SSL:     Use NPM SSL Certificates tab
-  4. Secure:  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "ufw delete allow 81/tcp && ufw reload"; else echo "firewall-cmd --permanent --remove-port=81/tcp && firewall-cmd --reload"; fi)
+${C_B}${C_YEL}Step 1 — NPM Admin${C_R}
+  Open:   http://${ip}:81
+  Login:  admin@example.com / changeme
+  ${C_RED}→ Change password immediately${C_R}
+
+${C_B}${C_YEL}Step 2 — Add Proxy Host in NPM${C_R}
+  Dashboards → Proxy Hosts → Add Proxy Host
+  ┌──────────────────────────────────────┐
+  │ Domain Names:    portainer.YOURDOMAIN│
+  │ Scheme:          http                │
+  │ Forward Host:    portainer           │
+  │ Forward Port:    9000                │
+  │ Block Exploits:  ON                  │
+  └──────────────────────────────────────┘
+  Click Save
+
+${C_B}${C_YEL}Step 3 — SSL Certificate${C_R}
+  On the same proxy host → SSL tab
+  ┌──────────────────────────────────────┐
+  │ SSL:             Request a new cert  │
+  │ Force SSL:       ON                  │
+  │ HTTP/2 Support:  ON                  │
+  │ Email:           your-email@domain   │
+  │ Agree to TOS:    ON                  │
+  └──────────────────────────────────────┘
+  Click Save
+
+${C_B}${C_YEL}Step 4 — Secure Admin Port${C_R}
+  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "  ufw delete allow 81/tcp && ufw reload"; else echo "  firewall-cmd --permanent --remove-port=81/tcp && firewall-cmd --reload"; fi)
 
 ${C_B}Troubleshooting:${C_R}
   Logs:    docker logs -f npm    docker logs -f portainer
