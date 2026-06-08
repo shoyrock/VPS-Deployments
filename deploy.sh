@@ -127,7 +127,7 @@ header() {
 print_menu() {
   # Quick setup option
   printf "\n${C_B}${C_GRN}── Quick Setup ──${C_R}\n"
-  printf "  ${C_B} 0)${C_R} ${C_GRN}%-12s${C_R} %s\n" "light" "NPM + Portainer (minimal, expand later)"
+  printf "  ${C_B} 0)${C_R} ${C_GRN}%-12s${C_R} %s\n" "lite" "NPM + Portainer (minimal, expand later)"
   printf "\n${C_DIM}  Or choose individual tools below:${C_R}"
 
   local current_category=""

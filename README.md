@@ -70,7 +70,7 @@ The fastest way to get started. Deploys **NPM + Portainer** only — minimal res
 curl -fsSL -o deploy.sh https://raw.githubusercontent.com/shoyrock/VPS-Deployments/main/deploy.sh
 chmod +x deploy.sh
 ./deploy.sh              # Pick [0] Lite Bundle from the menu
-# Or directly: ./deploy.sh light
+# Or directly: ./deploy.sh lite
 ```
 
 **After deploy:**
@@ -84,7 +84,7 @@ chmod +x deploy.sh
 For full protection, deploy Authelia after the lite bundle. It adds a login gate with TOTP 2FA (Google/Microsoft Authenticator) to **all** your dashboards.
 
 ```bash
-./deploy.sh light        # Step 1: deploy minimal setup
+./deploy.sh lite         # Step 1: deploy minimal setup
 ./deploy.sh authelia     # Step 2: add 2FA portal
 ```
 
