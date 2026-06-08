@@ -3,7 +3,7 @@
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     exec sudo bash "$0" "$@"
 fi
-# deploy-cosmos.sh — Docker + NPM + Cosmos + Authelia + Fail2Ban
+# deploy-cosmos.sh -- Docker + NPM + Cosmos + Authelia + Fail2Ban
 # v3.0.0-cosmos-authelia | Usage: sudo ./deploy-cosmos.sh
 set -euo pipefail
 IFS=$'\n\t'
@@ -18,14 +18,18 @@ readonly NPM_LE_DIR="${STACK_DIR}/letsencrypt"
 readonly NPM_LOGS_DIR="${NPM_DATA_DIR}/logs"
 readonly LOG_FILE="/var/log/vps-deploy.log"
 
-# ── Authelia paths ──
+# -- Authelia paths --
 readonly AUTHELIA_DIR="${STACK_DIR}/authelia"
 readonly AUTHELIA_SECRETS_DIR="${AUTHELIA_DIR}/secrets"
 readonly AUTHELIA_CONFIG_DIR="${AUTHELIA_DIR}/config"
 readonly AUTHELIA_SNIPPETS_DIR="${AUTHELIA_DIR}/snippets"
 
-# ── Runtime-populated ──
+# -- Runtime-populated --
 DOMAIN=""  # Set at runtime via user prompt
+
+# -- Deployment state --
+DEPLOY_STATUS="in_progress"
+DEPLOYED_SERVICES=""
 
 if [[ -t 1 ]]; then
   C_R='\033[0m'; C_B='\033[1m'; C_RED='\033[0;31m'; C_GRN='\033[0;32m'
@@ -40,8 +44,52 @@ info()    { printf "${C_BLU}ℹ${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
 warn()    { printf "${C_YEL}⚠${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
 error()   { printf "${C_RED}✖${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }
 success() { printf "${C_GRN}✔${C_R}  %s\n" "$*"; _log "SUCCESS" "$@"; }
-fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; exit 1; }
+fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; DEPLOY_STATUS="failed"; exit 1; }
 step()    { printf "\n${C_B}${C_CYN}── %s ──${C_R}\n" "$*"; _log "STEP" "$@"; }
+
+# -- Guaranteed completion summary on EXIT (fires even on fatal() / set -e failures) --
+_on_exit() {
+  local exit_code=$?
+  local elapsed=$(( $(date +%s) - START_TIME ))
+  local ip
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
+
+  if [[ -n "${DEPLOYED_SERVICES:-}" ]] || [[ "$DEPLOY_STATUS" != "in_progress" ]]; then
+    printf "\n"
+    if [[ "$DEPLOY_STATUS" == "success" ]]; then
+      printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
+      printf "${C_B}${C_GRN}║                   ✅  DEPLOYMENT COMPLETED SUCCESSFULLY                      ║${C_R}\n"
+      printf "${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    else
+      printf "${C_B}${C_RED}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
+      printf "${C_B}${C_RED}║                     ❌  DEPLOYMENT DID NOT COMPLETE                          ║${C_R}\n"
+      printf "${C_B}${C_RED}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    fi
+    printf "${C_B}║  Elapsed:   ${C_CYN}%dm %ds${C_R}${C_B}                                                          ║${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
+    printf "${C_B}║  VPS IP:    ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "$ip"
+    printf "${C_B}║  Domain:    ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "${DOMAIN:-<not set>}"
+    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    printf "${C_B}║  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "${ip}:81"
+    if [[ "$DEPLOY_STATUS" == "success" ]]; then
+      printf "${C_B}║  ${C_YEL}Cosmos   ${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "cosmos.${DOMAIN:-yourdomain.com} (via NPM)"
+      printf "${C_B}║  ${C_YEL}Authelia ${C_R}${C_B}:  https://${C_CYN}%-55s${C_R}${C_B}║${C_R}\n" "authelia.${DOMAIN:-yourdomain.com} (via NPM)"
+    fi
+    printf "${C_B}║  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}80 (HTTP), 443 (HTTPS), 81 (NPM Admin)          ${C_R}${C_B}║${C_R}\n"
+    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    printf "${C_B}║  Log file: ${C_CYN}%-66s${C_R}${C_B}║${C_R}\n" "$LOG_FILE"
+    printf "${C_B}╚══════════════════════════════════════════════════════════════════════════════╝${C_R}\n"
+    printf "\n"
+
+    if [[ "$DEPLOY_STATUS" == "success" ]]; then
+      printf "${C_B}${C_GRN}Your VPS is ready!${C_R}\n\n"
+    else
+      printf "${C_B}${C_YEL}The deployment did not finish.${C_R} Check: ${C_CYN}cat %s${C_R}\n\n" "$LOG_FILE"
+    fi
+  fi
+  _log "INFO" "=== Script exited (code $exit_code, status: $DEPLOY_STATUS, elapsed: ${elapsed}s) ===" 2>/dev/null || true
+  exit $exit_code
+}
+trap _on_exit EXIT
 
 preflight_checks() {
   step "Pre-flight Checks"
@@ -117,6 +165,7 @@ idempotent_cleanup() {
 
 system_update() {
   step "System Update"
+  info "Updating packages -- this may take a few minutes..."
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
   if [[ "$OS_FAMILY" == "debian" ]]; then
     apt-get update -qq && apt-get upgrade -y -qq && apt-get autoremove -y -qq && apt-get autoclean -qq
@@ -129,6 +178,7 @@ system_update() {
 
 install_dependencies() {
   step "Installing Dependencies"
+  info "Installing required packages..."
   if [[ "$OS_FAMILY" == "debian" ]]; then
     apt-get install -y -qq ca-certificates curl gnupg lsb-release \
       software-properties-common apt-transport-https jq cron logrotate
@@ -145,6 +195,7 @@ install_docker() {
   if command -v docker &>/dev/null && docker version &>/dev/null; then
     success "Docker already installed: $(docker --version)"; return 0
   fi
+  info "Installing Docker CE -- this may take a few minutes..."
   if [[ "$OS_FAMILY" == "debian" ]]; then
     install -m 0755 -d /etc/apt/keyrings
     curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" -o /etc/apt/keyrings/docker.asc 2>/dev/null || \
@@ -181,7 +232,7 @@ install_docker() {
 
 setup_docker_network() {
   step "Docker Network: proxy"
-  # NEVER remove existing proxy network — other containers may depend on it
+  # NEVER remove existing proxy network -- other containers may depend on it
   if ! docker network ls --format '{{.Name}}' | grep -qx "proxy"; then
     docker network create proxy 2>/dev/null || true
   fi
@@ -190,7 +241,7 @@ setup_docker_network() {
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Authelia — Domain, Secrets, Config, Snippets
+# Authelia -- Domain, Secrets, Config, Snippets
 # ──────────────────────────────────────────────────────────────────────────────
 
 get_user_domain() {
@@ -218,7 +269,7 @@ setup_authelia_secrets() {
   for secret_name in jwt_session storage_encryption session; do
     secret_file="${AUTHELIA_SECRETS_DIR}/${secret_name}"
     if [[ ! -f "$secret_file" ]]; then
-      tr -cd '[:alnum:]' </dev/urandom | fold -w 64 | head -n 1 > "$secret_file"
+      openssl rand -hex 32 > "$secret_file"
       chmod 600 "$secret_file"
       success "Secret '${secret_name}' generated"
     else
@@ -231,7 +282,7 @@ setup_authelia_config() {
   step "Authelia Configuration"
   mkdir -p "$AUTHELIA_CONFIG_DIR"
 
-  # ── configuration.yml (unquoted EOF for $DOMAIN substitution) ──
+  # -- configuration.yml (unquoted EOF for $DOMAIN substitution) --
   cat > "${AUTHELIA_CONFIG_DIR}/configuration.yml" << EOF
 server:
   address: "tcp://0.0.0.0:9091"
@@ -295,7 +346,7 @@ notifier:
     filename: /config/notifications.txt
 EOF
 
-  # ── users.yml (quoted 'USERS' delimiter — NO variable expansion) ──
+  # -- users.yml (quoted 'USERS' delimiter -- NO variable expansion) --
   cat > "${AUTHELIA_CONFIG_DIR}/users.yml" << 'USERS'
 users:
   admin:
@@ -312,14 +363,14 @@ USERS
   sed -i "s|admin@__DOMAIN_PLACEHOLDER__|admin@${DOMAIN}|" "${AUTHELIA_CONFIG_DIR}/users.yml"
 
   success "Authelia configuration written to ${AUTHELIA_CONFIG_DIR}"
-  warn "Default Authelia password is 'authelia' — CHANGE IMMEDIATELY after first login"
+  warn "Default Authelia password is 'authelia' -- CHANGE IMMEDIATELY after first login"
 }
 
 create_nginx_snippets() {
   step "Creating Nginx Snippets"
   mkdir -p "$AUTHELIA_SNIPPETS_DIR"
 
-  # ── proxy.conf ──
+  # -- proxy.conf --
   cat > "${AUTHELIA_SNIPPETS_DIR}/proxy.conf" << 'PROXY'
 client_body_buffer_size 128k;
 proxy_next_upstream error timeout invalid_header http_500 http_502 http_503;
@@ -340,7 +391,7 @@ proxy_send_timeout 600s;
 proxy_read_timeout 600s;
 PROXY
 
-  # ── authelia-location.conf (unquoted SNIPPET for \$ escaping) ──
+  # -- authelia-location.conf (unquoted SNIPPET for \$ escaping) --
   cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" << SNIPPET
 location /authelia {
     internal;
@@ -355,7 +406,7 @@ location /authelia {
 }
 SNIPPET
 
-  # ── authelia-authrequest.conf (unquoted SNIPPET for \$ escaping) ──
+  # -- authelia-authrequest.conf (unquoted SNIPPET for \$ escaping) --
   cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" << SNIPPET
 auth_request /authelia;
 auth_request_set \$user \$upstream_http_remote_user;
@@ -405,7 +456,7 @@ services:
     hostname: cosmos-server
     restart: always
     privileged: true
-    # No host ports — accessed only via NPM proxy at http://cosmos-server:80
+    # No host ports -- accessed only via NPM proxy at http://cosmos-server:80
     # For Constellation VPN, add UDP 4242 via UFW or NPM Stream Hosts
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -449,8 +500,9 @@ networks:
     external: true
 COMPOSE
 
+  info "Pulling Docker images -- this may take a few minutes..."
   docker compose pull
-  info "Starting stack..."
+  info "Starting containers -- please wait..."
   docker rm -f npm 2>/dev/null || true
   docker rm -f cosmos-server 2>/dev/null || true
   docker rm -f authelia 2>/dev/null || true
@@ -468,23 +520,33 @@ COMPOSE
       ports_ok=true
       break
     fi
-    [[ $i -eq 30 ]] && {
+    if [[ $i -eq 30 ]]; then
       echo ""; echo "  Port 80 bound:  $has_80"; echo "  Port 443 bound: $has_443"; echo "  Port 81 bound:  $has_81"; echo ""
       ss -tlnp 2>/dev/null | grep -E ':80 |:443 |:81 ' || true; echo ""
       fatal "NPM failed to bind required ports. Check: docker logs npm"
-    }
+    fi
+    printf "\r  Waiting for NPM ports... %2d/30" "$i"
     sleep 2
   done
+  printf "\n"
 
   info "Waiting for NPM container..."
-  for i in $(seq 1 30); do docker ps --format '{{.Names}}' | grep -qx "npm" && break; sleep 2; done
+  for i in $(seq 1 30); do
+    docker ps --format '{{.Names}}' | grep -qx "npm" && { success "NPM container running"; break; }
+    printf "\r  Waiting... %2d/30" "$i"
+    [[ $i -eq 30 ]] && { printf "\n"; warn "NPM container not detected after 60s"; }
+    sleep 2
+  done
+  printf "\n"
 
   info "Waiting for NPM admin UI (port 81)..."
   for i in $(seq 1 60); do
     curl -sf --max-time 5 http://127.0.0.1:81/ &>/dev/null && { success "NPM admin UI responding"; break; }
-    [[ $i -eq 60 ]] && warn "NPM UI timed out (2m). Still starting?"
+    printf "\r  Waiting... %2d/60" "$i"
+    [[ $i -eq 60 ]] && { printf "\n"; warn "NPM UI timed out (2m). Still starting?"; }
     sleep 2
   done
+  printf "\n"
 
   info "Waiting for NPM log files..."
   for i in $(seq 1 30); do
@@ -492,7 +554,9 @@ COMPOSE
       success "NPM logs present"
       break
     fi
+    printf "\r  Waiting... %2d/30" "$i"
     if [[ $i -eq 30 ]]; then
+      printf "\n"
       warn "NPM logs not created yet. Creating placeholders."
       touch "${NPM_LOGS_DIR}/fallback_http_access.log" \
             "${NPM_LOGS_DIR}/fallback_http_error.log" \
@@ -501,20 +565,25 @@ COMPOSE
     fi
     sleep 2
   done
+  printf "\n"
 
   info "Waiting for Cosmos Server..."
   for i in $(seq 1 60); do
     docker exec cosmos-server wget -q --spider --timeout=5 http://127.0.0.1:80/ &>/dev/null && { success "Cosmos Server responding"; break; }
-    [[ $i -eq 60 ]] && warn "Cosmos timed out (3m). Check: docker logs cosmos-server"
+    printf "\r  Waiting... %2d/60" "$i"
+    [[ $i -eq 60 ]] && { printf "\n"; warn "Cosmos timed out (3m). Check: docker logs cosmos-server"; }
     sleep 3
   done
+  printf "\n"
 
   info "Waiting for Authelia..."
   for i in $(seq 1 30); do
     docker exec authelia wget -qO- --timeout=3 http://127.0.0.1:9091/api/health 2>/dev/null | grep -q "ok" && { success "Authelia ready"; break; }
-    [[ $i -eq 30 ]] && warn "Authelia health check timed out"
+    printf "\r  Waiting... %2d/30" "$i"
+    [[ $i -eq 30 ]] && { printf "\n"; warn "Authelia health check timed out"; }
     sleep 2
   done
+  printf "\n"
 
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
   success "Stack deployed: NPM at http://${ip}:81, Cosmos proxied via http://cosmos-server:80, Authelia at http://authelia:9091"
@@ -522,6 +591,7 @@ COMPOSE
 
 setup_fail2ban() {
   step "Fail2Ban"
+  info "Installing and configuring Fail2Ban..."
   if [[ "$OS_FAMILY" == "debian" ]]; then
     apt-get install -y -qq fail2ban
     local banaction="ufw"
@@ -622,14 +692,22 @@ EOF
   mkdir -p /var/log/fail2ban
   systemctl restart fail2ban && systemctl enable fail2ban
 
-  sleep 2
-  local jails; jails=$(fail2ban-client status 2>/dev/null | grep "Jail list" | sed 's/.*://' | tr -d ' ' || true)
-  [[ -n "$jails" ]] && success "Active jails: ${jails}" || warn "Check jails: fail2ban-client status"
+  info "Waiting for Fail2Ban jails to activate..."
+  local jails=""
+  for i in $(seq 1 10); do
+    jails=$(fail2ban-client status 2>/dev/null | grep "Jail list" | sed 's/.*://' | tr -d ' ' || true)
+    [[ -n "$jails" ]] && { success "Active jails: ${jails}"; break; }
+    printf "\r  Waiting... %2d/10" "$i"
+    sleep 2
+  done
+  printf "\n"
+  [[ -z "$jails" ]] && warn "Check jails: fail2ban-client status"
   success "Fail2Ban configured"
 }
 
 setup_firewall() {
   step "Firewall Configuration"
+  info "Configuring firewall..."
   [[ "$OS_FAMILY" == "debian" ]] && setup_firewall_debian || setup_firewall_rhel
 }
 
@@ -698,11 +776,16 @@ print_summary() {
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
   local fw_cmd; [[ "$OS_FAMILY" == "debian" ]] && fw_cmd="ufw status verbose" || fw_cmd="firewall-cmd --list-all"
 
+  printf "\n"
+  printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
+  printf "${C_B}${C_GRN}║                   📋  DEPLOYMENT SUMMARY                                     ║${C_R}\n"
+  printf "${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+  printf "${C_B}║  ${SCRIPT_NAME} v${SCRIPT_VERSION}                                                   ║${C_R}\n"
+  printf "${C_B}║  Duration: ${C_CYN}%dm %ds${C_R}${C_B}                                                    ║${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
+  printf "${C_B}╚══════════════════════════════════════════════════════════════════════════════╝${C_R}\n"
+  printf "\n"
+
   cat << EOF
-
-${C_B}${C_GRN}=== DEPLOYMENT COMPLETE ===${C_R}  ${SCRIPT_NAME} v${SCRIPT_VERSION}
-${C_B}Duration:${C_R} $(( elapsed / 60 ))m $(( elapsed % 60 ))s
-
 ${C_B}${C_CYN}-- SERVICES --${C_R}
 
 ${C_B}Nginx Proxy Manager${C_R}
@@ -732,12 +815,12 @@ ${C_B}Network${C_R}   proxy (bridge)
 ${C_B}Fail2Ban${C_R}  Jails: sshd, npm-auth, npm-forceful-browsing, npm-botsearch
 ${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
 
-${C_B}${C_YEL}Step 1 — NPM Admin${C_R}
+${C_B}${C_YEL}Step 1 -- NPM Admin${C_R}
   Open:   http://${ip}:81
   Login:  admin@example.com / changeme
   ${C_RED}→ Change password immediately${C_R}
 
-${C_B}${C_YEL}Step 2 — Add Proxy Hosts in NPM${C_R}
+${C_B}${C_YEL}Step 2 -- Add Proxy Hosts in NPM${C_R}
 
   A) Authelia Portal
      Dashboards → Proxy Hosts → Add Proxy Host
@@ -763,7 +846,7 @@ ${C_B}${C_YEL}Step 2 — Add Proxy Hosts in NPM${C_R}
      └──────────────────────────────────────────┘
      Click Save
 
-${C_B}${C_YEL}Step 3 — SSL Certificates${C_R}
+${C_B}${C_YEL}Step 3 -- SSL Certificates${C_R}
   On each proxy host → SSL tab
   ┌──────────────────────────────────────────┐
   │ SSL:             Request a new cert      │
@@ -774,21 +857,21 @@ ${C_B}${C_YEL}Step 3 — SSL Certificates${C_R}
   └──────────────────────────────────────────┘
   Click Save
 
-${C_B}${C_YEL}Step 4 — Configure Authelia Protection${C_R}
+${C_B}${C_YEL}Step 4 -- Configure Authelia Protection${C_R}
   In NPM Advanced tab for cosmos.${DOMAIN}, add:
     include /opt/cosmos-stack/authelia/snippets/authelia-authrequest.conf;
   Create location @authelia_signin:
     return 302 https://authelia.${DOMAIN}/?rd=\$scheme://\$http_host\$request_uri;
 
-${C_B}${C_YEL}Step 5 — Register TOTP Device${C_R}
+${C_B}${C_YEL}Step 5 -- Register TOTP Device${C_R}
   Visit https://authelia.${DOMAIN}
   Login: admin@${DOMAIN} / authelia
   Follow prompts to register your authenticator app
 
-${C_B}${C_YEL}Step 6 — Secure Admin Port${C_R}
+${C_B}${C_YEL}Step 6 -- Secure Admin Port${C_R}
   $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "  ufw delete allow 81/tcp && ufw reload"; else echo "  firewall-cmd --permanent --remove-port=81/tcp && firewall-cmd --reload"; fi)
 
-${C_B}${C_YEL}Step 7 — Change Default Password${C_R}
+${C_B}${C_YEL}Step 7 -- Change Default Password${C_R}
   ${C_RED}IMPORTANT:${C_R} Change the default Authelia password immediately:
     1. Login to https://authelia.${DOMAIN}
     2. Go to Settings → Password
@@ -807,7 +890,7 @@ EOF
 }
 
 main() {
-  printf "\n${C_B}${C_CYN}VPS Deployment — Docker + NPM + Cosmos + Authelia + Fail2Ban${C_R}\n"
+  printf "\n${C_B}${C_CYN}VPS Deployment -- Docker + NPM + Cosmos + Authelia + Fail2Ban${C_R}\n"
   printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
   preflight_checks
   idempotent_cleanup
@@ -824,6 +907,8 @@ main() {
   setup_firewall
   setup_logrotate
   print_summary
+  DEPLOY_STATUS="success"
+  DEPLOYED_SERVICES="npm,cosmos-server,authelia,fail2ban"
 }
 
 main "$@"

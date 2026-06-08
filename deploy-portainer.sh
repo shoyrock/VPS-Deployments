@@ -26,6 +26,10 @@ readonly AUTHELIA_SNIPPETS_DIR="${AUTHELIA_DIR}/snippets"
 # Domain set at runtime via user prompt
 DOMAIN=""
 
+# Deployment status tracking for guaranteed completion summary
+DEPLOY_STATUS="in_progress"   # in_progress | success | failed
+DEPLOYED_SERVICES=""          # Track what was successfully deployed
+
 # Colors (TTY only)
 if [[ -t 1 ]]; then
   C_R='\033[0m'; C_B='\033[1m'; C_RED='\033[0;31m'; C_GRN='\033[0;32m'
@@ -40,8 +44,60 @@ info()    { printf "${C_BLU}ℹ${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
 warn()    { printf "${C_YEL}⚠${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
 error()   { printf "${C_RED}✖${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }
 success() { printf "${C_GRN}✔${C_R}  %s\n" "$*"; _log "SUCCESS" "$@"; }
-fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; exit 1; }
+fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; DEPLOY_STATUS="failed"; exit 1; }
 step()    { printf "\n${C_B}${C_CYN}── %s ──${C_R}\n" "$*"; _log "STEP" "$@"; }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GUARANTEED COMPLETION SUMMARY — runs on exit regardless of success/failure
+# ═══════════════════════════════════════════════════════════════════════════════
+_on_exit() {
+  local exit_code=$?
+  local elapsed=$(( $(date +%s) - START_TIME ))
+  local ip
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
+
+  # Only print if we got past preflight (avoid ugly output on very early failure)
+  if [[ -n "${DEPLOYED_SERVICES:-}" ]] || [[ "$DEPLOY_STATUS" != "in_progress" ]]; then
+    printf "\n"
+    if [[ "$DEPLOY_STATUS" == "success" ]]; then
+      printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
+      printf "${C_B}${C_GRN}║                   ✅  DEPLOYMENT COMPLETED SUCCESSFULLY                      ║${C_R}\n"
+      printf "${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    else
+      printf "${C_B}${C_RED}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
+      printf "${C_B}${C_RED}║                     ❌  DEPLOYMENT DID NOT COMPLETE                          ║${C_R}\n"
+      printf "${C_B}${C_RED}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    fi
+    printf "${C_B}║  Elapsed:   ${C_CYN}%dm %ds${C_R}${C_B}                                                          ║${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
+    printf "${C_B}║  VPS IP:    ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "$ip"
+    printf "${C_B}║  Domain:    ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "${DOMAIN:-<not set>}"
+    printf "${C_B}║  Status:    %-16s${C_B}                                                   ║${C_R}\n" "$(if [[ "$DEPLOY_STATUS" == "success" ]]; then printf "${C_GRN}All systems go"; else printf "${C_RED}Check logs"; fi)"
+    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    printf "${C_B}║  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "${ip}:81"
+    if [[ "$DEPLOY_STATUS" == "success" ]]; then
+      printf "${C_B}║  ${C_YEL}Portainer${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "portainer.${DOMAIN:-yourdomain.com} (via NPM)"
+      printf "${C_B}║  ${C_YEL}Authelia ${C_R}${C_B}:  https://${C_CYN}%-55s${C_R}${C_B}║${C_R}\n" "authelia.${DOMAIN:-yourdomain.com} (via NPM)"
+    fi
+    printf "${C_B}║  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}80 (HTTP), 443 (HTTPS), 81 (NPM Admin)          ${C_R}${C_B}║${C_R}\n"
+    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    printf "${C_B}║  Log file: ${C_CYN}%-66s${C_R}${C_B}║${C_R}\n" "$LOG_FILE"
+    printf "${C_B}╚══════════════════════════════════════════════════════════════════════════════╝${C_R}\n"
+    printf "\n"
+
+    if [[ "$DEPLOY_STATUS" == "success" ]]; then
+      printf "${C_B}${C_GRN}Your VPS is ready!${C_R} Set up your DNS records and configure NPM.\n\n"
+    else
+      printf "${C_B}${C_YEL}The deployment did not finish.${C_R} Common fixes:\n"
+      printf "  1. Check the log:   ${C_CYN}cat %s${C_R}\n" "$LOG_FILE"
+      printf "  2. Check Docker:    ${C_CYN}docker ps -a${C_R}\n"
+      printf "  3. Re-run:          ${C_CYN}sudo %s${C_R}\n" "$SCRIPT_NAME"
+      printf "\n"
+    fi
+  fi
+  _log "INFO" "=== Script exited (code $exit_code, status: $DEPLOY_STATUS, elapsed: ${elapsed}s) ===" 2>/dev/null || true
+  exit $exit_code
+}
+trap _on_exit EXIT
 
 preflight_checks() {
   step "Pre-flight Checks"
@@ -118,6 +174,7 @@ idempotent_cleanup() {
 
 system_update() {
   step "System Update"
+  info "Updating packages — this may take a few minutes..."
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
   if [[ "$OS_FAMILY" == "debian" ]]; then
     apt-get update -qq && apt-get upgrade -y -qq && apt-get autoremove -y -qq && apt-get autoclean -qq
@@ -130,6 +187,7 @@ system_update() {
 
 install_dependencies() {
   step "Dependencies"
+  info "Installing required packages..."
   if [[ "$OS_FAMILY" == "debian" ]]; then
     apt-get install -y -qq ca-certificates curl gnupg lsb-release \
       software-properties-common apt-transport-https jq cron logrotate
@@ -146,6 +204,7 @@ install_docker() {
   if command -v docker &>/dev/null && docker version &>/dev/null; then
     success "Docker already installed: $(docker --version)"; return 0
   fi
+  info "Installing Docker CE — this may take a few minutes..."
   if [[ "$OS_FAMILY" == "debian" ]]; then
     install -m 0755 -d /etc/apt/keyrings
     curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" -o /etc/apt/keyrings/docker.asc 2>/dev/null || \
@@ -216,7 +275,7 @@ setup_authelia_secrets() {
   for secret_name in jwt_session storage_encryption session; do
     secret_file="${AUTHELIA_SECRETS_DIR}/${secret_name}"
     if [[ ! -f "$secret_file" ]]; then
-      tr -cd '[:alnum:]' </dev/urandom | fold -w 64 | head -n 1 > "$secret_file"
+      openssl rand -hex 32 > "$secret_file"
       chmod 600 "$secret_file"
       success "Secret '${secret_name}' generated"
     else
@@ -230,7 +289,7 @@ setup_authelia_config() {
   mkdir -p "$AUTHELIA_CONFIG_DIR"
   local ip random_pass
   ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
-  random_pass=$(tr -cd '[:alnum:]' </dev/urandom | fold -w 16 | head -n 1)
+  random_pass=$(openssl rand -hex 8)
 
   # Generate configuration.yml -- unquoted EOF so $DOMAIN is substituted
   if [[ ! -f "${AUTHELIA_CONFIG_DIR}/configuration.yml" ]]; then
@@ -465,10 +524,13 @@ networks:
     external: true
 COMPOSE
 
+  info "Pulling Docker images (NPM, Portainer, Authelia) — this may take a few minutes..."
   docker compose pull
   docker rm -f npm 2>/dev/null || true
   docker rm -f portainer 2>/dev/null || true
   docker rm -f authelia 2>/dev/null || true
+
+  info "Starting containers — please wait..."
   docker compose up -d
 
   info "Verifying NPM ports (80, 443, 81) are bound..."
@@ -483,6 +545,7 @@ COMPOSE
       ports_ok=true
       break
     fi
+    printf "${C_DIM}  Waiting for NPM ports... (%d/30)${C_R}\r" "$i"
     [[ $i -eq 30 ]] && {
       echo ""; echo "  Port 80 bound:  $has_80"; echo "  Port 443 bound: $has_443"; echo "  Port 81 bound:  $has_81"; echo ""
       ss -tlnp 2>/dev/null | grep -E ':80 |:443 |:81 ' || true; echo ""
@@ -490,16 +553,25 @@ COMPOSE
     }
     sleep 2
   done
+  printf "\n"
 
-  info "Waiting for NPM container..."
-  for i in $(seq 1 30); do docker ps --format '{{.Names}}' | grep -qx "npm" && break; sleep 2; done
+  info "Waiting for NPM container to start..."
+  for i in $(seq 1 30); do
+    docker ps --format '{{.Names}}' | grep -qx "npm" && { success "NPM container running"; break; }
+    printf "${C_DIM}  Waiting for NPM container... (%d/30)${C_R}\r" "$i"
+    [[ $i -eq 30 ]] && warn "NPM container not found after 60s"
+    sleep 2
+  done
+  printf "\n"
 
   info "Waiting for NPM admin UI (:81)..."
   for i in $(seq 1 60); do
-    curl -sf --max-time 5 http://127.0.0.1:81/ &>/dev/null && { success "NPM UI ready"; break; }
-    [[ $i -eq 60 ]] && warn "NPM UI timed out (2m)."
+    curl -sf --max-time 5 http://127.0.0.1:81/ &>/dev/null && { success "NPM admin UI ready"; break; }
+    printf "${C_DIM}  Waiting for NPM admin UI... (%d/60)${C_R}\r" "$i"
+    [[ $i -eq 60 ]] && warn "NPM UI timed out (2m)"
     sleep 2
   done
+  printf "\n"
 
   info "Waiting for NPM log files..."
   for i in $(seq 1 30); do
@@ -507,6 +579,7 @@ COMPOSE
       success "NPM logs present"
       break
     fi
+    printf "${C_DIM}  Waiting for NPM log files... (%d/30)${C_R}\r" "$i"
     if [[ $i -eq 30 ]]; then
       warn "NPM logs not found. Creating placeholders."
       touch "${NPM_LOGS_DIR}/fallback_http_access.log" \
@@ -516,22 +589,27 @@ COMPOSE
     fi
     sleep 2
   done
+  printf "\n"
 
-  info "Waiting for Portainer..."
+  info "Waiting for Portainer to be ready..."
   for i in $(seq 1 40); do
     docker exec portainer wget -qO- --timeout=5 http://127.0.0.1:9000/api/status &>/dev/null && { success "Portainer ready"; break; }
+    printf "${C_DIM}  Waiting for Portainer... (%d/40)${C_R}\r" "$i"
     docker ps --format '{{.Names}}' | grep -qx "portainer" || { [[ $i -eq 40 ]] && warn "Portainer container not found"; }
     [[ $i -eq 40 ]] && warn "Portainer timed out. Check: docker logs portainer"
     sleep 3
   done
+  printf "\n"
 
-  info "Waiting for Authelia..."
+  info "Waiting for Authelia to be ready..."
   for i in $(seq 1 40); do
     docker exec authelia wget -qO- --timeout=5 http://127.0.0.1:9091/api/health &>/dev/null && { success "Authelia ready"; break; }
+    printf "${C_DIM}  Waiting for Authelia... (%d/40)${C_R}\r" "$i"
     docker ps --format '{{.Names}}' | grep -qx "authelia" || { [[ $i -eq 40 ]] && warn "Authelia container not found"; }
     [[ $i -eq 40 ]] && warn "Authelia timed out. Check: docker logs authelia"
     sleep 3
   done
+  printf "\n"
 
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
   success "NPM: http://${ip}:81"
@@ -541,6 +619,7 @@ COMPOSE
 
 setup_fail2ban() {
   step "Fail2Ban"
+  info "Installing and configuring Fail2Ban..."
   if [[ "$OS_FAMILY" == "debian" ]]; then
     apt-get install -y -qq fail2ban
     local banaction="ufw"
@@ -657,7 +736,7 @@ setup_firewall() {
 }
 
 setup_firewall_debian() {
-  info "Configuring UFW..."
+  info "Configuring UFW firewall..."
   apt-get install -y -qq ufw
 
   # CRITICAL: Docker manipulates iptables directly. UFW's DEFAULT_FORWARD_POLICY=DROP
@@ -743,7 +822,12 @@ print_summary() {
   fi
 
   cat << EOF
-${C_B}${C_GRN}Deployment Complete${C_R}  (${SCRIPT_NAME} v${SCRIPT_VERSION})  ${C_B}$(( elapsed / 60 ))m $(( elapsed % 60 ))s${C_R}
+
+${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════╗${C_R}
+${C_B}${C_GRN}║                    🚀 YOUR VPS IS READY!                             ║${C_R}
+${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════╣${C_R}
+${C_B}${C_GRN}║  Deployment Complete  ${C_R}${C_B}(${SCRIPT_NAME} v${SCRIPT_VERSION})  ${C_CYN}$(( elapsed / 60 ))m $(( elapsed % 60 ))s${C_R}${C_B}   ║${C_R}
+${C_B}${C_GRN}╚══════════════════════════════════════════════════════════════════════╝${C_R}
 
 ${C_B}Nginx Proxy Manager${C_R}
   Admin:   http://${ip}:81
@@ -852,6 +936,8 @@ main() {
   setup_fail2ban
   setup_firewall
   setup_logrotate
+  DEPLOY_STATUS="success"
+  DEPLOYED_SERVICES="npm,portainer,authelia,fail2ban,firewall"
   print_summary
 }
 
