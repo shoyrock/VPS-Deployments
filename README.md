@@ -22,7 +22,7 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script incl
 
 | # | Option | What It Deploys | Notes |
 |---|--------|----------------|-------|
-| **0** | **Light Bundle** | **NPM + Portainer** only | Minimal setup (~200MB RAM). Add more dashboards later. |
+| **0** | **Lite Bundle** | **NPM + Portainer** only | Minimal setup (~200MB RAM). Add more dashboards later. |
 | 1 | Portainer | NPM + Portainer | Visual container management |
 | 2 | Dockge | NPM + Dockge | Compose stack manager |
 | 3 | Coolify | NPM + Coolify | PaaS — **native 2FA** — Coolify Traefik disabled |
@@ -62,14 +62,14 @@ All containers connect to the `proxy` Docker network and are reachable by hostna
 
 ## How to Use
 
-### Option 1: Light Bundle (Recommended for Fresh VPS)
+### Option 1: Lite Bundle (Recommended for Fresh VPS)
 
 The fastest way to get started. Deploys **NPM + Portainer** only — minimal resource usage, expand later.
 
 ```bash
 curl -fsSL -o deploy.sh https://raw.githubusercontent.com/shoyrock/VPS-Deployments/main/deploy.sh
 chmod +x deploy.sh
-./deploy.sh              # Pick [0] Light Bundle from the menu
+./deploy.sh              # Pick [0] Lite Bundle from the menu
 # Or directly: ./deploy.sh light
 ```
 
@@ -81,7 +81,7 @@ chmod +x deploy.sh
 
 ### Option 2: Deploy with 2FA (Authelia)
 
-For full protection, deploy Authelia after the light bundle. It adds a login gate with TOTP 2FA (Google/Microsoft Authenticator) to **all** your dashboards.
+For full protection, deploy Authelia after the lite bundle. It adds a login gate with TOTP 2FA (Google/Microsoft Authenticator) to **all** your dashboards.
 
 ```bash
 ./deploy.sh light        # Step 1: deploy minimal setup
@@ -283,7 +283,7 @@ sudo ufw delete allow 81/tcp && sudo ufw reload
 ├── deploy.sh                  ← Unified menu (run this first)
 ├── harden.sh                  ← 🔒 Security hardening (run after deploy)
 ├── deploy-authelia.sh         ← 🔐 Optional SSO + TOTP 2FA portal
-├── deploy-portainer.sh        ← NPM + Portainer (light bundle default)
+├── deploy-portainer.sh        ← NPM + Portainer (lite bundle default)
 ├── deploy-dockge.sh           ← NPM + Dockge
 ├── deploy-coolify.sh          ← NPM + Coolify (native 2FA, Traefik disabled)
 ├── deploy-dokploy.sh          ← NPM + Dokploy (native 2FA, Traefik disabled)

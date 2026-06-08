@@ -157,19 +157,19 @@ print_tool_detail() {
 # ═══════════════════════════════════════════════════════════════════════════════
 # LIGHT BUNDLE — NPM + Portainer only
 # ═══════════════════════════════════════════════════════════════════════════════
-run_light_bundle() {
+run_lite_bundle() {
   header
-  printf "${C_B}${C_GRN}Light Bundle Setup${C_R}\n"
+  printf "${C_B}${C_GRN}Lite Bundle Setup${C_R}\n"
   printf "Deploys: Nginx Proxy Manager + Portainer (minimal, ~200MB RAM)\n"
   printf "You can add more dashboards or Authelia (2FA) anytime later.\n\n"
 
-  read -rp "Deploy light bundle? [y/N]: " confirm
+  read -rp "Deploy lite bundle? [y/N]: " confirm
   [[ "$confirm" =~ ^[Yy]$ ]] || { printf "Aborted.\n"; return 1; }
 
   # Deploy NPM + Portainer
   run_tool "portainer"
 
-  printf "\n${C_B}${C_GRN}Light bundle deployed!${C_R}\n"
+  printf "\n${C_B}${C_GRN}Lite bundle deployed!${C_R}\n"
   printf "\nTo add more dashboards later, run: ./deploy.sh\n"
   printf "To add 2FA (Authelia) later, run: ./deploy.sh authelia\n"
   printf "\n${C_DIM}Press Enter to return to menu...${C_R}"
@@ -261,7 +261,7 @@ if [[ $# -gt 0 ]]; then
     cosmos)                           requested="cosmos" ;;
     yunohost|ynh)                     requested="yunohost" ;;
     freedombox|fbx)                   requested="freedombox" ;;
-    light|minimal|quick)              requested="light" ;;
+    lite|light|minimal|quick)              requested="lite" ;;
     authelia|mfa|2fa|sso)             requested="authelia" ;;
     harden|security|lockdown)         requested="harden" ;;
     *)
@@ -275,9 +275,9 @@ if [[ $# -gt 0 ]]; then
       ;;
   esac
 
-  # Handle light bundle
-  if [[ "$requested" == "light" ]]; then
-    run_light_bundle
+  # Handle lite bundle
+  if [[ "$requested" == "lite" ]]; then
+    run_lite_bundle
     exit $?
   fi
 
@@ -299,14 +299,14 @@ while true; do
   header
   print_menu
 
-  read -rp "Enter [0] for light bundle, [1-${TOOL_COUNT}] for individual tool, or [q] to quit: " choice
+  read -rp "Enter [0] for lite bundle, [1-${TOOL_COUNT}] for individual tool, or [q] to quit: " choice
 
   # Handle quit
   [[ "$choice" =~ ^[Qq]$ ]] && { printf "\n${C_DIM}Goodbye!${C_R}\n\n"; exit 0; }
 
-  # Handle light bundle (0)
+  # Handle lite bundle (0)
   if [[ "$choice" == "0" ]]; then
-    run_light_bundle
+    run_lite_bundle
     continue
   fi
 

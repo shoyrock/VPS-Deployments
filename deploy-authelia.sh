@@ -269,54 +269,38 @@ verify_authelia() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# NPM INTEGRATION
+# SNIPPETS — align with official Authelia NGINX Proxy Manager integration
 # ═══════════════════════════════════════════════════════════════════════════════
-configure_npm_integration() {
-  step "NPM Forward-Auth Integration"
-  info "To enable MFA for each service in NPM:"
-  echo ""
-  echo "  1. In NPM Admin, go to Proxy Hosts → Edit your host"
-  echo "  2. Go to the 'Advanced' tab"
-  echo "  3. In 'Custom Nginx Configuration', add:"
-  echo ""
-  echo "     location / {"
-  echo "       include /data/nginx/proxy_host_authelia.conf;"
-  echo "     }"
-  echo ""
-  echo "  4. Save and repeat for each protected subdomain"
-  echo ""
-  warn "Or use the authelia-configure.sh helper script (see below)"
-}
+create_snippets() {
+  step "Creating NGINX snippets for NPM integration ..."
+  local snippets_dir="$DATA_DIR/snippets"
+  mkdir -p "$snippets_dir"
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# HELPER SCRIPT
-# ═══════════════════════════════════════════════════════════════════════════════
-create_helper_script() {
-  local helper="$DATA_DIR/authelia-configure.sh"
-  cat > "$helper" << HELPER
-#!/usr/bin/env bash
-# Authelia NPM Configuration Helper
-# Run this to automatically configure NPM proxy hosts to use Authelia 2FA
+  cat > "$snippets_dir/proxy.conf" << 'SNIPPET'
+## Authelia proxy.conf — headers for proxied applications
+## Based on: https://www.authelia.com/integration/proxies/nginx/
+client_body_buffer_size 128k;
+proxy_next_upstream error timeout invalid_header http_500 http_502 http_503;
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header X-Forwarded-Host $http_host;
+proxy_set_header X-Forwarded-Uri $request_uri;
+proxy_set_header X-Forwarded-Ssl on;
+proxy_redirect http:// $scheme://;
+proxy_http_version 1.1;
+proxy_set_header Connection "";
+proxy_cache_bypass $cookie_session;
+proxy_no_cache $cookie_session;
+proxy_buffers 4 32k;
+proxy_send_timeout 600s;
+proxy_read_timeout 600s;
+SNIPPET
 
-AUTH_DOMAIN="authelia.${DOMAIN}"
-AUTH_URL="http://authelia:9091"
-
-echo "Authelia NPM Configuration Helper"
-echo "================================="
-echo ""
-echo "For each subdomain you want to protect with MFA, add this to NPM"
-echo "Proxy Host → Advanced → Custom Nginx Configuration:"
-echo ""
-cat << 'NGINX'
-# Forward auth to Authelia
-auth_request /authelia;
-auth_request_set \$user \$upstream_http_remote_user;
-proxy_set_header Remote-User \$user;
-auth_request_set \$groups \$upstream_http_remote_groups;
-proxy_set_header Remote-Groups \$groups;
-
-error_page 401 = @authelia_signin;
-
+  cat > "$snippets_dir/authelia-location.conf" << SNIPPET
+## Authelia auth verification endpoint
+## Mount this directory into NPM as /snippets/ and include in Advanced tab
 location /authelia {
     internal;
     proxy_pass http://authelia:9091/api/verify;
@@ -328,15 +312,117 @@ location /authelia {
     proxy_set_header Content-Length "";
     proxy_set_header Connection "";
 }
+SNIPPET
 
-location @authelia_signin {
-    internal;
-    return 302 https://authelia.${DOMAIN}/?rd=\$scheme://\$http_host\$request_uri;
+  cat > "$snippets_dir/authelia-authrequest.conf" << SNIPPET
+## Authelia auth_request directive
+## Add inside the location / {} block in NPM Advanced tab
+auth_request /authelia;
+auth_request_set \$user \$upstream_http_remote_user;
+proxy_set_header Remote-User \$user;
+auth_request_set \$groups \$upstream_http_remote_groups;
+proxy_set_header Remote-Groups \$groups;
+auth_request_set \$name \$upstream_http_remote_name;
+proxy_set_header Remote-Name \$name;
+auth_request_set \$email \$upstream_http_remote_email;
+proxy_set_header Remote-Email \$email;
+error_page 401 = @authelia_signin;
+SNIPPET
+
+  ok "NGINX snippets created in $snippets_dir"
 }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NPM INTEGRATION
+# ═══════════════════════════════════════════════════════════════════════════════
+configure_npm_integration() {
+  step "NPM Forward-Auth Integration"
+  info "Authelia is ready. Two proxy hosts needed:"
+  echo ""
+  echo "  1. AUTHELIA PORTAL (NOT protected — must be accessible to log in)"
+  echo "     Domain: authelia.${DOMAIN} → http://authelia:9091"
+  echo "     Advanced tab:"
+  echo "       location / {"
+  echo "         include /snippets/proxy.conf;"
+  echo "         proxy_pass \$forward_scheme://\$server:\$port;"
+  echo "       }"
+  echo ""
+  echo "  2. PROTECTED DASHBOARDS (each gets 2FA)"
+  echo "     For EACH dashboard, edit its proxy host Advanced tab:"
+  echo "       include /snippets/authelia-location.conf;"
+  echo "       location / {"
+  echo "         include /snippets/proxy.conf;"
+  echo "         include /snippets/authelia-authrequest.conf;"
+  echo "         proxy_pass \$forward_scheme://\$server:\$port;"
+  echo "       }"
+  echo ""
+  echo "  Full config with comments: $DATA_DIR/authelia-configure.sh"
+  echo ""
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELPER SCRIPT
+# ═══════════════════════════════════════════════════════════════════════════════
+create_helper_script() {
+  local helper="$DATA_DIR/authelia-configure.sh"
+  cat > "$helper" << HELPER
+#!/usr/bin/env bash
+# Authelia NPM Configuration Helper
+# Based on: https://www.authelia.com/integration/proxies/nginx-proxy-manager/
+#
+# Two ways to set up:
+#   A) Inline (quick) — copy-paste from this script into NPM Advanced tab
+#   B) Snippets (clean) — mount snippet files into NPM container
+#
+# SNIPPETS LOCATION: $DATA_DIR/snippets/
+#   - proxy.conf
+#   - authelia-location.conf
+#   - authelia-authrequest.conf
+
+AUTH_DOMAIN="authelia.${DOMAIN}"
+
+echo "==================================================================="
+echo "Authelia NPM Configuration"
+echo "==================================================================="
+echo ""
+echo "METHOD A: INLINE (copy-paste into NPM Advanced tab)"
+echo "-----------------------------------------------------"
+echo "For each proxy host you want to protect, paste this into"
+echo "NPM → Proxy Hosts → Edit → Advanced tab:"
+echo ""
+cat << 'NGINX'
+# Authelia forward-auth protection
+# Paste the ENTIRE block below into the Advanced tab
+
+include /snippets/authelia-location.conf;
+
+location / {
+    include /snippets/proxy.conf;
+    include /snippets/authelia-authrequest.conf;
+    proxy_pass $forward_scheme://$server:$port;
+}
+
+# For apps that need websockets (e.g., Portainer, Dockge):
+# include /snippets/websocket.conf;
 NGINX
 
 echo ""
-echo "Copy the block above into each proxy host you want to protect."
+echo "METHOD B: MOUNT SNIPPETS (cleaner, recommended)"
+echo "------------------------------------------------"
+echo "1. Mount snippets into NPM container:"
+echo "   $DATA_DIR/snippets/ → /snippets/ in NPM"
+echo ""
+echo "2. Then in each proxy host Advanced tab, just paste:"
+echo ""
+echo "   include /snippets/authelia-location.conf;"
+echo "   location / {"
+echo "       include /snippets/proxy.conf;"
+echo "       include /snippets/authelia-authrequest.conf;"
+echo "       proxy_pass \$forward_scheme://\$server:\$port;"
+echo "   }"
+echo ""
+echo "DOMAIN SET: ${DOMAIN}"
+echo "AUTHELIA URL: https://authelia.${DOMAIN}"
 echo ""
 HELPER
   chmod +x "$helper"
@@ -374,9 +460,11 @@ print_summary() {
   1. Add DNS record:
      Type: A | Name: authelia | Content: ${ip} | Proxy: 🟠 Orange cloud
 
-  2. In NPM, add proxy host:
+  2. In NPM, add proxy host for the AUTHELIA PORTAL:
      Domain: authelia.${DOMAIN} → http://authelia:9091
      Request SSL certificate
+     ⚠ Advanced tab: do NOT include authelia-authrequest.conf here
+        (the portal must be accessible without 2FA to allow login)
 
   3. Change default password:
      docker exec authelia authelia crypto hash generate argon2 --password 'YOUR_NEWPASS'
@@ -388,9 +476,15 @@ print_summary() {
      Click "Methods" → "One-time Password" → "Not registered yet?"
      Scan QR code with Google/Microsoft/Duo Authenticator
 
-  5. Protect other services:
-     For each subdomain, add the forward-auth config from:
-     $DATA_DIR/authelia-configure.sh
+  5. Protect other dashboards with 2FA:
+     For each proxy host, add to Advanced tab:
+       include /snippets/authelia-location.conf;
+       location / {
+           include /snippets/proxy.conf;
+           include /snippets/authelia-authrequest.conf;
+           proxy_pass \$forward_scheme://\$server:\$port;
+       }
+     Full reference: $DATA_DIR/authelia-configure.sh
 
 ===============================================================================
   ADDING NEW USERS
@@ -412,6 +506,7 @@ main() {
   setup_docker_network
   generate_secrets
   generate_config
+  create_snippets
   deploy_authelia
   verify_authelia
   configure_npm_integration
