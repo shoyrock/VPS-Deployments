@@ -83,7 +83,7 @@ _on_exit() {
     printf "${C_B}║  Status:    %-16s${C_B}                                                   ║${C_R}\n" "$(if [[ "$DEPLOY_STATUS" == "success" ]]; then printf "${C_GRN}All systems go"; else printf "${C_RED}Check logs"; fi)"
     # Read Authelia password for display (always show - never skip)
     local exit_pass="<unknown>"
-    [[ -f "${AUTHELIA_DIR}/.default_password" ]] && exit_pass=$(cat "${AUTHELIA_DIR}/.default_password" 2>/dev/null || echo "<unknown>")
+    [[ -f "${AUTHELIA_DIR}/.default_password" ]] && exit_pass=$(tr -d '\n' < "${AUTHELIA_DIR}/.default_password" 2>/dev/null || echo "<unknown>")
 
     printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
     printf "${C_B}║  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "${ip}:81"
@@ -384,7 +384,7 @@ EOF
 
   # Store the random password for later use in setup_authelia_users
   random_pass=$(openssl rand -hex 8)
-  echo "$random_pass" > "${AUTHELIA_DIR}/.default_password"
+  printf '%s' "$random_pass" > "${AUTHELIA_DIR}/.default_password"
   chmod 600 "${AUTHELIA_DIR}/.default_password"
   info "Random password generated for Authelia admin account"
   info "users.yml will be created after authelia container starts"
@@ -469,12 +469,12 @@ setup_authelia_users() {
   # Read the random password generated during setup_authelia_config
   local random_pass=""
   if [[ -f "${AUTHELIA_DIR}/.default_password" ]]; then
-    random_pass=$(cat "${AUTHELIA_DIR}/.default_password")
+    random_pass=$(tr -d '\n' < "${AUTHELIA_DIR}/.default_password")
   fi
   if [[ -z "$random_pass" ]]; then
     warn "No random password found, generating fallback"
     random_pass=$(openssl rand -hex 8)
-    echo "$random_pass" > "${AUTHELIA_DIR}/.default_password"
+    printf '%s' "$random_pass" > "${AUTHELIA_DIR}/.default_password"
     chmod 600 "${AUTHELIA_DIR}/.default_password"
   fi
 
@@ -890,7 +890,7 @@ print_summary() {
   # Read Authelia password from file (generated at deploy time)
   local default_pass_msg="<unknown>"
   if [[ -f "${AUTHELIA_DIR}/.default_password" ]]; then
-    default_pass_msg=$(cat "${AUTHELIA_DIR}/.default_password")
+    default_pass_msg=$(tr -d '\n' < "${AUTHELIA_DIR}/.default_password")
   fi
 
   cat << EOF

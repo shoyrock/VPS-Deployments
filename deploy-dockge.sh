@@ -78,7 +78,7 @@ _on_exit() {
     printf "${C_B}║  Domain:    ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "${DOMAIN:-<not set>}"
     # Read Authelia password for display (always show - never skip)
     local exit_pass="<unknown>"
-    [[ -f "${AUTHELIA_DIR}/.default_password" ]] && exit_pass=$(cat "${AUTHELIA_DIR}/.default_password" 2>/dev/null || echo "<unknown>")
+    [[ -f "${AUTHELIA_DIR}/.default_password" ]] && exit_pass=$(tr -d '\n' < "${AUTHELIA_DIR}/.default_password" 2>/dev/null || echo "<unknown>")
 
     printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
     printf "${C_B}║  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "${ip}:81"
@@ -382,7 +382,7 @@ EOF
 
   # Generate random password for admin account
   random_pass=$(openssl rand -hex 8)
-  echo "$random_pass" > "${AUTHELIA_DIR}/.default_password"
+  printf '%s' "$random_pass" > "${AUTHELIA_DIR}/.default_password"
   chmod 600 "${AUTHELIA_DIR}/.default_password"
   info "Random password generated for Authelia admin account"
 
@@ -456,11 +456,11 @@ setup_authelia_users() {
   # Read the random password
   local random_pass=""
   if [[ -f "${AUTHELIA_DIR}/.default_password" ]]; then
-    random_pass=$(cat "${AUTHELIA_DIR}/.default_password")
+    random_pass=$(tr -d '\n' < "${AUTHELIA_DIR}/.default_password")
   fi
   if [[ -z "$random_pass" ]]; then
     random_pass=$(openssl rand -hex 8)
-    echo "$random_pass" > "${AUTHELIA_DIR}/.default_password"
+    printf '%s' "$random_pass" > "${AUTHELIA_DIR}/.default_password"
     chmod 600 "${AUTHELIA_DIR}/.default_password"
   fi
 
@@ -859,7 +859,7 @@ EOF
 print_summary() {
   local random_pass="unknown"
   if [[ -f "${AUTHELIA_DIR}/.default_password" ]]; then
-    random_pass=$(cat "${AUTHELIA_DIR}/.default_password")
+    random_pass=$(tr -d '\n' < "${AUTHELIA_DIR}/.default_password")
   fi
 
   local elapsed=$(( $(date +%s) - START_TIME ))
