@@ -19,6 +19,7 @@ readonly AUTHELIA_DIR="${STACK_DIR}/authelia"
 readonly AUTHELIA_SECRETS_DIR="${AUTHELIA_DIR}/secrets"
 readonly AUTHELIA_CONFIG_DIR="${AUTHELIA_DIR}/config"
 readonly AUTHELIA_SNIPPETS_DIR="${AUTHELIA_DIR}/snippets"
+readonly DOMAIN_PERSIST_FILE="/etc/vps-deploy-domain"
 readonly LOG_FILE="/var/log/vps-deploy.log"
 
 DOMAIN=""  # Set at runtime via user prompt
@@ -271,10 +272,10 @@ setup_docker_network() {
 get_user_domain() {
   step "Domain Configuration"
 
-  # Check for existing config from a previous deployment
-  if [[ -f "${AUTHELIA_CONFIG_DIR}/configuration.yml" ]]; then
+  # Check for persisted domain from a previous deployment
+  if [[ -f "${DOMAIN_PERSIST_FILE}" ]]; then
     local existing_domain
-    existing_domain=$(grep "authelia_url:" "${AUTHELIA_CONFIG_DIR}/configuration.yml" 2>/dev/null | sed 's/.*https:\/\/authelia\.//' | tr -d ' ' || true)
+    existing_domain=$(tr -d '\n' < "${DOMAIN_PERSIST_FILE}" 2>/dev/null || true)
     if [[ -n "$existing_domain" ]]; then
       printf "\n${C_YEL}⚠️  Previous deployment detected with domain: ${C_B}${existing_domain}${C_R}\n"
       printf "${C_YEL}   Press ${C_B}Y${C_R}${C_YEL} + Enter to REUSE this domain${C_R}\n"
@@ -290,6 +291,10 @@ get_user_domain() {
   read -r DOMAIN
   [[ -z "$DOMAIN" ]] && fatal "Domain is required."
   DOMAIN=$(echo "$DOMAIN" | sed 's|https\?://||' | sed 's|/.*||' | tr -d ' ')
+
+  # Persist domain outside STACK_DIR so it survives cleanup
+  printf '%s' "$DOMAIN" > "${DOMAIN_PERSIST_FILE}" || warn "Could not persist domain to ${DOMAIN_PERSIST_FILE}"
+
   success "Domain set to: $DOMAIN"
 }
 
@@ -304,6 +309,7 @@ setup_authelia_secrets() {
       chmod 600 "$secret_file"
       success "Secret '${secret_name}' generated"
     else
+      # NOTE: only reachable if idempotent_cleanup is skipped
       info "Secret '${secret_name}' already exists (preserved)"
     fi
   done
@@ -381,6 +387,7 @@ EOF
   info "users.yml will be created after authelia container is running"
 
   # Generate random password for admin account
+  local random_pass
   random_pass=$(openssl rand -hex 8)
   printf '%s' "$random_pass" > "${AUTHELIA_DIR}/.default_password"
   chmod 600 "${AUTHELIA_DIR}/.default_password"
@@ -427,18 +434,37 @@ location /authelia {
 }
 SNIPPET
 
-  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" << 'SNIPPET'
+  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" << SNIPPET1
+## Paste this into NPM Advanced tab for each protected proxy host
+## NOTE: proxy_set_header Remote-User/Groups below work at server block level.
+## NPM's generated location / block has its own proxy_set_header directives,
+## which OVERRIDES all server-level ones (nginx inheritance rule).
+## For apps that need SSO identity headers, add them via NPM's Custom Locations.
 auth_request /authelia;
-auth_request_set $user $upstream_http_remote_user;
-proxy_set_header Remote-User $user;
-auth_request_set $groups $upstream_http_remote_groups;
-proxy_set_header Remote-Groups $groups;
-auth_request_set $name $upstream_http_remote_name;
-proxy_set_header Remote-Name $name;
-auth_request_set $email $upstream_http_remote_email;
-proxy_set_header Remote-Email $email;
-error_page 401 = @authelia_signin;
-SNIPPET
+auth_request_set \$target_url \$scheme://\$http_host\$request_uri;
+error_page 401 =302 https://authelia.${DOMAIN}/?rd=\$target_url;
+auth_request_set \$user \$upstream_http_remote_user;
+auth_request_set \$groups \$upstream_http_remote_groups;
+proxy_set_header Remote-User \$user;
+proxy_set_header Remote-Groups \$groups;
+
+set \$upstream_authelia http://authelia:9091;
+location /authelia {
+    internal;
+    proxy_pass \$upstream_authelia/api/authz/forward-auth;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    proxy_set_header X-Original-URL \$scheme://\$http_host\$request_uri;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header X-Forwarded-Host \$http_host;
+    proxy_set_header X-Forwarded-Uri \$request_uri;
+    proxy_cache_bypass \$cookie_session;
+    proxy_no_cache \$cookie_session;
+    proxy_http_version 1.1;
+}
+SNIPPET1
 
   success "NGINX snippets written to ${AUTHELIA_SNIPPETS_DIR}/"
 }
@@ -446,6 +472,7 @@ SNIPPET
 setup_authelia_users() {
   step "Creating Authelia User Account"
 
+  # NOTE: only true if idempotent_cleanup was skipped (normally always creates fresh)
   if [[ -f "${AUTHELIA_CONFIG_DIR}/users.yml" ]]; then
     info "users.yml already exists (preserved)"
     return 0
@@ -1011,8 +1038,8 @@ main() {
   create_nginx_snippets
   setup_stack
   setup_authelia_users
-  setup_fail2ban
   setup_firewall
+  setup_fail2ban
   setup_logrotate
   print_summary
   # Mark deployment as successful for the exit trap summary
