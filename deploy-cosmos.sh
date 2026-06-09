@@ -77,18 +77,16 @@ _on_exit() {
     printf "${C_B}║  VPS IP:    ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "$ip"
     printf "${C_B}║  External:  ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "$ext_ip"
     printf "${C_B}║  Domain:    ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "${DOMAIN:-<not set>}"
-    # Read Authelia password for display
-    local exit_pass=""
-    [[ -f "${AUTHELIA_DIR}/.default_password" ]] && exit_pass=$(cat "${AUTHELIA_DIR}/.default_password")
+    # Read Authelia password for display (always show - never skip)
+    local exit_pass="<unknown>"
+    [[ -f "${AUTHELIA_DIR}/.default_password" ]] && exit_pass=$(cat "${AUTHELIA_DIR}/.default_password" 2>/dev/null || echo "<unknown>")
 
     printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
     printf "${C_B}║  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "${ip}:81"
     if [[ "$DEPLOY_STATUS" == "success" ]]; then
       printf "${C_B}║  ${C_YEL}Cosmos   ${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "cosmos.${DOMAIN:-yourdomain.com} (via NPM)"
       printf "${C_B}║  ${C_YEL}Authelia ${C_R}${C_B}:  https://${C_CYN}%-55s${C_R}${C_B}║${C_R}\n" "authelia.${DOMAIN:-yourdomain.com}"
-      if [[ -n "$exit_pass" ]]; then
-        printf "${C_B}║  ${C_YEL}Authelia Login${R}${C_B}:  ${C_CYN}admin / %s${R}${C_B}%*s║${C_R}\n" "$exit_pass" $((46 - ${#exit_pass})) ""
-      fi
+      printf "${C_B}║  ${C_RED}🔐  Login:  admin / %s${C_R}${C_B}%*s║${C_R}\n" "$exit_pass" $((46 - ${#exit_pass})) ""
     fi
     printf "${C_B}║  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}80 (HTTP), 443 (HTTPS), 81 (NPM Admin)          ${C_R}${C_B}║${C_R}\n"
     printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
@@ -463,29 +461,22 @@ setup_authelia_users() {
   local hash_output
   hash_output=$(docker exec authelia authelia crypto hash generate argon2 --password "$random_pass" 2>&1) || true
   local pass_hash
-  pass_hash=$(echo "$hash_output" | grep -o 'Digest: .*' | sed 's/Digest: //' | tr -d ' \t\n\r') || true
+  pass_hash=$(echo "$hash_output" | tail -1 | sed 's/^Digest: //' | tr -d '[:space:]') || true
 
   if [[ -z "$pass_hash" ]] || [[ ! "$pass_hash" == \$argon2id\$* ]]; then
     warn "Retrying hash generation..."
-    pass_hash=$(docker exec authelia sh -c "authelia crypto hash generate argon2 --password '$random_pass' 2>&1" | grep -o 'Digest: .*' | sed 's/Digest: //' | tr -d ' \t\n\r') || true
+    hash_output=$(docker exec authelia sh -c "authelia crypto hash generate argon2 --password '$random_pass' 2>&1") || true
+    pass_hash=$(echo "$hash_output" | tail -1 | sed 's/^Digest: //' | tr -d '[:space:]') || true
   fi
 
   if [[ -z "$pass_hash" ]] || [[ ! "$pass_hash" == \$argon2id\$* ]]; then
     fatal "Could not generate a valid password hash. Check: docker logs authelia"
   fi
 
-  cat > "${AUTHELIA_CONFIG_DIR}/users.yml" << USEREOF
----
-users:
-  admin:
-    disabled: false
-    displayname: "Administrator"
-    password: "${pass_hash}"
-    email: admin@${DOMAIN}
-    groups:
-      - admins
-      - users
-USEREOF
+  info "Hash extracted: ${pass_hash:0:30}..."
+
+  # Write users.yml with printf (avoids heredoc expansion issues)
+  printf '%s\n' '---' 'users:' '  admin:' '    disabled: false' '    displayname: "Administrator"' "    password: \"${pass_hash}\"" "    email: admin@${DOMAIN}" '    groups:' '      - admins' '      - users' > "${AUTHELIA_CONFIG_DIR}/users.yml"
 
   success "Authelia user 'admin' created with random password"
   info "Restarting Authelia to load user database..."
