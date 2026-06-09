@@ -85,7 +85,8 @@ _on_exit() {
     if [[ "$DEPLOY_STATUS" == "success" ]]; then
       printf "${C_B}║  ${C_YEL}Dockge   ${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "dockge.${DOMAIN:-yourdomain.com} (via NPM)"
       printf "${C_B}║  ${C_YEL}Authelia ${C_R}${C_B}:  https://${C_CYN}%-55s${C_R}${C_B}║${C_R}\n" "authelia.${DOMAIN:-yourdomain.com}"
-      printf "${C_B}║  ${C_RED}🔐  Login:  admin / %s${C_R}${C_B}%*s║${C_R}\n" "$exit_pass" $((46 - ${#exit_pass})) ""
+      printf "${C_B}║  ${C_RED}🔐  Temp Login: admin / %s${C_R}${C_B}%*s║${C_R}\n" "$exit_pass" $((43 - ${#exit_pass})) ""
+      printf "${C_B}║  ${C_RED}⚠️  Change password immediately after first login!${C_R}${C_B}    ║${C_R}\n"
     fi
     printf "${C_B}║  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}80 (HTTP), 443 (HTTPS), 81 (NPM Admin)          ${C_R}${C_B}║${C_R}\n"
     printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
