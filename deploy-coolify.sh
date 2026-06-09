@@ -34,8 +34,66 @@ info()    { printf "${C_BLU}ℹ${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
 warn()    { printf "${C_YEL}⚠${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
 error()   { printf "${C_RED}✖${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }
 success() { printf "${C_GRN}✔${C_R}  %s\n" "$*"; _log "SUCCESS" "$@"; }
-fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; exit 1; }
+fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; DEPLOY_STATUS="failed"; exit 1; }
 step()    { printf "\n${C_B}${C_CYN}── %s ──${C_R}\n" "$*"; _log "STEP" "$@"; }
+
+# Deployment status tracking
+DEPLOY_STATUS="in_progress"
+DEPLOYED_SERVICES=""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXTERNAL IP
+# ═══════════════════════════════════════════════════════════════════════════════
+get_external_ip() {
+  curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
+  curl -s -4 --max-time 10 https://ifconfig.me 2>/dev/null || \
+  curl -s -4 --max-time 10 https://icanhazip.com 2>/dev/null || \
+  echo "unknown"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GUARANTEED COMPLETION SUMMARY — runs on exit regardless of success/failure
+# ═══════════════════════════════════════════════════════════════════════════════
+_on_exit() {
+  local exit_code=$?
+  local elapsed=$(( $(date +%s) - START_TIME ))
+  local ip ext_ip
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<internal_ip>")
+  ext_ip=$(get_external_ip)
+  if [[ -n "${DEPLOYED_SERVICES:-}" ]] || [[ "$DEPLOY_STATUS" != "in_progress" ]]; then
+    printf "\n"
+    if [[ "$DEPLOY_STATUS" == "success" ]]; then
+      printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
+      printf "${C_B}${C_GRN}║                   ✅  DEPLOYMENT COMPLETED SUCCESSFULLY                      ║${C_R}\n"
+      printf "${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    else
+      printf "${C_B}${C_RED}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
+      printf "${C_B}${C_RED}║                     ❌  DEPLOYMENT DID NOT COMPLETE                          ║${C_R}\n"
+      printf "${C_B}${C_RED}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    fi
+    printf "${C_B}║  Elapsed:   ${C_CYN}%dm %ds${C_R}${C_B}                                                          ║${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
+    printf "${C_B}║  Internal:  ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "$ip"
+    printf "${C_B}║  External:  ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "$ext_ip"
+    printf "${C_B}║  Status:    %-16s${C_B}                                                   ║${C_R}\n" "$(if [[ "$DEPLOY_STATUS" == "success" ]]; then printf "${C_GRN}All systems go"; else printf "${C_RED}Check logs"; fi)"
+    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    printf "${C_B}║  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "${ip}:81"
+    if [[ "$DEPLOY_STATUS" == "success" ]]; then
+      printf "${C_B}║  ${C_YEL}Coolify  ${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "coolify.${DOMAIN:-yourdomain.com} (via NPM)"
+    fi
+    printf "${C_B}║  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}80 (HTTP), 443 (HTTPS), 81 (NPM Admin)          ${C_R}${C_B}║${C_R}\n"
+    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    printf "${C_B}║  Log file: ${C_CYN}%-66s${C_R}${C_B}║${C_R}\n" "$LOG_FILE"
+    printf "${C_B}╚══════════════════════════════════════════════════════════════════════════════╝${C_R}\n"
+    printf "\n"
+    if [[ "$DEPLOY_STATUS" == "success" ]]; then
+      printf "${C_B}${C_GRN}Your VPS is ready!${C_R} Configure DNS → ${C_CYN}${ext_ip}${C_R} and set up NPM.\n\n"
+    else
+      printf "${C_B}${C_YEL}The deployment did not finish.${C_R} Check: ${C_CYN}cat %s${C_R}\n\n" "$LOG_FILE"
+    fi
+  fi
+  exit $exit_code
+}
+trap _on_exit EXIT
 
 preflight_checks() {
   step "Pre-flight Checks"
@@ -109,6 +167,14 @@ idempotent_cleanup() {
     apt-get autoremove -y -qq &>/dev/null || true
   else
     yum remove -y -q docker-ce docker-ce-cli containerd.io 2>/dev/null || true
+  fi
+  if [[ -d "/opt/npm" ]]; then
+    info "Removing previous NPM config..."
+    rm -rf /opt/npm 2>/dev/null || true
+  fi
+  if [[ -d "/data/coolify" ]]; then
+    info "Removing previous Coolify config..."
+    rm -rf /data/coolify 2>/dev/null || true
   fi
 }
 
@@ -218,12 +284,15 @@ networks:
     external: true
 COMPOSE
 
+  info "Pulling Docker images — this may take a few minutes..."
   docker compose pull
+  info "Starting containers — please wait..."
   docker compose up -d
 
   info "Verifying NPM ports (80, 443, 81) are bound..."
   local ports_ok=false
   for i in $(seq 1 30); do
+    printf "${C_DIM}  Waiting for NPM ports... (%d/30)${C_R}\r" "$i"
     local has_80=false has_443=false has_81=false
     ss -tlnp 2>/dev/null | grep -q ':80[[:space:]]' && has_80=true
     ss -tlnp 2>/dev/null | grep -q ':443[[:space:]]' && has_443=true
@@ -234,26 +303,36 @@ COMPOSE
       break
     fi
     [[ $i -eq 30 ]] && {
-      echo ""; echo "  Port 80 bound:  $has_80"; echo "  Port 443 bound: $has_443"; echo "  Port 81 bound:  $has_81"; echo ""
+      printf "\n"; echo "  Port 80 bound:  $has_80"; echo "  Port 443 bound: $has_443"; echo "  Port 81 bound:  $has_81"; echo ""
       ss -tlnp 2>/dev/null | grep -E ':80 |:443 |:81 ' || true; echo ""
       fatal "NPM failed to bind required ports. Check: docker logs npm"
     }
     sleep 2
   done
+  printf "\n"
 
 
   info "Waiting for NPM container..."
-  for i in $(seq 1 30); do docker ps --format '{{.Names}}' | grep -qx "npm" && break; sleep 2; done
+  for i in $(seq 1 30); do
+    printf "${C_DIM}  Waiting for NPM container... (%d/30)${C_R}\r" "$i"
+    docker ps --format '{{.Names}}' | grep -qx "npm" && { success "NPM container running"; break; }
+    [[ $i -eq 30 ]] && warn "NPM container timed out"
+    sleep 2
+  done
+  printf "\n"
 
   info "Waiting for NPM admin UI (:81)..."
   for i in $(seq 1 60); do
+    printf "${C_DIM}  Waiting for NPM admin UI... (%d/60)${C_R}\r" "$i"
     curl -sf --max-time 5 http://127.0.0.1:81/ &>/dev/null && { success "NPM UI ready"; break; }
     [[ $i -eq 60 ]] && warn "NPM UI timed out (2m)."
     sleep 2
   done
+  printf "\n"
 
   info "Waiting for NPM log files..."
   for i in $(seq 1 30); do
+    printf "${C_DIM}  Waiting for NPM log files... (%d/30)${C_R}\r" "$i"
     if ls "${NPM_LOGS_DIR}/"*_access.log "${NPM_LOGS_DIR}/"*_error.log &>/dev/null; then
       success "NPM logs present"
       break
@@ -267,6 +346,7 @@ COMPOSE
     fi
     sleep 2
   done
+  printf "\n"
 
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
   success "NPM: http://${ip}:81"
@@ -274,7 +354,7 @@ COMPOSE
 
 setup_coolify() {
   step "Coolify"
-  info "Running Coolify installer..."
+  info "Running Coolify installer — this may take 5-10 minutes..."
   # Coolify's Traefik owns 80/443 but NPM needs them. We stop Traefik BEFORE
   # starting NPM (so NPM can bind 80/443), then connect Coolify to the proxy
   # network so NPM routes to Coolify on :8000.
@@ -282,10 +362,12 @@ setup_coolify() {
 
   info "Waiting for Coolify (:8000)..."
   for i in $(seq 1 60); do
+    printf "${C_DIM}  Waiting for Coolify... (%d/60)${C_R}\r" "$i"
     curl -sf --max-time 5 http://127.0.0.1:8000/api/health &>/dev/null && { success "Coolify ready on :8000"; break; }
     [[ $i -eq 60 ]] && warn "Coolify timed out (3m). Check: docker logs coolify"
     sleep 3
   done
+  printf "\n"
 
   info "Stopping Coolify Traefik (frees 80/443 for NPM)..."
   docker stop coolify-proxy 2>/dev/null || true
@@ -324,6 +406,7 @@ verify_coolify() {
 
 setup_fail2ban() {
   step "Fail2Ban"
+  info "Installing Fail2Ban..."
   if [[ "$OS_FAMILY" == "debian" ]]; then
     apt-get install -y -qq fail2ban
     local banaction="ufw"
@@ -516,7 +599,12 @@ EOF
 print_summary() {
   local elapsed=$(( $(date +%s) - START_TIME ))
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
+  local ext_ip; ext_ip=$(get_external_ip)
   local fw_cmd; [[ "$OS_FAMILY" == "debian" ]] && fw_cmd="ufw status verbose" || fw_cmd="firewall-cmd --list-all"
+
+  printf "\n${C_B}${C_BLU}══════════════════════════════════════════════════════════════════════════════${C_R}\n"
+  printf "${C_B}${C_BLU}  Internal IP: ${C_CYN}%s${C_R}${C_B}${C_BLU}  |  External IP: ${C_CYN}%s${C_R}\n" "$ip" "$ext_ip"
+  printf "${C_B}${C_BLU}══════════════════════════════════════════════════════════════════════════════${C_R}\n\n"
 
   cat << EOF
 ${C_B}${C_GRN}Deployment Complete${C_R}  (${SCRIPT_NAME} v${SCRIPT_VERSION})  ${C_B}$(( elapsed / 60 ))m $(( elapsed % 60 ))s${C_R}
@@ -609,6 +697,8 @@ main() {
   setup_fail2ban
   setup_firewall
   setup_logrotate
+  DEPLOY_STATUS="success"
+  DEPLOYED_SERVICES="npm,coolify,fail2ban,firewall"
   print_summary
 }
 

@@ -14,6 +14,13 @@ readonly GEOIP_DIR="/usr/local/bin/geoip-block"
 readonly C_RST='\033[0m' C_BLD='\033[1m' C_GRN='\033[1;32m'
 readonly C_YLW='\033[1;33m' C_RED='\033[1;31m' C_BLU='\033[1;34m'
 
+get_external_ip() {
+  curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
+  curl -s -4 --max-time 10 https://ifconfig.me 2>/dev/null || \
+  curl -s -4 --max-time 10 https://icanhazip.com 2>/dev/null || \
+  echo "unknown"
+}
+
 OS_FAMILY="" PKG_MANAGER="" PKG_INSTALL=""
 
 # ---------------------------------------------------------------------------
@@ -526,30 +533,40 @@ verify_hardening() {
 # Summary
 # ---------------------------------------------------------------------------
 print_summary() {
-    info "=== Hardening complete ==="
-    echo ""
-    echo "${C_BLD}${C_GRN}VPS hardening complete.${C_RST}"
-    echo "  Log:       $LOGFILE"
-    echo "  Backups:   files with suffix $BAKSUF"
-    echo ""
-    echo "${C_BLD}${C_YLW}OPTIONAL: Disable SSH access when setup is done${C_RST}"
-    echo ""
-    echo "  When you've finished configuring your services, disable SSH"
-    echo "  via your cloud provider's security group / firewall (NOT via"
-    echo "  UFW — you'd have no way to re-enable it without SSH):"
-    echo ""
-    echo "    ${C_BLU}Oracle Cloud:${C_RST}  VCN → Security Lists → Remove ingress rule for port 22"
-    echo "    ${C_BLU}AWS:${C_RST}          EC2 → Security Groups → Remove inbound rule for port 22"
-    echo "    ${C_BLU}DigitalOcean:${C_RST} Networking → Firewalls → Remove SSH rule"
-    echo "    ${C_BLU}Hetzner:${C_RST}      Console → Firewalls → Remove SSH rule"
-    echo ""
-    echo "  Your services (NPM, apps, etc.) continue running normally."
-    echo "  To re-enable SSH later, add the ingress rule back from the"
-    echo "  provider's web console — no SSH access required."
-    echo ""
-    echo "  Note: NPM admin (port 81) is already locked to localhost only."
-    echo "  Access it via: ssh -L 8181:127.0.0.1:81 root@<vps-ip>"
-    echo ""
+    local ip ext_ip
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<internal_ip>")
+    ext_ip=$(get_external_ip)
+
+    printf "\n"
+    printf "${C_BLD}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_RST}\n"
+    printf "${C_BLD}${C_GRN}║                   ✅  VPS HARDENING COMPLETE                                 ║${C_RST}\n"
+    printf "${C_BLD}${C_GRN}╠══════════════════════════════════════════════════════════════════════════════╣${C_RST}\n"
+    printf "${C_BLD}║  External IP:  ${C_BLU}%-16s${C_RST}${C_BLD}                                                   ║${C_RST}\n" "$ext_ip"
+    printf "${C_BLD}║  Internal IP:  ${C_BLU}%-16s${C_RST}${C_BLD}                                                   ║${C_RST}\n" "$ip"
+    printf "${C_BLD}╠══════════════════════════════════════════════════════════════════════════════╣${C_RST}\n"
+    printf "${C_BLD}║  ${C_YLW}Security layers enabled:${C_RST}                                                  ${C_BLD}║${C_RST}\n"
+    printf "${C_BLD}║    • CrowdSec (local IDS)     • GeoIP blocking                               ║${C_RST}\n"
+    printf "${C_BLD}║    • Auto security updates    • AIDE file integrity                          ║${C_RST}\n"
+    printf "${C_BLD}║    • Firewall rate limiting   • Docker log rotation                          ║${C_RST}\n"
+    printf "${C_BLD}╠══════════════════════════════════════════════════════════════════════════════╣${C_RST}\n"
+    printf "${C_BLD}║  ${C_RED}⚠️  IMPORTANT:${C_RST} NPM admin (port 81) now restricted to localhost.           ${C_BLD}║${C_RST}\n"
+    printf "${C_BLD}║     Access via SSH tunnel:  ssh -L 8080:localhost:81 user@${ext_ip}         ${C_BLD}║${C_RST}\n"
+    printf "${C_BLD}╚══════════════════════════════════════════════════════════════════════════════╝${C_RST}\n"
+    printf "\n"
+    printf "  Log:     %s\n" "$LOGFILE"
+    printf "  Backups: files with suffix %s\n\n" "$BAKSUF"
+
+    printf "${C_BLD}${C_YLW}OPTIONAL: Disable SSH access when setup is done${C_RST}\n\n"
+    printf "  When you've finished configuring your services, disable SSH\n"
+    printf "  via your cloud provider's security group / firewall (NOT via\n"
+    printf "  UFW — you'd have no way to re-enable it without SSH):\n\n"
+    printf "    ${C_BLU}Oracle Cloud:${C_RST}  VCN → Security Lists → Remove ingress rule for port 22\n"
+    printf "    ${C_BLU}AWS:${C_RST}          EC2 → Security Groups → Remove inbound rule for port 22\n"
+    printf "    ${C_BLU}DigitalOcean:${C_RST} Networking → Firewalls → Remove SSH rule\n"
+    printf "    ${C_BLU}Hetzner:${C_RST}      Console → Firewalls → Remove SSH rule\n\n"
+    printf "  Your services (NPM, apps, etc.) continue running normally.\n"
+    printf "  To re-enable SSH later, add the ingress rule back from the\n"
+    printf "  provider's web console — no SSH access required.\n\n"
 }
 
 # ---------------------------------------------------------------------------

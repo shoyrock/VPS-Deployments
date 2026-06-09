@@ -14,6 +14,54 @@ readonly LOGFILE="/var/log/vps-deploy.log"
 readonly DATA_DIR="/opt/authelia"
 readonly SECRETS_DIR="/opt/authelia/secrets"
 
+# Deployment status
+DEPLOY_STATUS="in_progress"
+DEPLOYED_SERVICES=""
+START_TIME=$(date +%s)
+
+get_external_ip() {
+  curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
+  curl -s -4 --max-time 10 https://ifconfig.me 2>/dev/null || \
+  curl -s -4 --max-time 10 https://icanhazip.com 2>/dev/null || \
+  echo "unknown"
+}
+
+_on_exit() {
+  local exit_code=$?
+  local elapsed=$(( $(date +%s) - START_TIME ))
+  local ip ext_ip
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<internal_ip>")
+  ext_ip=$(get_external_ip)
+  if [[ -n "${DEPLOYED_SERVICES:-}" ]] || [[ "$DEPLOY_STATUS" != "in_progress" ]]; then
+    printf "\n"
+    if [[ "$DEPLOY_STATUS" == "success" ]]; then
+      printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
+      printf "${C_B}${C_GRN}║                   ✅  AUTHELIA DEPLOYMENT COMPLETE                           ║${C_R}\n"
+      printf "${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    else
+      printf "${C_B}${C_RED}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
+      printf "${C_B}${C_RED}║                     ❌  DEPLOYMENT DID NOT COMPLETE                          ║${C_R}\n"
+      printf "${C_B}${C_RED}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    fi
+    printf "${C_B}║  Internal:  ${C_CYN}%-16s${C_R}${C_B}  Elapsed: ${C_CYN}%dm %02ds${C_R}                              ║${C_R}\n" "$ip" "$((elapsed/60))" "$((elapsed%60))"
+    printf "${C_B}║  External:  ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "$ext_ip"
+    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    printf "${C_B}║  ${C_YEL}Portal   ${C_R}${C_B}:  https://${C_CYN}%-55s${C_R}${C_B}║${C_R}\n" "authelia.${DOMAIN:-yourdomain.com}"
+    printf "${C_B}║  ${C_YEL}Config   ${C_R}${C_B}:  ${C_CYN}%-63s${C_R}${C_B}║${C_R}\n" "$DATA_DIR/config/"
+    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    printf "${C_B}║  Log file: ${C_CYN}%-66s${C_R}${C_B}║${C_R}\n" "$LOGFILE"
+    printf "${C_B}╚══════════════════════════════════════════════════════════════════════════════╝${C_R}\n"
+    printf "\n"
+    if [[ "$DEPLOY_STATUS" == "success" ]]; then
+      printf "${C_B}${C_GRN}Authelia is ready!${C_R} Configure DNS → ${C_CYN}${ext_ip}${C_R} and set up NPM.\n\n"
+    else
+      printf "${C_B}${C_YEL}The deployment did not finish.${C_R} Check: ${C_CYN}cat %s${C_R}\n\n" "$LOGFILE"
+    fi
+  fi
+  exit $exit_code
+}
+trap _on_exit EXIT
+
 # Root domain — set at runtime from user input
 DOMAIN=""
 
@@ -31,7 +79,7 @@ ok()   { printf "${C_GRN}✔${C_R} %s\n" "$*"; _log "OK" "$*"; }
 warn() { printf "${C_YEL}!${C_R} %s\n" "$*"; _log "WARN" "$*"; }
 info() { printf "${C_BLU}→${C_R} %s\n" "$*"; _log "INFO" "$*"; }
 step() { printf "\n${C_B}▶ %s${C_R}\n" "$*"; _log "STEP" "$*"; }
-fatal(){ printf "${C_RED}✖ %s${C_R}\n" "$*" >&2; _log "FATAL" "$*"; exit 1; }
+fatal(){ printf "${C_RED}✖ %s${C_R}\n" "$*" >&2; _log "FATAL" "$*"; DEPLOY_STATUS="failed"; exit 1; }
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PRE-FLIGHT CHECKS
@@ -240,6 +288,9 @@ deploy_authelia() {
   # Remove old container if exists
   docker rm -f authelia 2>/dev/null || true
 
+  info "Pulling latest Authelia image (this may take a moment) ..."
+  docker pull authelia/authelia:latest >/dev/null 2>&1 || warn "Pull may have issues, continuing with local image"
+
   docker run -d \
     --name authelia \
     --hostname authelia \
@@ -263,11 +314,13 @@ deploy_authelia() {
 verify_authelia() {
   step "Verifying Authelia ..."
 
+  info "Waiting for Authelia API to become healthy ..."
   for i in $(seq 1 30); do
     docker exec authelia wget -qO- --timeout=3 http://127.0.0.1:9091/api/health 2>/dev/null | grep -q "ok" && {
       ok "Authelia API responding"
       return 0
     }
+    printf "${C_DIM}  Waiting... (%d/30)${C_R}\r" "$i"
     sleep 2
   done
 
@@ -406,7 +459,7 @@ include /snippets/authelia-location.conf;
 location / {
     include /snippets/proxy.conf;
     include /snippets/authelia-authrequest.conf;
-    proxy_pass $forward_scheme://$server:$port;
+    proxy_pass \$forward_scheme://\$server:\$port;
 }
 
 # For apps that need websockets (e.g., Portainer, Dockge):
@@ -425,7 +478,7 @@ echo "   include /snippets/authelia-location.conf;"
 echo "   location / {"
 echo "       include /snippets/proxy.conf;"
 echo "       include /snippets/authelia-authrequest.conf;"
-echo "       proxy_pass \$forward_scheme://\$server:\$port;"
+echo "       proxy_pass \\\$forward_scheme://\\\$server:\\\$port;"
 echo "   }"
 echo ""
 echo "DOMAIN SET: ${DOMAIN}"
@@ -440,8 +493,9 @@ HELPER
 # SUMMARY
 # ═══════════════════════════════════════════════════════════════════════════════
 print_summary() {
-  local ip
+  local ip ext_ip
   ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
+  ext_ip=$(get_external_ip)
 
   cat << EOF
 
@@ -451,7 +505,8 @@ print_summary() {
 
   Domain:     ${DOMAIN}
   Portal:     https://authelia.${DOMAIN} (add this DNS record first)
-  Internal:   http://authelia:9091 (from NPM container)
+  Internal:   ${ip}
+  External:   ${ext_ip}
   Config:     $DATA_DIR/config/
   Secrets:    $SECRETS_DIR/
   Users:      $DATA_DIR/config/users.yml
@@ -465,7 +520,7 @@ print_summary() {
 ===============================================================================
 
   1. Add DNS record:
-     Type: A | Name: authelia | Content: ${ip} | Proxy: 🟠 Orange cloud
+     Type: A | Name: authelia | Content: ${ext_ip} | Proxy: 🟠 Orange cloud
 
   2. In NPM, add proxy host for the AUTHELIA PORTAL:
      Domain: authelia.${DOMAIN} → http://authelia:9091
@@ -519,6 +574,10 @@ main() {
   configure_npm_integration
   create_helper_script
   print_summary
+
+  # Mark deployment as successful
+  DEPLOY_STATUS="success"
+  DEPLOYED_SERVICES="authelia"
 }
 
 main "$@"

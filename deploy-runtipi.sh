@@ -24,13 +24,63 @@ else
   C_R=''; C_B=''; C_RED=''; C_GRN=''; C_YEL=''; C_BLU=''; C_CYN=''; C_DIM=''
 fi
 
+DEPLOY_STATUS="in_progress"
+DEPLOYED_SERVICES=""
+
+get_external_ip() {
+  curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
+  curl -s -4 --max-time 10 https://ifconfig.me 2>/dev/null || \
+  curl -s -4 --max-time 10 https://icanhazip.com 2>/dev/null || \
+  echo "unknown"
+}
+
+_on_exit() {
+  local exit_code=$?
+  local elapsed=$(( $(date +%s) - START_TIME ))
+  local ip ext_ip
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<internal_ip>")
+  ext_ip=$(get_external_ip)
+  if [[ -n "${DEPLOYED_SERVICES:-}" ]] || [[ "$DEPLOY_STATUS" != "in_progress" ]]; then
+    printf "\n"
+    if [[ "$DEPLOY_STATUS" == "success" ]]; then
+      printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
+      printf "${C_B}${C_GRN}║                   ✅  DEPLOYMENT COMPLETED SUCCESSFULLY                      ║${C_R}\n"
+      printf "${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    else
+      printf "${C_B}${C_RED}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
+      printf "${C_B}${C_RED}║                     ❌  DEPLOYMENT DID NOT COMPLETE                          ║${C_R}\n"
+      printf "${C_B}${C_RED}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    fi
+    printf "${C_B}║  Elapsed:   ${C_CYN}%dm %ds${C_R}${C_B}                                                          ║${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
+    printf "${C_B}║  Internal:  ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "$ip"
+    printf "${C_B}║  External:  ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "$ext_ip"
+    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    printf "${C_B}║  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "${ip}:81"
+    if [[ "$DEPLOY_STATUS" == "success" ]]; then
+      printf "${C_B}║  ${C_YEL}%s${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "Runtipi" "runtipi.${DOMAIN:-yourdomain.com} (via NPM)"
+    fi
+    printf "${C_B}║  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}80 (HTTP), 443 (HTTPS), 81 (NPM Admin)          ${C_R}${C_B}║${C_R}\n"
+    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    printf "${C_B}║  Log file: ${C_CYN}%-66s${C_R}${C_B}║${C_R}\n" "$LOG_FILE"
+    printf "${C_B}╚══════════════════════════════════════════════════════════════════════════════╝${C_R}\n"
+    printf "\n"
+    if [[ "$DEPLOY_STATUS" == "success" ]]; then
+      printf "${C_B}${C_GRN}Your VPS is ready!${C_R} Configure DNS → ${C_CYN}${ext_ip}${C_R} and set up NPM.\n\n"
+    else
+      printf "${C_B}${C_YEL}The deployment did not finish.${C_R} Check: ${C_CYN}cat %s${C_R}\n\n" "$LOG_FILE"
+    fi
+  fi
+  exit $exit_code
+}
+trap _on_exit EXIT
+
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
 _log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}" >> "$LOG_FILE" 2>/dev/null || true; }
 info()    { printf "${C_BLU}ℹ${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
 warn()    { printf "${C_YEL}⚠${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
 error()   { printf "${C_RED}✖${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }
 success() { printf "${C_GRN}✔${C_R}  %s\n" "$*"; _log "SUCCESS" "$@"; }
-fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; exit 1; }
+fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; DEPLOY_STATUS="failed"; exit 1; }
 step()    { printf "\n${C_B}${C_CYN}── %s ──${C_R}\n" "$*"; _log "STEP" "$@"; }
 
 preflight_checks() {
@@ -103,6 +153,8 @@ idempotent_cleanup() {
   else
     yum remove -y -q docker-ce docker-ce-cli containerd.io 2>/dev/null || true
   fi
+  info "Removing old config directories..."
+  rm -rf /opt/npm ~/runtipi 2>/dev/null || true
 }
 
 
@@ -165,8 +217,9 @@ install_docker() {
   fi
   systemctl start docker && systemctl enable docker
   systemctl is-active --quiet docker || fatal "Docker daemon failed. Check: journalctl -u docker -n 50"
-  info "Verifying Docker..."
-  for i in {1..3}; do docker run --rm hello-world &>/dev/null && break; sleep 5; done
+  info "Verifying Docker, please wait..."
+  for i in {1..3}; do docker run --rm hello-world &>/dev/null && break; printf "${C_DIM}  Verifying Docker... (%d/3)${C_R}\r" "$i"; sleep 5; done
+  printf "${C_GRN}✔${C_R}  Docker verified\n"
   docker compose version &>/dev/null || fatal "Docker Compose plugin missing."
   success "Docker $(docker version --format '{{.Server.Version}}') + Compose $(docker compose version --short)"
 }
@@ -212,13 +265,14 @@ networks:
 COMPOSE
 
   docker compose pull
-  info "Starting NPM..."
+  info "Starting NPM, please wait..."
   docker compose up -d
 
-  info "Verifying NPM ports (80, 443, 81) are bound..."
+  info "Verifying NPM ports (80, 443, 81) are bound, please wait..."
   local ports_ok=false
   for i in $(seq 1 30); do
     local has_80=false has_443=false has_81=false
+    printf "${C_DIM}  Checking ports... (%d/30)${C_R}\r" "$i"
     ss -tlnp 2>/dev/null | grep -q ':80[[:space:]]' && has_80=true
     ss -tlnp 2>/dev/null | grep -q ':443[[:space:]]' && has_443=true
     ss -tlnp 2>/dev/null | grep -q ':81[[:space:]]' && has_81=true
@@ -234,12 +288,17 @@ COMPOSE
     }
     sleep 2
   done
-  info "Waiting for NPM..."
-  for i in $(seq 1 30); do docker ps --format '{{.Names}}' | grep -qx "npm" && break; sleep 2; done
+  info "Waiting for NPM container..."
+  for i in $(seq 1 30); do
+    docker ps --format '{{.Names}}' | grep -qx "npm" && break
+    printf "${C_DIM}  Waiting for NPM container... (%d/30)${C_R}\r" "$i"
+    sleep 2
+  done
 
-  info "Waiting for NPM admin UI (port 81)..."
+  info "Waiting for NPM admin UI (port 81), please wait..."
   for i in $(seq 1 60); do
     curl -sf --max-time 5 http://127.0.0.1:81/ &>/dev/null && { success "NPM admin UI responding"; break; }
+    printf "${C_DIM}  Waiting for NPM admin UI... (%d/60)${C_R}\r" "$i"
     [[ $i -eq 60 ]] && warn "NPM UI timed out (2m). Still starting?"
     sleep 2
   done
@@ -250,6 +309,7 @@ COMPOSE
       success "NPM logs present"
       break
     fi
+    printf "${C_DIM}  Waiting for NPM log files... (%d/30)${C_R}\r" "$i"
     if [[ $i -eq 30 ]]; then
       warn "NPM logs not created yet. Creating placeholders."
       touch "${NPM_LOGS_DIR}/fallback_http_access.log" \
@@ -269,7 +329,7 @@ setup_runtipi() {
   info "Installing Runtipi (this may take a few minutes)..."
   curl -fsSL https://setup.runtipi.io | bash
 
-  info "Reconfiguring Traefik: 80→8080, 443→8443 (NPM takes 80/443)..."
+  info "Reconfiguring Traefik: 80→8080, 443→8443 (NPM takes 80/443), please wait..."
   cd "$TIPI_DIR" && docker compose stop 2>/dev/null || true
 
   for f in "${TIPI_DIR}/docker-compose.yml" "${TIPI_DIR}/docker-compose.prod.yml"; do
@@ -285,9 +345,10 @@ setup_runtipi() {
 
   docker network connect proxy tipi-reverse-proxy 2>/dev/null || true
 
-  info "Waiting for Runtipi on port 8080..."
+  info "Waiting for Runtipi on port 8080, please wait..."
   for i in $(seq 1 60); do
     curl -sf --max-time 5 http://127.0.0.1:8080/ &>/dev/null && { success "Runtipi responding on port 8080"; break; }
+    printf "${C_DIM}  Waiting for Runtipi... (%d/60)${C_R}\r" "$i"
     [[ $i -eq 60 ]] && warn "Runtipi timed out (3m). Check: docker logs tipi-reverse-proxy"
     sleep 3
   done
@@ -469,13 +530,16 @@ EOF
 
 print_summary() {
   local elapsed=$(( $(date +%s) - START_TIME ))
-  local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
+  local ip ext_ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
+  ext_ip=$(get_external_ip)
   local fw_cmd; [[ "$OS_FAMILY" == "debian" ]] && fw_cmd="ufw status verbose" || fw_cmd="firewall-cmd --list-all"
 
   cat << EOF
 
 ${C_B}${C_GRN}=== DEPLOYMENT COMPLETE ===${C_R}  ${SCRIPT_NAME} v${SCRIPT_VERSION}
 ${C_B}Duration:${C_R} $(( elapsed / 60 ))m $(( elapsed % 60 ))s
+${C_B}Internal IP:${C_R}  ${ip}
+${C_B}External IP:${C_R}  ${ext_ip}
 
 ${C_B}${C_CYN}-- SERVICES --${C_R}
 
@@ -588,6 +652,8 @@ main() {
   setup_firewall
   setup_logrotate
   print_summary
+  DEPLOYED_SERVICES="NPM, Runtipi, Fail2Ban"
+  DEPLOY_STATUS="success"
 }
 
 main "$@"

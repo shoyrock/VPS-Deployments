@@ -50,11 +50,19 @@ step()    { printf "\n${C_B}${C_CYN}── %s ──${C_R}\n" "$*"; _log "STEP" 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GUARANTEED COMPLETION SUMMARY — runs on exit regardless of success/failure
 # ═══════════════════════════════════════════════════════════════════════════════
+get_external_ip() {
+  curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
+  curl -s -4 --max-time 10 https://ifconfig.me 2>/dev/null || \
+  curl -s -4 --max-time 10 https://icanhazip.com 2>/dev/null || \
+  echo "unknown"
+}
+
 _on_exit() {
   local exit_code=$?
   local elapsed=$(( $(date +%s) - START_TIME ))
   local ip
   ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
+  local ext_ip; ext_ip=$(get_external_ip)
 
   # Only print if we got past preflight (avoid ugly output on very early failure)
   if [[ -n "${DEPLOYED_SERVICES:-}" ]] || [[ "$DEPLOY_STATUS" != "in_progress" ]]; then
@@ -70,13 +78,21 @@ _on_exit() {
     fi
     printf "${C_B}║  Elapsed:   ${C_CYN}%dm %ds${C_R}${C_B}                                                          ║${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
     printf "${C_B}║  VPS IP:    ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "$ip"
+    printf "${C_B}║  External:  ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "$ext_ip"
     printf "${C_B}║  Domain:    ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "${DOMAIN:-<not set>}"
     printf "${C_B}║  Status:    %-16s${C_B}                                                   ║${C_R}\n" "$(if [[ "$DEPLOY_STATUS" == "success" ]]; then printf "${C_GRN}All systems go"; else printf "${C_RED}Check logs"; fi)"
+    # Read Authelia password for display
+    local exit_pass=""
+    [[ -f "${AUTHELIA_DIR}/.default_password" ]] && exit_pass=$(cat "${AUTHELIA_DIR}/.default_password")
+
     printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
     printf "${C_B}║  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "${ip}:81"
     if [[ "$DEPLOY_STATUS" == "success" ]]; then
       printf "${C_B}║  ${C_YEL}Portainer${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "portainer.${DOMAIN:-yourdomain.com} (via NPM)"
-      printf "${C_B}║  ${C_YEL}Authelia ${C_R}${C_B}:  https://${C_CYN}%-55s${C_R}${C_B}║${C_R}\n" "authelia.${DOMAIN:-yourdomain.com} (via NPM)"
+      printf "${C_B}║  ${C_YEL}Authelia ${C_R}${C_B}:  https://${C_CYN}%-55s${R}${C_B}║${C_R}\n" "authelia.${DOMAIN:-yourdomain.com}"
+      if [[ -n "$exit_pass" ]]; then
+        printf "${C_B}║  ${C_YEL}Authelia Login${R}${C_B}:  ${C_CYN}admin / %s${R}${C_B}%*s║${C_R}\n" "$exit_pass" $((46 - ${#exit_pass})) ""
+      fi
     fi
     printf "${C_B}║  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}80 (HTTP), 443 (HTTPS), 81 (NPM Admin)          ${C_R}${C_B}║${C_R}\n"
     printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
@@ -164,6 +180,14 @@ idempotent_cleanup() {
     docker ps -aq 2>/dev/null | xargs -r docker rm -f &>/dev/null || true
     docker volume ls -q 2>/dev/null | xargs -r docker volume rm -f &>/dev/null || true
   fi
+
+  # Remove stack directory to ensure ZERO traces of previous deployments
+  # (config files, secrets, users.yml, authelia settings -- all wiped)
+  if [[ -d "${STACK_DIR}" ]]; then
+    info "Removing previous stack directory: ${STACK_DIR}"
+    rm -rf "${STACK_DIR}" 2>/dev/null || true
+  fi
+
   if [[ "$OS_FAMILY" == "debian" ]]; then
     dpkg -l 2>/dev/null | grep -E "docker|containerd|runc" | awk '{print $2}' | xargs -r apt-get remove -y -qq &>/dev/null || true
     apt-get autoremove -y -qq &>/dev/null || true
@@ -251,16 +275,22 @@ setup_docker_network() {
 
 get_user_domain() {
   step "Domain Configuration"
-  # Check existing config
+
+  # Check for existing config from a previous deployment
   if [[ -f "${AUTHELIA_CONFIG_DIR}/configuration.yml" ]]; then
     local existing_domain
     existing_domain=$(grep "authelia_url:" "${AUTHELIA_CONFIG_DIR}/configuration.yml" 2>/dev/null | sed 's/.*https:\/\/authelia\.//' | tr -d ' ' || true)
     if [[ -n "$existing_domain" ]]; then
-      info "Existing domain found: $existing_domain"
-      read -rp "Use existing domain? [Y/n]: " use_existing
-      [[ "$use_existing" =~ ^[Nn]$ ]] || { DOMAIN="$existing_domain"; return 0; }
+      printf "\n${C_YEL}⚠️  Previous deployment detected with domain: ${C_B}${existing_domain}${C_R}\n"
+      printf "${C_YEL}   Press ${C_B}Y${C_R}${C_YEL} + Enter to REUSE this domain${C_R}\n"
+      printf "${C_YEL}   Press ${C_B}N${C_R}${C_YEL} + Enter to enter a NEW domain${C_R}\n\n"
+      read -rp "Reuse '${existing_domain}'? [Y/n]: " use_existing
+      [[ "$use_existing" =~ ^[Nn]$ ]] || { DOMAIN="$existing_domain"; success "Domain set to: $DOMAIN"; return 0; }
+      printf "\n${C_CYN}Switching to new domain entry...${C_R}\n"
     fi
   fi
+
+  # Fresh domain prompt
   printf "\n${C_B}Enter your root domain${C_R} (e.g., example.com): "
   read -r DOMAIN
   [[ -z "$DOMAIN" ]] && fatal "Domain is required."
@@ -860,10 +890,11 @@ EOF
 print_summary() {
   local elapsed=$(( $(date +%s) - START_TIME ))
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
+  local ext_ip; ext_ip=$(get_external_ip)
   local fw_cmd; [[ "$OS_FAMILY" == "debian" ]] && fw_cmd="ufw status verbose" || fw_cmd="firewall-cmd --list-all"
 
-  # Read default password if it exists
-  local default_pass_msg="authelia"
+  # Read Authelia password from file (generated at deploy time)
+  local default_pass_msg="<unknown>"
   if [[ -f "${AUTHELIA_DIR}/.default_password" ]]; then
     default_pass_msg=$(cat "${AUTHELIA_DIR}/.default_password")
   fi
@@ -878,6 +909,7 @@ ${C_B}${C_GRN}╚═════════════════════
 
 ${C_B}Nginx Proxy Manager${C_R}
   Admin:   http://${ip}:81
+  External: http://${ext_ip}:81
   HTTP:    http://${ip}:80
   HTTPS:   https://${ip}:443
   Data:    ${NPM_DATA_DIR}
@@ -951,7 +983,7 @@ ${C_B}${C_YEL}Step 3 -- Add Proxy Hosts in NPM${C_R}
 
 ${C_B}${C_YEL}Step 4 -- Authelia Setup${C_R}
   Open:   https://authelia.${DOMAIN}
-  Login:  admin / authelia
+  Login:  admin / ${default_pass_msg}
   ${C_RED}→ Change password via "Settings" → "Password" immediately${C_R}
   → Register TOTP device (scan QR code with authenticator app)
 

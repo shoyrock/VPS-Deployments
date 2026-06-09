@@ -34,8 +34,59 @@ info()    { printf "${C_BLU}ℹ${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
 warn()    { printf "${C_YEL}⚠${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
 error()   { printf "${C_RED}✖${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }
 success() { printf "${C_GRN}✔${C_R}  %s\n" "$*"; _log "SUCCESS" "$@"; }
-fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; exit 1; }
+fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; DEPLOY_STATUS="failed"; exit 1; }
 step()    { printf "\n${C_B}${C_CYN}── %s ──${C_R}\n" "$*"; _log "STEP" "$@"; }
+
+readonly TOOL_LABEL="YunoHost"
+
+DEPLOY_STATUS="in_progress"
+DEPLOYED_SERVICES=""
+
+get_external_ip() {
+  curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
+  curl -s -4 --max-time 10 https://ifconfig.me 2>/dev/null || \
+  curl -s -4 --max-time 10 https://icanhazip.com 2>/dev/null || \
+  echo "unknown"
+}
+
+_on_exit() {
+  local exit_code=$?
+  local elapsed=$(( $(date +%s) - START_TIME ))
+  local ip ext_ip
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<internal_ip>")
+  ext_ip=$(get_external_ip)
+  if [[ -n "${DEPLOYED_SERVICES:-}" ]] || [[ "$DEPLOY_STATUS" != "in_progress" ]]; then
+    printf "\n"
+    if [[ "$DEPLOY_STATUS" == "success" ]]; then
+      printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
+      printf "${C_B}${C_GRN}║                   ✅  DEPLOYMENT COMPLETED SUCCESSFULLY                      ║${C_R}\n"
+      printf "${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    else
+      printf "${C_B}${C_RED}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
+      printf "${C_B}${C_RED}║                     ❌  DEPLOYMENT DID NOT COMPLETE                          ║${C_R}\n"
+      printf "${C_B}${C_RED}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    fi
+    printf "${C_B}║  Elapsed:   ${C_CYN}%dm %ds${C_R}${C_B}                                                          ║${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
+    printf "${C_B}║  Internal:  ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "$ip"
+    printf "${C_B}║  External:  ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "$ext_ip"
+    printf "${C_B}║  Status:    %-16s${C_B}                                                   ║${C_R}\n" "$(if [[ "$DEPLOY_STATUS" == "success" ]]; then printf "${C_GRN}All systems go"; else printf "${C_RED}Check logs"; fi)"
+    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    printf "${C_B}║  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "${ip}:81"
+    printf "${C_B}║  ${C_YEL}%-9s${C_R}${C_B}:  ${C_CYN}%-63s${C_R}${C_B}║${C_R}\n" "${TOOL_LABEL}" "${ip}:80/443 (own proxy, NPM on 81)"
+    printf "${C_B}║  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}22 (SSH), 80 (HTTP), 443 (HTTPS), 81 (NPM)    ${R}${C_B}║${C_R}\n"
+    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${R}\n"
+    printf "${C_B}║  Log file: ${C_CYN}%-66s${R}${C_B}║${C_R}\n" "$LOG_FILE"
+    printf "${C_B}╚══════════════════════════════════════════════════════════════════════════════╝${R}\n"
+    printf "\n"
+    if [[ "$DEPLOY_STATUS" == "success" ]]; then
+      printf "${C_B}${C_GRN}Your VPS is ready!${R} Configure DNS → ${C_CYN}${ext_ip}${R} and set up NPM.\n\n"
+    else
+      printf "${C_B}${C_YEL}The deployment did not finish.${R} Check: ${C_CYN}cat %s${R}\n\n" "$LOG_FILE"
+    fi
+  fi
+  exit $exit_code
+}
+trap _on_exit EXIT
 
 ## PRE-FLIGHT CHECKS
 preflight_checks() {
@@ -85,6 +136,8 @@ preflight_checks() {
 ## IDEMPOTENT CLEANUP
 idempotent_cleanup() {
   step "Cleanup"
+  info "Removing config directories..."
+  rm -rf /opt/npm
   if command -v docker &>/dev/null; then
     info "Removing ALL existing containers and volumes..."
     docker ps -aq 2>/dev/null | xargs -r docker stop &>/dev/null || true
@@ -149,8 +202,12 @@ install_docker() {
   systemctl start docker && systemctl enable docker
   systemctl is-active --quiet docker || fatal "Docker daemon failed. Check: journalctl -u docker -n 50"
 
-  info "Verifying Docker..."
-  for i in {1..3}; do docker run --rm hello-world &>/dev/null && break; sleep 5; done
+  info "Verifying Docker (please wait)..."
+  for i in {1..3}; do
+    docker run --rm hello-world &>/dev/null && break
+    printf "${C_DIM}  Waiting... (%d/3)${C_R}\r" "$i"
+    sleep 5
+  done
   docker compose version &>/dev/null || fatal "Docker Compose plugin missing."
   success "Docker $(docker version --format '{{.Server.Version}}') + Compose $(docker compose version --short)"
 }
@@ -202,12 +259,14 @@ COMPOSE
 
   info "Verifying NPM port 81 is bound (YunoHost nginx owns 80/443)..."
   local ports_ok=false
+  info "Please wait..."
   for i in $(seq 1 30); do
     if ss -tlnp 2>/dev/null | grep -q ':81[[:space:]]'; then
       success "NPM bound port 81 (YunoHost nginx owns 80/443)"
       ports_ok=true
       break
     fi
+    printf "${C_DIM}  Waiting... (%d/30)${C_R}\r" "$i"
     [[ $i -eq 30 ]] && {
       echo ""; ss -tlnp 2>/dev/null | grep -E ':81 ' || true; echo ""
       fatal "NPM failed to bind port 81. Check: docker logs npm"
@@ -216,12 +275,17 @@ COMPOSE
   done
 
 
-  info "Waiting for NPM container..."
-  for i in $(seq 1 30); do docker ps --format '{{.Names}}' | grep -qx "npm" && break; sleep 2; done
+  info "Waiting for NPM container (please wait)..."
+  for i in $(seq 1 30); do
+    docker ps --format '{{.Names}}' | grep -qx "npm" && break
+    printf "${C_DIM}  Waiting... (%d/30)${C_R}\r" "$i"
+    sleep 2
+  done
 
   info "Waiting for NPM admin UI (port 81)..."
   for i in $(seq 1 60); do
     curl -sf --max-time 5 http://127.0.0.1:81/ &>/dev/null && { success "NPM admin UI responding"; break; }
+    printf "${C_DIM}  Waiting... (%d/60)${C_R}\r" "$i"
     [[ $i -eq 60 ]] && warn "NPM UI timed out (2m). Still starting?"
     sleep 2
   done
@@ -231,6 +295,7 @@ COMPOSE
     if ls "${NPM_LOGS_DIR}/"*_access.log "${NPM_LOGS_DIR}/"*_error.log &>/dev/null; then
       success "NPM logs present"; break
     fi
+    printf "${C_DIM}  Waiting... (%d/30)${C_R}\r" "$i"
     if [[ $i -eq 30 ]]; then
       warn "NPM logs not found. Creating placeholders."
       touch "${NPM_LOGS_DIR}/fallback_http_access.log" \
@@ -411,11 +476,14 @@ setup_yunohost_firewall_npm() {
 ## SUMMARY
 print_summary() {
   local elapsed=$(( $(date +%s) - START_TIME ))
-  local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
+  local ip ext_ip
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
+  ext_ip=$(get_external_ip)
 
   cat << EOF
 
 ${C_B}${C_GRN}DEPLOYMENT COMPLETE${C_R}  (${SCRIPT_NAME} v${SCRIPT_VERSION})
+${C_B}External IP:${C_R} ${ext_ip}
 ${C_B}Duration:${C_R} $(( elapsed / 60 ))m $(( elapsed % 60 ))s
 
 ${C_B}${C_CYN}── YUNOHOST ──${C_R}
@@ -482,6 +550,10 @@ main() {
   setup_fail2ban
   setup_yunohost_firewall_npm
   setup_logrotate
+
+  DEPLOY_STATUS="success"
+  DEPLOYED_SERVICES="YunoHost,NPM,Fail2Ban"
+
   print_summary
 }
 
