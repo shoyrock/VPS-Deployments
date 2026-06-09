@@ -479,15 +479,17 @@ setup_authelia_users() {
   fi
 
   info "Generating password hash using the Authelia container..."
+  # Use -T to disable TTY allocation — prevents ANSI color codes from corrupting output
   local hash_output
-  hash_output=$(docker exec authelia authelia crypto hash generate argon2 --password "$random_pass" 2>&1) || true
+  hash_output=$(docker exec -T authelia authelia crypto hash generate argon2 --password "$random_pass" 2>&1) || true
   local pass_hash
-  pass_hash=$(echo "$hash_output" | tail -1 | sed 's/^Digest: //' | tr -d '[:space:]') || true
+  # Extract hash directly from output (handles any formatting, no color codes with -T)
+  pass_hash=$(echo "$hash_output" | grep -o '\$argon2id\$[^[:space:]]*' | head -1) || true
 
   if [[ -z "$pass_hash" ]] || [[ ! "$pass_hash" == \$argon2id\$* ]]; then
     warn "Retrying hash generation..."
-    hash_output=$(docker exec authelia sh -c "authelia crypto hash generate argon2 --password '$random_pass' 2>&1") || true
-    pass_hash=$(echo "$hash_output" | tail -1 | sed 's/^Digest: //' | tr -d '[:space:]') || true
+    hash_output=$(docker exec -T authelia sh -c "authelia crypto hash generate argon2 --password '$random_pass' 2>&1") || true
+    pass_hash=$(echo "$hash_output" | grep -o '\$argon2id\$[^[:space:]]*' | head -1) || true
   fi
 
   if [[ -z "$pass_hash" ]] || [[ ! "$pass_hash" == \$argon2id\$* ]]; then
