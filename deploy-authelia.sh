@@ -12,7 +12,7 @@ IFS=$'\n\t'
 readonly SCRIPT_VER="1.0.0"
 readonly LOGFILE="/var/log/vps-deploy.log"
 readonly DATA_DIR="/opt/authelia"
-readonly SECRETS_DIR="/opt/authelia/secrets"
+readonly SECRETS_DIR="/opt/authelia/config/secrets"
 
 # Deployment status
 DEPLOY_STATUS="in_progress"
@@ -267,11 +267,12 @@ users:
     disabled: false
     displayname: "Administrator"
     password: "$argon2id$v=19$m=65536,t=3,p=4$bXJzdWZmc3R1ZmZz$dHYzV3l1YVNhRjZwbHBLWGJzRjh4NUZNaTgxMXZVQUFEZ0lYVDlLVzgwU1dWMnpQS1VDdGV"
-    email: admin@${DOMAIN}
+    email: admin@CHANGEME_DOMAIN
     groups:
       - admins
       - users
 USERS
+    sed -i "s/CHANGEME_DOMAIN/${DOMAIN}/" "$DATA_DIR/config/users.yml"
     warn "Default user 'admin' created with password 'changeme' — CHANGE THIS IMMEDIATELY"
     ok "users.yml created"
   else

@@ -75,15 +75,15 @@ _on_exit() {
     printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
     printf "${C_B}║  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "${ip}:81"
     printf "${C_B}║  ${C_YEL}%-9s${C_R}${C_B}:  ${C_CYN}%-63s${C_R}${C_B}║${C_R}\n" "${TOOL_LABEL}" "${ip}:80/443 (own proxy, NPM on 81)"
-    printf "${C_B}║  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}22 (SSH), 80 (HTTP), 443 (HTTPS), 81 (NPM)    ${R}${C_B}║${C_R}\n"
-    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${R}\n"
-    printf "${C_B}║  Log file: ${C_CYN}%-66s${R}${C_B}║${C_R}\n" "$LOG_FILE"
-    printf "${C_B}╚══════════════════════════════════════════════════════════════════════════════╝${R}\n"
+    printf "${C_B}║  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}22 (SSH), 80 (HTTP), 443 (HTTPS), 81 (NPM)    ${C_R}${C_B}║${C_R}\n"
+    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    printf "${C_B}║  Log file: ${C_CYN}%-66s${C_R}${C_B}║${C_R}\n" "$LOG_FILE"
+    printf "${C_B}╚══════════════════════════════════════════════════════════════════════════════╝${C_R}\n"
     printf "\n"
     if [[ "$DEPLOY_STATUS" == "success" ]]; then
-      printf "${C_B}${C_GRN}Your VPS is ready!${R} Configure DNS → ${C_CYN}${ext_ip}${R} and set up NPM.\n\n"
+      printf "${C_B}${C_GRN}Your VPS is ready!${C_R} Configure DNS → ${C_CYN}${ext_ip}${C_R} and set up NPM.\n\n"
     else
-      printf "${C_B}${C_YEL}The deployment did not finish.${R} Check: ${C_CYN}cat %s${R}\n\n" "$LOG_FILE"
+      printf "${C_B}${C_YEL}The deployment did not finish.${C_R} Check: ${C_CYN}cat %s${C_R}\n\n" "$LOG_FILE"
     fi
   fi
   exit $exit_code
@@ -118,6 +118,8 @@ preflight_checks() {
     *) fatal "Unsupported arch: ${ARCH}. Need x86_64 or arm64/aarch64." ;;
   esac
   success "Arch: ${ARCH} (${DOCKER_ARCH})"
+
+  readonly OS_FAMILY="debian"
 
   info "Checking internet..."
   if ! curl -sf --max-time 10 https://deb.debian.org/ >/dev/null 2>&1 && \

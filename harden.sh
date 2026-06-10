@@ -352,14 +352,15 @@ DNFAUTO
 # ---------------------------------------------------------------------------
 lockdown_npm_admin() {
     info "=== Locking down NPM admin panel ==="
-    local dcf="${NPM_DIR:-/opt/npm}/docker-compose.yml"
+    local dcf="${NPM_DIR:-/opt/npm}/docker-compose.npm.yml"
+    if [[ ! -f "$dcf" ]]; then dcf="${NPM_DIR:-/opt/npm}/docker-compose.yml"; fi
     if grep -q '127\.0\.0\.1:81:81' "$dcf" 2>/dev/null; then
         info "NPM admin already locked to localhost"; return 0
     fi
-    local paths=(/opt/npm /root/npm /home/*/npm /opt/nginx-proxy-manager)
+    local paths=(/opt/npm /root/npm /home/*/npm /opt/nginx-proxy-manager /opt/portainer-stack /opt/dockge-stack /opt/cosmos-stack)
     local found=0
     for p in "${paths[@]}"; do
-        for dcf in "$p"/docker-compose.yml "$p"/docker-compose.yaml; do
+        for dcf in "$p"/docker-compose.npm.yml "$p"/docker-compose.npm.yaml "$p"/docker-compose.yml "$p"/docker-compose.yaml; do
             [[ -f "$dcf" ]] || continue
             found=1; backup_file "$dcf"
             sed -i -E "s/([\"']?)0\.0\.0\.0:81:81\1/\1127.0.0.1:81:81\1/g" "$dcf" 2>/dev/null || true
@@ -373,7 +374,7 @@ lockdown_npm_admin() {
             fi
         done
     done
-    [[ "$found" -eq 0 ]] && warn "No NPM docker-compose.yml found — manual lockdown needed" || ok "NPM admin locked to 127.0.0.1:81"
+    [[ "$found" -eq 0 ]] && warn "No NPM docker-compose file found — manual lockdown needed" || ok "NPM admin locked to 127.0.0.1:81"
     _log "NPM lockdown: found=$found"
 }
 

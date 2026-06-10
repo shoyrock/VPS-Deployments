@@ -4,6 +4,73 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   exec sudo bash "$0" "$@"
 fi
 
+set -euo pipefail
+IFS=$'\n\t'
+
+SCRIPT_VERSION="3.0.0"
+SCRIPT_NAME="deploy-coolify.sh"
+START_TIME=$(date +%s)
+
+NPM_DIR="/opt/npm"
+NPM_DATA_DIR="${NPM_DIR}/data"
+NPM_LE_DIR="${NPM_DIR}/letsencrypt"
+NPM_LOGS_DIR="${NPM_DIR}/logs"
+CROWDSEC_DIR="${NPM_DIR}/crowdsec"
+
+LOG_FILE="/var/log/vps-deploy.log"
+DOMAIN="yourdomain.com"
+
+DEPLOY_STATUS="in_progress"
+DEPLOYED_SERVICES=""
+
+if [[ -t 1 ]]; then
+  C_R='\e[0m'
+  C_B='\e[1m'
+  C_RED='\e[31m'
+  C_GRN='\e[32m'
+  C_YEL='\e[33m'
+  C_BLU='\e[34m'
+  C_CYN='\e[36m'
+  C_DIM='\e[2m'
+else
+  C_R=''
+  C_B=''
+  C_RED=''
+  C_GRN=''
+  C_YEL=''
+  C_BLU=''
+  C_CYN=''
+  C_DIM=''
+fi
+
+_ts() { date '+%Y-%m-%d %H:%M:%S'; }
+
+_log() {
+  local level="$1" msg="$2"
+  printf "[%s] [%s] %s\n" "$(_ts)" "$level" "$msg" >> "$LOG_FILE"
+}
+
+info()    { printf "${C_BLU}[INFO]${C_R} %s\n" "$*"; _log "INFO" "$*"; }
+warn()    { printf "${C_YEL}[WARN]${C_R} %s\n" "$*" >&2; _log "WARN" "$*"; }
+error()   { printf "${C_RED}[ERROR]${C_R} %s\n" "$*" >&2; _log "ERROR" "$*"; }
+success() { printf "${C_GRN}[OK]${C_R} %s\n" "$*"; _log "OK" "$*"; }
+fatal()   {
+  printf "${C_RED}[FATAL]${C_R} %s\n" "$*" >&2
+  _log "FATAL" "$*"
+  DEPLOY_STATUS="failed"
+  exit 1
+}
+step()    { printf "\n${C_B}${C_CYN}── %s ──${C_R}\n" "$*"; _log "STEP" "$*"; }
+
+get_external_ip() {
+  local ext_ip
+  ext_ip=$(curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || \
+           curl -sf --max-time 5 https://ifconfig.me 2>/dev/null || \
+           curl -sf --max-time 5 https://icanhazip.com 2>/dev/null || \
+           echo "unknown")
+  printf '%s' "$ext_ip"
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # GUARANTEED COMPLETION SUMMARY — runs on exit regardless of success/failure
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -360,7 +427,7 @@ setup_coolify() {
   # Coolify's Traefik owns 80/443 but NPM needs them. We stop Traefik BEFORE
   # starting NPM (so NPM can bind 80/443), then connect Coolify to the proxy
   # network so NPM routes to Coolify on :8000.
-  curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash
+  curl -fsSL https://cdn.coollabs.io/coolify/install.sh | bash || fatal "Coolify installation failed"
 
   info "Waiting for Coolify (:8000)..."
   for i in $(seq 1 60); do

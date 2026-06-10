@@ -15,7 +15,7 @@ readonly STACK_DIR="/opt/dockge-stack"
 readonly NPM_DATA_DIR="${STACK_DIR}/npm-data"
 readonly NPM_LE_DIR="${STACK_DIR}/npm-letsencrypt"
 readonly NPM_LOGS_DIR="${NPM_DATA_DIR}/logs"
-readonly CROWDSEC_DIR="${NPM_DIR}/crowdsec"
+readonly CROWDSEC_DIR="${STACK_DIR}/crowdsec"
 readonly AUTHELIA_DIR="${STACK_DIR}/authelia"
 readonly AUTHELIA_SECRETS_DIR="${AUTHELIA_DIR}/secrets"
 readonly AUTHELIA_CONFIG_DIR="${AUTHELIA_DIR}/config"
@@ -82,7 +82,7 @@ _on_exit() {
   printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
   printf "${C_B}║  %-72s  ║${C_R}\n" "NPM Admin: http://${ip}:81"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
-    printf "${C_B}║  %-72s  ║${C_R}\n" "Portainer: http://portainer.${DOMAIN}"
+    printf "${C_B}║  %-72s  ║${C_R}\n" "Dockge:    http://dockge.${DOMAIN}"
     printf "${C_B}║  %-72s  ║${C_R}\n" "Authelia:  https://authelia.${DOMAIN}"
     printf "${C_B}║  %-72s  ║${C_R}\n" ""
     printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "Authelia Username: admin"
@@ -524,8 +524,8 @@ USEREOF
   success "Authelia user 'admin' created"
   info "Default password: ${default_pass} (change after first login)"
 
-  info "Restarting Authelia to load user database..."
-  docker restart authelia >/dev/null 2>&1 || true
+  info "Starting Authelia..."
+  docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" up -d
 
   # Wait for authelia to come back up
   for i in $(seq 1 30); do
@@ -619,7 +619,7 @@ services:
     volumes:
       - ./crowdsec/data:/var/lib/crowdsec/data
       - ./crowdsec/config:/etc/crowdsec
-      - ./data/logs:/npm-logs:ro
+      - ./npm-data/logs:/npm-logs:ro
       - /var/log:/var/log:ro
     environment:
       - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux
@@ -706,17 +706,6 @@ COMPOSE_CROWDSEC
     docker exec dockge curl -sf --max-time 5 http://127.0.0.1:5001/ &>/dev/null && { printf "\r"; success "Dockge ready"; break; }
     [[ $i -eq 40 ]] && { printf "\r"; warn "Dockge timed out. Check: docker logs dockge"; }
     sleep 3
-  done
-  printf "\r"
-
-  info "Starting Authelia..."
-  docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" up -d
-  info "Waiting for Authelia..."
-  for i in $(seq 1 30); do
-    printf "\r  ${C_DIM}Waiting for Authelia... %d/30${C_R}" "$i"
-    docker exec authelia wget -qO- --timeout=3 http://127.0.0.1:9091/api/health 2>/dev/null | grep -q "ok" && { printf "\r"; success "Authelia ready"; break; }
-    [[ $i -eq 30 ]] && { printf "\r"; warn "Authelia health check timed out"; }
-    sleep 2
   done
   printf "\r"
 
@@ -993,12 +982,13 @@ NPM_ACQUIS
   if docker exec crowdsec cat /etc/crowdsec/acquis.d/npm.yaml &>/dev/null; then
     success "NPM acquisition configured"
   else
-    docker exec crowdsec sh -c "mkdir -p /etc/crowdsec/acquis.d && cat > /etc/crowdsec/acquis.d/npm.yaml << 'EOF'
+    docker exec -i crowdsec sh -c "mkdir -p /etc/crowdsec/acquis.d && cat > /etc/crowdsec/acquis.d/npm.yaml" << 'EOF' || true
 filenames:
   - /npm-logs/*.log
 labels:
   type: nginx
-EOF" && warn "NPM acquisition written (via docker exec)" || warn "Could not configure NPM acquisition"
+EOF
+    warn "NPM acquisition written (via docker exec)"
   fi
 
   docker exec crowdsec kill -HUP 1 2>/dev/null || docker restart crowdsec &>/dev/null || true

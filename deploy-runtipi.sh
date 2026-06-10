@@ -27,6 +27,7 @@ fi
 
 DEPLOY_STATUS="in_progress"
 DEPLOYED_SERVICES=""
+DOMAIN="yourdomain.com"
 
 get_external_ip() {
   curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
@@ -387,7 +388,7 @@ setup_runtipi() {
   curl -fsSL https://setup.runtipi.io | bash
 
   info "Reconfiguring Traefik: 80→8080, 443→8443 (NPM takes 80/443), please wait..."
-  cd "$TIPI_DIR" && docker compose stop 2>/dev/null || true
+  (cd "$TIPI_DIR" && docker compose stop 2>/dev/null) || true
 
   for f in "${TIPI_DIR}/docker-compose.yml" "${TIPI_DIR}/docker-compose.prod.yml"; do
     [[ -f "$f" ]] || continue
@@ -395,9 +396,9 @@ setup_runtipi() {
     sed -i "s/'80:80'/'8080:80'/g; s/'443:443'/'8443:443'/g" "$f" 2>/dev/null || true
   done
 
-  cd "$TIPI_DIR" && docker compose up -d 2>/dev/null || true
+  (cd "$TIPI_DIR" && docker compose up -d 2>/dev/null) || true
   if [[ -f "${TIPI_DIR}/docker-compose.prod.yml" ]]; then
-    cd "$TIPI_DIR" && docker compose -f docker-compose.prod.yml up -d 2>/dev/null || true
+    (cd "$TIPI_DIR" && docker compose -f docker-compose.prod.yml up -d 2>/dev/null) || true
   fi
 
   docker network connect proxy tipi-reverse-proxy 2>/dev/null || true

@@ -37,6 +37,7 @@ fi
 # Deployment state
 DEPLOY_STATUS="in_progress"
 DEPLOYED_SERVICES=""
+DOMAIN="yourdomain.com"
 
 get_external_ip() {
   curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
@@ -297,7 +298,7 @@ setup_docker_swarm() {
 
 setup_nginx_proxy_manager() {
   step "Nginx Proxy Manager"
-  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR"
+  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR"
 
   cat > "${NPM_DIR}/docker-compose.npm.yml" << 'COMPOSE_NPM'
 services:

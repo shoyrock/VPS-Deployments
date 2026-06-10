@@ -175,7 +175,7 @@ run_tool() {
   fi
 
   url="${GITHUB_REPO}/${script_name}"
-  tmp_script="/tmp/${script_name}.new"
+  tmp_script="$(mktemp /tmp/${script_name}.XXXXXX)"
 
   # Always download latest from GitHub — GitHub version wins over local
   printf "${C_CYN}> Downloading latest ${script_name}...${C_R}\n"

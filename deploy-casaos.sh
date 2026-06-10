@@ -30,6 +30,7 @@ fi
 
 DEPLOY_STATUS="in_progress"
 DEPLOYED_SERVICES=""
+DOMAIN="yourdomain.com"
 
 get_external_ip() {
   curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
@@ -530,8 +531,9 @@ After fixing, run this script again."
   fi
 
   # 6. Connect gateway to proxy network
-  info "Connecting CasaOS gateway to proxy network..."
-  docker network connect proxy casaos-gateway 2>/dev/null || true
+  # SKIPPED: casaos-gateway is a systemd service, not a Docker container
+  info "CasaOS gateway is a systemd service — skipping docker network connect"
+  # docker network connect proxy casaos-gateway 2>/dev/null || true
 
   # 7. Verify CasaOS is healthy on 8080
   info "Verifying CasaOS health on port 8080, please wait..."
