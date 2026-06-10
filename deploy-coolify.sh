@@ -291,7 +291,7 @@ services:
     volumes:
       - ./crowdsec/data:/var/lib/crowdsec/data
       - ./crowdsec/config:/etc/crowdsec
-      - ./data/logs:/var/log/npm:ro
+      - ./data/logs:/npm-logs:ro
       - /var/log:/var/log:ro
     ports:
       - "127.0.0.1:8080:8080"
@@ -453,7 +453,7 @@ setup_crowdsec() {
   mkdir -p "$(dirname "$npm_acquis")"
   cat > "$npm_acquis" << 'NPM_ACQUIS'
 filenames:
-  - /var/log/npm/*.log
+  - /npm-logs/*.log
 labels:
   type: nginx
 NPM_ACQUIS
@@ -462,7 +462,7 @@ NPM_ACQUIS
   else
     docker exec crowdsec bash -c "mkdir -p /etc/crowdsec/acquis.d && cat > /etc/crowdsec/acquis.d/npm.yaml << 'EOF'
 filenames:
-  - /var/log/npm/*.log
+  - /npm-logs/*.log
 labels:
   type: nginx
 EOF" && warn "NPM acquisition written (via docker exec)" || warn "Could not configure NPM acquisition"
