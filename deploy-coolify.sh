@@ -6,14 +6,14 @@ if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
 
   # Remove any Docker crowdsec container from previous runs
   docker rm -f crowdsec 2>/dev/null || true
-  # Kill whatever is holding port 8088
-  local pid_8088; pid_8088=$(ss -tlnp 2>/dev/null | grep ':8088 ' | sed 's/.*pid=\([0-9]*\).*/\1/' | head -1)
-  [ -n "${pid_8088}" ] && kill -9 "${pid_8088}" 2>/dev/null || true
+  # Kill whatever is holding port 8080
+  local pid_8080; pid_8088=$(ss -tlnp 2>/dev/null | grep ':8080 ' | sed 's/.*pid=\([0-9]*\).*/\1/' | head -1)
+  [ -n "${pid_8080}" ] && kill -9 "${pid_8080}" 2>/dev/null || true
   # Always try to stop native crowdsec (may have been restarted by systemd)
   systemctl stop crowdsec crowdsec-firewall-bouncer 2>/dev/null || true
   systemctl disable crowdsec crowdsec-firewall-bouncer 2>/dev/null || true
   if command -v crowdsec &>/dev/null || command -v cscli &>/dev/null; then
-    info "Removing native crowdsec (conflicts with Docker CrowdSec on port 8088)..."
+    info "Removing native crowdsec (conflicts with Docker CrowdSec on port 8080)..."
     systemctl stop crowdsec crowdsec-firewall-bouncer 2>/dev/null || true
     systemctl disable crowdsec crowdsec-firewall-bouncer 2>/dev/null || true
     if [[ "$OS_FAMILY" == "debian" ]]; then
@@ -287,7 +287,7 @@ services:
     hostname: crowdsec
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8088:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./crowdsec/data:/var/lib/crowdsec/data
       - ./crowdsec/config:/etc/crowdsec
@@ -524,7 +524,7 @@ BOUNCER_SERVICE
     local fw_mode="iptables"
     command -v nft &>/dev/null && fw_mode="nftables"
     cat > /etc/crowdsec/crowdsec-firewall-bouncer.yaml << BOUNCER
-api_url: http://127.0.0.1:8088
+api_url: http://127.0.0.1:8080
 api_key: ${api_key}
 mode: ${fw_mode}
 deny_action: DROP

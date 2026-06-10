@@ -631,7 +631,7 @@ services:
     hostname: crowdsec
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8088:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./crowdsec/data:/var/lib/crowdsec/data
       - ./crowdsec/config:/etc/crowdsec
@@ -744,7 +744,7 @@ BOUNCER_SERVICE
     local fw_mode="iptables"
     command -v nft &>/dev/null && fw_mode="nftables"
     cat > /etc/crowdsec/crowdsec-firewall-bouncer.yaml << BOUNCER
-api_url: http://127.0.0.1:8088
+api_url: http://127.0.0.1:8080
 api_key: ${api_key}
 mode: ${fw_mode}
 deny_action: DROP
