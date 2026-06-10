@@ -22,6 +22,9 @@ readonly AUTHELIA_DIR="${STACK_DIR}/authelia"
 readonly AUTHELIA_SECRETS_DIR="${AUTHELIA_DIR}/secrets"
 readonly AUTHELIA_CONFIG_DIR="${AUTHELIA_DIR}/config"
 readonly AUTHELIA_SNIPPETS_DIR="${AUTHELIA_DIR}/snippets"
+
+# CrowdSec paths
+readonly CROWDSEC_DIR="${STACK_DIR}/crowdsec"
 readonly DOMAIN_PERSIST_FILE="/etc/vps-deploy-domain"
 
 # Domain set at runtime via user prompt
@@ -520,11 +523,27 @@ USEREOF
   printf "\n"
 }
 
-setup_stack() {
-  step "Deploying Portainer + Authelia Stack"
-  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" && cd "$STACK_DIR"
+setup_portainer_standalone() {
+  step "Portainer (standalone)"
+  local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
+  docker rm -f portainer 2>/dev/null || true
+  docker run -d --name portainer \
+    --restart always \
+    -p 9000:9000 \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v portainer_data:/data \
+    portainer/portainer-ce:latest >> "$LOG_FILE" 2>&1 || true
+  info "Waiting for Portainer to be ready..."
+  for i in $(seq 1 30); do
+    docker ps --format '{{.Names}}' | grep -qx "portainer" && { success "Portainer ready at http://${ip}:9000"; break; }
+    sleep 2
+  done
+}
 
-  # Use absolute paths for Authelia volumes in compose
+setup_stack() {
+  step "Deploying NPM + Authelia + CrowdSec Stack"
+  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR" && cd "$STACK_DIR"
+
   local authelia_config_path="${AUTHELIA_CONFIG_DIR}"
   local authelia_secrets_path="${AUTHELIA_SECRETS_DIR}"
 
@@ -551,23 +570,6 @@ services:
       retries: 3
       start_period: 40s
 
-  portainer:
-    image: 'portainer/portainer-ce:latest'
-    restart: always
-    container_name: portainer
-    hostname: portainer
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - portainer_data:/data
-    networks:
-      - proxy
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9000/api/status"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-
   authelia:
     image: authelia/authelia:latest
     container_name: authelia
@@ -592,19 +594,31 @@ services:
       retries: 3
       start_period: 40s
 
-volumes:
-  portainer_data:
+  crowdsec:
+    image: crowdsecurity/crowdsec:latest
+    container_name: crowdsec
+    hostname: crowdsec
+    restart: unless-stopped
+    environment:
+      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux
+      - TZ=UTC
+    volumes:
+      - ./crowdsec/data:/var/lib/crowdsec/data
+      - ./crowdsec/config:/etc/crowdsec
+      - ./data/logs:/var/log/npm:ro
+      - /var/log:/var/log:ro
+    network_mode: host
 
 networks:
   proxy:
     external: true
 COMPOSE
 
-  info "Pulling Docker images (NPM, Portainer, Authelia) — this may take a few minutes..."
+  info "Pulling Docker images (NPM, Authelia, CrowdSec) — this may take a few minutes..."
   docker compose pull
   docker rm -f npm 2>/dev/null || true
-  docker rm -f portainer 2>/dev/null || true
   docker rm -f authelia 2>/dev/null || true
+  docker rm -f crowdsec 2>/dev/null || true
 
   info "Starting containers — please wait..."
   docker compose up -d
@@ -667,16 +681,6 @@ COMPOSE
   done
   printf "\n"
 
-  info "Waiting for Portainer to be ready..."
-  for i in $(seq 1 40); do
-    docker exec portainer wget -qO- --timeout=5 http://127.0.0.1:9000/api/status &>/dev/null && { success "Portainer ready"; break; }
-    printf "${C_DIM}  Waiting for Portainer... (%d/40)${C_R}\r" "$i"
-    docker ps --format '{{.Names}}' | grep -qx "portainer" || { [[ $i -eq 40 ]] && warn "Portainer container not found"; }
-    [[ $i -eq 40 ]] && warn "Portainer timed out. Check: docker logs portainer"
-    sleep 3
-  done
-  printf "\n"
-
   info "Waiting for Authelia to be ready..."
   for i in $(seq 1 40); do
     docker exec authelia wget -qO- --timeout=5 http://127.0.0.1:9091/api/health &>/dev/null && { success "Authelia ready"; break; }
@@ -687,53 +691,92 @@ COMPOSE
   done
   printf "\n"
 
+  info "Waiting for CrowdSec container to be ready..."
+  for i in $(seq 1 30); do
+    docker ps --format '{{.Names}}' | grep -qx "crowdsec" && { success "CrowdSec container running"; break; }
+    printf "${C_DIM}  Waiting for CrowdSec container... (%d/30)${C_R}\r" "$i"
+    [[ $i -eq 30 ]] && warn "CrowdSec container not found"
+    sleep 2
+  done
+  printf "\n"
+
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
   success "NPM: http://${ip}:81"
-  success "Portainer deployed (access via NPM proxy)"
+  success "Portainer: http://${ip}:9000 (standalone)"
   success "Authelia deployed (access via NPM proxy)"
 }
 
 setup_crowdsec() {
-  step "CrowdSec"
-  info "Installing and configuring CrowdSec..."
-  if command -v cscli &>/dev/null; then
-    info "CrowdSec already installed"
-  else
-    if [[ "$OS_FAMILY" == "debian" ]]; then
-      curl -s https://install.crowdsec.net | bash -s -- -d debian >> "$LOG_FILE" 2>&1 || { warn "CrowdSec repo setup failed"; return; }
-      apt-get install -y -qq crowdsec >> "$LOG_FILE" 2>&1 || { warn "CrowdSec install failed"; return; }
-    else
-      curl -s https://install.crowdsec.net | bash -s -- -d rhel >> "$LOG_FILE" 2>&1 || { warn "CrowdSec repo setup failed"; return; }
-      local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
-      $pkg install -y -q crowdsec >> "$LOG_FILE" 2>&1 || { warn "CrowdSec install failed"; return; }
+  step "CrowdSec (Docker)"
+
+  info "Waiting for CrowdSec container to be ready..."
+  local cs_ready=false
+  for i in $(seq 1 30); do
+    if docker exec crowdsec cscli metrics &>/dev/null; then
+      cs_ready=true
+      break
     fi
+    sleep 2
+  done
+
+  if ! $cs_ready; then
+    docker logs crowdsec --tail 20 2>/dev/null || true
+    warn "CrowdSec container not ready -- check ${LOG_FILE}. Continuing..."
+    return
+  fi
+  success "CrowdSec container running"
+
+  info "Verifying collections..."
+  docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/sshd" && success "sshd collection" || warn "sshd collection not found"
+  docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/nginx-proxy-manager" && success "nginx-proxy-manager collection" || warn "nginx-proxy-manager not found"
+  docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/linux" && success "linux collection" || warn "linux not found"
+
+  info "Configuring NPM log acquisition..."
+  local npm_acquis="${CROWDSEC_DIR}/config/acquis.d/npm.yaml"
+  mkdir -p "$(dirname "$npm_acquis")"
+  cat > "$npm_acquis" << 'NPM_ACQUIS'
+filenames:
+  - /var/log/npm/*.log
+labels:
+  type: nginx
+NPM_ACQUIS
+  if docker exec crowdsec cat /etc/crowdsec/acquis.d/npm.yaml &>/dev/null; then
+    success "NPM acquisition configured"
+  else
+    docker exec crowdsec bash -c "mkdir -p /etc/crowdsec/acquis.d && cat > /etc/crowdsec/acquis.d/npm.yaml << 'EOF'
+filenames:
+  - /var/log/npm/*.log
+labels:
+  type: nginx
+EOF" && warn "NPM acquisition written (via docker exec)" || warn "Could not configure NPM acquisition"
   fi
 
-  info "Installing CrowdSec collections..."
-  cscli collections install crowdsecurity/sshd 2>/dev/null || true
-  cscli collections install crowdsecurity/nginx-proxy-manager 2>/dev/null || true
-  cscli collections install crowdsecurity/linux 2>/dev/null || true
+  docker exec crowdsec kill -HUP 1 2>/dev/null || docker restart crowdsec &>/dev/null || true
 
   info "Installing firewall bouncer..."
   if [[ "$OS_FAMILY" == "debian" ]]; then
-    dpkg -l crowdsec-firewall-bouncer-iptables &>/dev/null || apt-get install -y -qq crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
+    apt-get install -y -qq crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
   else
-    rpm -q crowdsec-firewall-bouncer-iptables &>/dev/null || {
-      local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
-      $pkg install -y -q crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
-    }
+    local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
+    $pkg install -y -q crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
   fi
 
-  systemctl enable --now crowdsec >> "$LOG_FILE" 2>&1 || true
-  systemctl enable --now crowdsec-firewall-bouncer 2>/dev/null || true
-
-  sleep 2
-  if systemctl is-active --quiet crowdsec 2>/dev/null; then
-    success "CrowdSec active (local mode)"
+  docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
+  local api_key
+  api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer 2>/dev/null | tail -1 || true)
+  if [[ -n "$api_key" ]]; then
+    mkdir -p /etc/crowdsec
+    cat > /etc/crowdsec/crowdsec-firewall-bouncer.yaml << BOUNCER
+api_url: http://127.0.0.1:8080
+api_key: ${api_key}
+BOUNCER
+    systemctl enable --now crowdsec-firewall-bouncer 2>/dev/null || true
+    success "Firewall bouncer registered"
   else
-    warn "CrowdSec not running — check ${LOG_FILE}"
+    warn "Could not register firewall bouncer -- run manually: docker exec crowdsec cscli bouncers add my-bouncer"
   fi
 }
+
 
 setup_firewall() {
   step "Firewall"
@@ -845,10 +888,9 @@ ${C_B}Nginx Proxy Manager${C_R}
   SSL:     ${NPM_LE_DIR}
   Logs:    ${NPM_LOGS_DIR}
 
-${C_B}Portainer CE${C_R}
-  Container: portainer
-  Port:      9000 (internal, no host port)
-  Network:   proxy
+${C_B}Portainer CE (standalone)${C_R}
+  URL:      http://${ip}:9000
+  Data:     portainer_data (Docker volume)
 
 ${C_B}${C_YEL}════════════════════════════════════════════════════════════════${C_R}
 ${C_B}${C_YEL}  🔐  AUTHELIA LOGIN CREDENTIALS (SAVE THESE)${C_R}
@@ -949,6 +991,7 @@ main() {
   install_docker
   setup_docker_network
   get_user_domain
+  setup_portainer_standalone
   setup_authelia_secrets
   setup_authelia_config
   create_nginx_snippets

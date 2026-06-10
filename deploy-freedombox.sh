@@ -7,7 +7,7 @@ fi
 # v3.0.0-crowdsec | Usage: chmod +x deploy-freedombox.sh && sudo ./deploy-freedombox.sh
 #
 # FreedomBox (Debian Pure Blend) manages its own Apache2 and firewalld.
-# CrowdSec replaces FreedomBox's fail2ban for IPS.
+# CrowdSec provides intrusion prevention for FreedomBox.
 # Supports: Debian 12 (Bookworm) or newer ONLY.
 set -euo pipefail
 IFS=$'\n\t'
@@ -19,6 +19,7 @@ readonly NPM_DIR="/opt/npm"
 readonly NPM_DATA_DIR="${NPM_DIR}/data"
 readonly NPM_LE_DIR="${NPM_DIR}/letsencrypt"
 readonly NPM_LOGS_DIR="${NPM_DATA_DIR}/logs"
+readonly CROWDSEC_DIR="${NPM_DIR}/crowdsec"
 readonly LOG_FILE="/var/log/vps-deploy.log"
 
 # Colors (TTY only)
@@ -239,7 +240,7 @@ setup_docker_network() {
 ## NGINX PROXY MANAGER (port 81 — FreedomBox Apache owns 80/443)
 setup_nginx_proxy_manager() {
   step "Nginx Proxy Manager (supplementary proxy on port 81)"
-  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" && cd "$NPM_DIR"
+  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR" && cd "$NPM_DIR"
 
   cat > docker-compose.yml << 'COMPOSE'
 services:
@@ -264,6 +265,21 @@ services:
 networks:
   proxy:
     external: true
+
+  crowdsec:
+    image: crowdsecurity/crowdsec:latest
+    container_name: crowdsec
+    hostname: crowdsec
+    restart: unless-stopped
+    environment:
+      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux
+      - TZ=UTC
+    volumes:
+      - ./crowdsec/data:/var/lib/crowdsec/data
+      - ./crowdsec/config:/etc/crowdsec
+      - ./data/logs:/var/log/npm:ro
+      - /var/log:/var/log:ro
+    network_mode: host
 COMPOSE
 
   docker compose pull
@@ -324,40 +340,6 @@ COMPOSE
 }
 
 ## CROWDSEC
-setup_crowdsec() {
-  step "CrowdSec"
-  if command -v cscli &>/dev/null; then
-    info "CrowdSec already installed"
-  else
-    curl -s https://install.crowdsec.net | bash -s -- -d debian >> "$LOG_FILE" 2>&1 || { warn "CrowdSec repo setup failed"; return; }
-    apt-get install -y -qq crowdsec >> "$LOG_FILE" 2>&1 || { warn "CrowdSec install failed"; return; }
-  fi
-
-  info "Installing CrowdSec collections..."
-  cscli collections install crowdsecurity/sshd 2>/dev/null || true
-  cscli collections install crowdsecurity/nginx-proxy-manager 2>/dev/null || true
-  cscli collections install crowdsecurity/linux 2>/dev/null || true
-
-  info "Installing firewall bouncer..."
-  dpkg -l crowdsec-firewall-bouncer-iptables &>/dev/null || apt-get install -y -qq crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
-
-  systemctl enable --now crowdsec >> "$LOG_FILE" 2>&1 || true
-  systemctl enable --now crowdsec-firewall-bouncer 2>/dev/null || true
-
-  # Disable FreedomBox's managed fail2ban to avoid conflicts with CrowdSec
-  if systemctl is-active --quiet fail2ban 2>/dev/null; then
-    info "Disabling FreedomBox-managed fail2ban (CrowdSec handles IPS now)..."
-    systemctl stop fail2ban
-    systemctl disable fail2ban
-  fi
-
-  sleep 2
-  if systemctl is-active --quiet crowdsec 2>/dev/null; then
-    success "CrowdSec active (local mode)"
-  else
-    warn "CrowdSec not running — check ${LOG_FILE}"
-  fi
-}
 
 ## FIREWALL: Open port 81 in firewalld for NPM
 setup_firewall_npm() {
@@ -539,7 +521,7 @@ ${C_B}${C_CYN}── SERVICES ──${C_R}
 
   Apache2    (managed by FreedomBox)
   Firewalld  (managed by FreedomBox)
-  CrowdSec   (replaces FreedomBox fail2ban)
+  CrowdSec   (intrusion prevention)
 
 ${C_B}${C_CYN}── NGINX PROXY MANAGER ──${C_R}
   Admin:    http://${ip}:81  (admin@example.com / changeme)
@@ -588,6 +570,78 @@ EOF
 }
 
 ## MAIN
+
+setup_crowdsec() {
+  step "CrowdSec (Docker)"
+
+  info "Waiting for CrowdSec container to be ready..."
+  local cs_ready=false
+  for i in $(seq 1 30); do
+    if docker exec crowdsec cscli metrics &>/dev/null; then
+      cs_ready=true
+      break
+    fi
+    sleep 2
+  done
+
+  if ! $cs_ready; then
+    docker logs crowdsec --tail 20 2>/dev/null || true
+    warn "CrowdSec container not ready -- check ${LOG_FILE}. Continuing..."
+    return
+  fi
+  success "CrowdSec container running"
+
+  info "Verifying collections..."
+  docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/sshd" && success "sshd collection" || warn "sshd collection not found"
+  docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/nginx-proxy-manager" && success "nginx-proxy-manager collection" || warn "nginx-proxy-manager not found"
+  docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/linux" && success "linux collection" || warn "linux not found"
+
+  info "Configuring NPM log acquisition..."
+  local npm_acquis="${CROWDSEC_DIR}/config/acquis.d/npm.yaml"
+  mkdir -p "$(dirname "$npm_acquis")"
+  cat > "$npm_acquis" << 'NPM_ACQUIS'
+filenames:
+  - /var/log/npm/*.log
+labels:
+  type: nginx
+NPM_ACQUIS
+  if docker exec crowdsec cat /etc/crowdsec/acquis.d/npm.yaml &>/dev/null; then
+    success "NPM acquisition configured"
+  else
+    docker exec crowdsec bash -c "mkdir -p /etc/crowdsec/acquis.d && cat > /etc/crowdsec/acquis.d/npm.yaml << 'EOF'
+filenames:
+  - /var/log/npm/*.log
+labels:
+  type: nginx
+EOF" && warn "NPM acquisition written (via docker exec)" || warn "Could not configure NPM acquisition"
+  fi
+
+  docker exec crowdsec kill -HUP 1 2>/dev/null || docker restart crowdsec &>/dev/null || true
+
+  info "Installing firewall bouncer..."
+  if [[ "$OS_FAMILY" == "debian" ]]; then
+    apt-get install -y -qq crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
+  else
+    local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
+    $pkg install -y -q crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
+  fi
+
+  docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
+  local api_key
+  api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer 2>/dev/null | tail -1 || true)
+  if [[ -n "$api_key" ]]; then
+    mkdir -p /etc/crowdsec
+    cat > /etc/crowdsec/crowdsec-firewall-bouncer.yaml << BOUNCER
+api_url: http://127.0.0.1:8080
+api_key: ${api_key}
+BOUNCER
+    systemctl enable --now crowdsec-firewall-bouncer 2>/dev/null || true
+    success "Firewall bouncer registered"
+  else
+    warn "Could not register firewall bouncer -- run manually: docker exec crowdsec cscli bouncers add my-bouncer"
+  fi
+}
+
 main() {
   printf "\n${C_B}${C_CYN}VPS Deployment — FreedomBox + NPM${C_R}\n"
   printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
