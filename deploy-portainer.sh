@@ -607,7 +607,10 @@ services:
       - ./crowdsec/config:/etc/crowdsec
       - ./data/logs:/var/log/npm:ro
       - /var/log:/var/log:ro
-    network_mode: host
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      - proxy
 
 networks:
   proxy:
