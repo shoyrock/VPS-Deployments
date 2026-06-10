@@ -594,9 +594,11 @@ EOF" && warn "NPM acquisition written (via docker exec)" || warn "Could not conf
 
   info "Installing firewall bouncer..."
   if [[ "$OS_FAMILY" == "debian" ]]; then
+    apt-get install -y -qq crowdsec-firewall-bouncer-nftables >> "$LOG_FILE" 2>&1 || \
     apt-get install -y -qq crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
   else
     local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
+    $pkg install -y -q crowdsec-firewall-bouncer-nftables >> "$LOG_FILE" 2>&1 || \
     $pkg install -y -q crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
   fi
 
