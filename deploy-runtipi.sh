@@ -154,19 +154,40 @@ idempotent_cleanup() {
   else
     yum remove -y -q docker-ce docker-ce-cli containerd.io 2>/dev/null || true
   fi
-  info "Removing old config directories..."
-  rm -rf /opt/npm ~/runtipi 2>/dev/null || true
+  # Remove ALL previously deployed platform data directories
+  info "Removing ALL previous platform data..."
+  for dir in /opt/npm /opt/casaos /var/lib/casaos /opt/casaos-stack /opt/coolify-stack /opt/cosmos-stack /opt/dockge-stack /opt/dokploy-stack /opt/portainer-stack /opt/runtipi-stack /opt/freedombox-stack /opt/yunohost-stack ~/runtipi; do
+    rm -rf "$dir" 2>/dev/null || true
+  done
 
-  if command -v crowdsec &>/dev/null || command -v cscli &>/dev/null; then
-    info "Removing native crowdsec (conflicts with Docker CrowdSec on port 8080)..."
-    systemctl stop crowdsec crowdsec-firewall-bouncer 2>/dev/null || true
-    systemctl disable crowdsec crowdsec-firewall-bouncer 2>/dev/null || true
-    if [[ "$OS_FAMILY" == "debian" ]]; then
-      apt-get remove -y -qq crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
-    else
-      local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
-      $pkg remove -y -q crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
-    fi
+  # Stop and remove ALL previously deployed platform systemd services
+  info "Removing ALL previous platform services..."
+  for svc in casaos-gateway casaos-user-service casaos-local-storage casaos-message-bus runtipi crowdsec-firewall-bouncer; do
+    systemctl stop "$svc" 2>/dev/null || true
+    systemctl disable "$svc" 2>/dev/null || true
+    systemctl mask "$svc" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${svc}.service" "/etc/systemd/system/${svc}" 2>/dev/null || true
+  done
+  systemctl daemon-reload 2>/dev/null || true
+
+  # Remove firewall bouncer binary and config
+  rm -f /usr/local/bin/crowdsec-firewall-bouncer 2>/dev/null || true
+  rm -f /etc/crowdsec/crowdsec-firewall-bouncer.yaml 2>/dev/null || true
+  rm -rf /etc/crowdsec 2>/dev/null || true
+
+  # Remove native crowdsec packages
+  if [[ "$OS_FAMILY" == "debian" ]]; then
+    apt-get remove -y -qq crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables 2>/dev/null || true
+    apt-get autoremove -y -qq 2>/dev/null || true
+  else
+    local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
+    $pkg remove -y -q crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables 2>/dev/null || true
+  fi
+
+  # Also handle snap-installed Docker (Ubuntu)
+  if command -v snap &>/dev/null; then
+    snap disable docker 2>/dev/null || true
+    snap remove docker 2>/dev/null || true
   fi
 }
 
@@ -279,7 +300,7 @@ services:
     hostname: crowdsec
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8088:8080"
     volumes:
       - ./crowdsec/data:/var/lib/crowdsec/data
       - ./crowdsec/config:/etc/crowdsec
@@ -664,7 +685,7 @@ BOUNCER_SERVICE
     local fw_mode="iptables"
     command -v nft &>/dev/null && fw_mode="nftables"
     cat > /etc/crowdsec/crowdsec-firewall-bouncer.yaml << BOUNCER
-api_url: http://127.0.0.1:8080
+api_url: http://127.0.0.1:8088
 api_key: ${api_key}
 mode: ${fw_mode}
 deny_action: DROP
