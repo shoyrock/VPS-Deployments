@@ -59,216 +59,56 @@ get_external_ip() {
 _on_exit() {
   local exit_code=$?
   local elapsed=$(( $(date +%s) - START_TIME ))
-  local ip
-  ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
-  local ext_ip; ext_ip=$(get_external_ip)
+  local ip ext_ip
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<internal_ip>")
+  ext_ip=$(get_external_ip)
+  local exit_pass="<unknown>"
+  [[ -f "${AUTHELIA_DIR}/.default_password" ]] && exit_pass=$(tr -d '\n' < "${AUTHELIA_DIR}/.default_password" 2>/dev/null || echo "<unknown>")
 
-  if [[ -n "${DEPLOYED_SERVICES:-}" ]] || [[ "$DEPLOY_STATUS" != "in_progress" ]]; then
-    printf "\n"
-    if [[ "$DEPLOY_STATUS" == "success" ]]; then
-      printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
-      printf "${C_B}${C_GRN}║                   ✅  DEPLOYMENT COMPLETED SUCCESSFULLY                      ║${C_R}\n"
-      printf "${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
-    else
-      printf "${C_B}${C_RED}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
-      printf "${C_B}${C_RED}║                     ❌  DEPLOYMENT DID NOT COMPLETE                          ║${C_R}\n"
-      printf "${C_B}${C_RED}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
-    fi
-    printf "${C_B}║  Elapsed:   ${C_CYN}%dm %ds${C_R}${C_B}                                                          ║${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
-    printf "${C_B}║  VPS IP:    ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "$ip"
-    printf "${C_B}║  External:  ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "$ext_ip"
-    printf "${C_B}║  Domain:    ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "${DOMAIN:-<not set>}"
-    # Read Authelia password for display (always show - never skip)
-    local exit_pass="<unknown>"
-    [[ -f "${AUTHELIA_DIR}/.default_password" ]] && exit_pass=$(tr -d '\n' < "${AUTHELIA_DIR}/.default_password" 2>/dev/null || echo "<unknown>")
-
-    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
-    printf "${C_B}║  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "${ip}:81"
-    if [[ "$DEPLOY_STATUS" == "success" ]]; then
-      printf "${C_B}║  ${C_YEL}Cosmos   ${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "cosmos.${DOMAIN:-yourdomain.com} (via NPM)"
-      printf "${C_B}║  ${C_YEL}Authelia ${C_R}${C_B}:  https://${C_CYN}%-55s${C_R}${C_B}║${C_R}\n" "authelia.${DOMAIN:-yourdomain.com}"
-      printf "${C_B}║                                                             ║${C_R}\n"
-      printf "${C_B}║  ${C_YEL}Authelia Username:  admin${C_R}                                ║${C_R}\n"
-      printf "${C_B}║  ${C_YEL}Authelia Password:  %s${C_R}                                  ║${C_R}\n" "$exit_pass"
-      printf "${C_B}║  ${C_RED}Type this password exactly as shown (no spaces)${C_R}          ║${C_R}\n"
-      printf "${C_B}║  ${C_RED}Also saved in: ${AUTHELIA_DIR}/password.txt${C_R}              ║${C_R}\n"
-      printf "${C_B}║                                                             ║${C_R}\n"
-      printf "${C_B}║  ${C_YEL}-- Changing Password or Adding 2FA --${C_R}                     ║${C_R}\n"
-      printf "${C_B}║  Run this to get your verification code:                  ║${C_R}\n"
-      printf "${C_B}║  ${C_CYN}sudo docker exec authelia cat /config/notifications.txt${C_R}   ║${C_R}\n"
-      printf "${C_B}║                                                             ║${C_R}\n"
-    fi
-    printf "${C_B}║  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}80 (HTTP), 443 (HTTPS), 81 (NPM Admin)          ${C_R}${C_B}║${C_R}\n"
-    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
-    printf "${C_B}║  Log file: ${C_CYN}%-66s${C_R}${C_B}║${C_R}\n" "$LOG_FILE"
-    printf "${C_B}╚══════════════════════════════════════════════════════════════════════════════╝${C_R}\n"
-    printf "\n"
-
-    if [[ "$DEPLOY_STATUS" == "success" ]]; then
-      printf "${C_B}${C_GRN}Your VPS is ready!${C_R}\n\n"
-    else
-      printf "${C_B}${C_YEL}The deployment did not finish.${C_R} Check: ${C_CYN}cat %s${C_R}\n\n" "$LOG_FILE"
-    fi
+  printf "\n"
+  if [[ "$DEPLOY_STATUS" == "success" ]]; then
+    printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
+    printf "${C_B}${C_GRN}║                   ✅  DEPLOYMENT COMPLETED SUCCESSFULLY                      ║${C_R}\n"
+    printf "${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+  else
+    printf "${C_B}${C_RED}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
+    printf "${C_B}${C_RED}║                     ❌  DEPLOYMENT DID NOT COMPLETE                          ║${C_R}\n"
+    printf "${C_B}${C_RED}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
   fi
-  _log "INFO" "=== Script exited (code $exit_code, status: $DEPLOY_STATUS, elapsed: ${elapsed}s) ===" 2>/dev/null || true
+  printf "${C_B}║  %-72s  ║${C_R}\n" "Elapsed:   ${elapsed}m ${elapsed}s"
+  printf "${C_B}║  %-72s  ║${C_R}\n" "VPS IP:    $ip"
+  printf "${C_B}║  %-72s  ║${C_R}\n" "External:  $ext_ip"
+  printf "${C_B}║  %-72s  ║${C_R}\n" "Domain:    ${DOMAIN:-<not set>}"
+  printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+  printf "${C_B}║  %-72s  ║${C_R}\n" "NPM Admin:  http://${ip}:81"
+  if [[ "$DEPLOY_STATUS" == "success" ]]; then
+    printf "${C_B}║  %-72s  ║${C_R}\n" "Portainer:  http://portainer.${DOMAIN} (via NPM)"
+    printf "${C_B}║  %-72s  ║${C_R}\n" "Authelia:   https://authelia.${DOMAIN}"
+    printf "${C_B}║  %-72s  ║${C_R}\n" ""
+    printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "Authelia Username:  admin"
+    printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "Authelia Password:  $exit_pass"
+    printf "${C_B}║  ${C_RED}%-72s${C_R}${C_B}  ║${C_R}\n" "Change this password immediately after first login!"
+    printf "${C_B}║  %-72s  ║${C_R}\n" "Also saved in: ${AUTHELIA_DIR}/password.txt"
+    printf "${C_B}║  %-72s  ║${C_R}\n" ""
+    printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "-- Changing Password or Adding 2FA --"
+    printf "${C_B}║  %-72s  ║${C_R}\n" "1. In Authelia, go to Settings → Password (or 2FA)"
+    printf "${C_B}║  %-72s  ║${C_R}\n" "2. Authelia will ask for a verification code"
+    printf "${C_B}║  %-72s  ║${C_R}\n" "3. Then run this command to get the code:"
+    printf "${C_B}║  ${C_CYN}%-72s${C_R}${C_B}  ║${C_R}\n" "sudo docker exec authelia cat /config/notifications.txt"
+    printf "${C_B}║  %-72s  ║${C_R}\n" "4. Paste the code into Authelia and click Verify"
+    printf "${C_B}║  %-72s  ║${C_R}\n" ""
+  fi
+  printf "${C_B}║  %-72s  ║${C_R}\n" "Ports:  80 (HTTP), 443 (HTTPS), 81 (NPM Admin)"
+  printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+  printf "${C_B}║  %-72s  ║${C_R}\n" "Log: $LOG_FILE"
+  printf "${C_B}╚══════════════════════════════════════════════════════════════════════════════╝${C_R}\n"
+  printf "\n"
+  if [[ "$DEPLOY_STATUS" == "success" ]]; then
+    printf "${C_B}${C_GRN}Your VPS is ready!${C_R} Set up DNS → ${C_CYN}${ext_ip}${C_R} and configure NPM.\n\n"
+  else
+    printf "${C_B}${C_YEL}Deployment failed.${C_R} Check: ${C_CYN}cat $LOG_FILE${C_R}\n\n"
+  fi
   exit $exit_code
-}
-trap _on_exit EXIT
-
-preflight_checks() {
-  step "Pre-flight Checks"
-  [[ "${EUID:-0}" -ne 0 ]] && fatal "Must run as root (use sudo)."
-  success "Running as root"
-
-  if [[ -f /etc/os-release ]]; then
-    # shellcheck source=/dev/null
-    source /etc/os-release
-    readonly OS_ID="${ID:-unknown}"
-    readonly OS_NAME="${NAME:-Unknown}"
-    readonly OS_VERSION_ID="${VERSION_ID:-0}"
-    readonly OS_LIKE="${ID_LIKE:-}"
-  else
-    fatal "/etc/os-release not found."
-  fi
-
-  case "$OS_ID" in
-    ubuntu|debian|linuxmint|pop|kali) readonly OS_FAMILY="debian" ;;
-    centos|rhel|rocky|almalinux|fedora|ol|oraclelinux|amzn) readonly OS_FAMILY="rhel" ;;
-    *)
-      if [[ "$OS_LIKE" == *"debian"* ]]; then readonly OS_FAMILY="debian"
-      elif [[ "$OS_LIKE" == *"rhel"* ]] || [[ "$OS_LIKE" == *"fedora"* ]] || [[ "$OS_LIKE" == *"centos"* ]]; then readonly OS_FAMILY="rhel"
-      else fatal "Unsupported: ${OS_NAME} (${OS_ID}). Need Ubuntu 20.04+, Debian 11+, Rocky/Alma 8+, Fedora 35+."; fi
-      ;;
-  esac
-  success "OS: ${OS_NAME} ${OS_VERSION_ID} (${OS_FAMILY})"
-
-  if [[ "$OS_FAMILY" == "debian" ]]; then
-    local major_ver="${OS_VERSION_ID%%.*}"
-    [[ "$OS_ID" == "ubuntu" && "$major_ver" -lt 20 ]] && fatal "Ubuntu ${OS_VERSION_ID} too old. Min: 20.04."
-    [[ "$OS_ID" == "debian" && "$major_ver" -lt 11 ]] && fatal "Debian ${OS_VERSION_ID} too old. Min: 11."
-  fi
-
-  readonly ARCH=$(uname -m)
-  case "$ARCH" in
-    x86_64) readonly DOCKER_ARCH="amd64" ;;
-    aarch64|arm64) readonly DOCKER_ARCH="arm64" ;;
-    *) fatal "Unsupported arch: ${ARCH}. Need x86_64 or arm64/aarch64." ;;
-  esac
-  success "Arch: ${ARCH} (${DOCKER_ARCH})"
-
-  info "Checking internet..."
-  if ! curl -sf --max-time 10 https://download.docker.com/ >/dev/null 2>&1 && \
-     ! curl -sf --max-time 10 https://github.com/ >/dev/null 2>&1; then
-    fatal "No internet connectivity."
-  fi
-  success "Internet OK"
-
-  local free_mb; free_mb=$(df -m / | awk 'NR==2 {print $4}')
-  [[ "$free_mb" -lt 2048 ]] && warn "Low disk: ${free_mb}MB free (recommend >= 2048MB)." || success "Disk: $(( free_mb / 1024 ))GB free"
-
-  mkdir -p "$(dirname "$LOG_FILE")"
-  _log "INFO" "=== ${SCRIPT_NAME} v${SCRIPT_VERSION} started ==="
-  _log "INFO" "OS: ${OS_NAME} ${OS_VERSION_ID}, Family: ${OS_FAMILY}, Arch: ${ARCH}"
-}
-
-idempotent_cleanup() {
-  step "Cleanup"
-  if command -v docker &>/dev/null; then
-    info "Removing ALL existing containers and volumes..."
-    docker ps -aq 2>/dev/null | xargs -r docker stop &>/dev/null || true
-    docker ps -aq 2>/dev/null | xargs -r docker rm -f &>/dev/null || true
-    docker volume ls -q 2>/dev/null | xargs -r docker volume rm -f &>/dev/null || true
-  fi
-
-  # Remove stack directory to ensure ZERO traces of previous deployments
-  if [[ -d "${STACK_DIR}" ]]; then
-    info "Removing previous stack directory: ${STACK_DIR}"
-    rm -rf "${STACK_DIR}" 2>/dev/null || true
-  fi
-
-  if [[ "$OS_FAMILY" == "debian" ]]; then
-    dpkg -l 2>/dev/null | grep -E "docker|containerd|runc" | awk '{print $2}' | xargs -r apt-get remove -y -qq &>/dev/null || true
-    apt-get autoremove -y -qq &>/dev/null || true
-  else
-    yum remove -y -q docker-ce docker-ce-cli containerd.io 2>/dev/null || true
-  fi
-}
-
-system_update() {
-  step "System Update"
-  info "Updating packages -- this may take a few minutes..."
-  export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-  if [[ "$OS_FAMILY" == "debian" ]]; then
-    apt-get update -qq && apt-get upgrade -y -qq && apt-get autoremove -y -qq && apt-get autoclean -qq
-  else
-    if command -v dnf &>/dev/null; then dnf update -y -q && dnf autoremove -y -q 2>/dev/null || true
-    else yum update -y -q; fi
-  fi
-  success "System updated"
-}
-
-install_dependencies() {
-  step "Installing Dependencies"
-  info "Installing required packages..."
-  if [[ "$OS_FAMILY" == "debian" ]]; then
-    apt-get install -y -qq ca-certificates curl gnupg lsb-release \
-      software-properties-common apt-transport-https jq cron logrotate
-  else
-    local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
-    $pkg install -y -q ca-certificates curl gnupg2 yum-utils \
-      device-mapper-persistent-data lvm2 jq cronie logrotate
-  fi
-  success "Dependencies installed"
-}
-
-install_docker() {
-  step "Installing Docker CE"
-  if command -v docker &>/dev/null && docker version &>/dev/null; then
-    success "Docker already installed: $(docker --version)"; return 0
-  fi
-  info "Installing Docker CE -- this may take a few minutes..."
-  if [[ "$OS_FAMILY" == "debian" ]]; then
-    install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" -o /etc/apt/keyrings/docker.asc 2>/dev/null || \
-      curl -fsSL "https://download.docker.com/linux/debian/gpg" -o /etc/apt/keyrings/docker.asc
-    chmod a+r /etc/apt/keyrings/docker.asc
-    local repo_url
-    if [[ "$OS_ID" == "debian" || "$OS_ID" == "ubuntu" ]]; then
-      repo_url="https://download.docker.com/linux/${OS_ID}"
-    else
-      repo_url="https://download.docker.com/linux/ubuntu"
-    fi
-    echo "deb [arch=${DOCKER_ARCH} signed-by=/etc/apt/keyrings/docker.asc] ${repo_url} $(lsb_release -cs) stable" \
-      > /etc/apt/sources.list.d/docker.list
-    apt-get update -qq
-    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
-  else
-    local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
-    if [[ "$OS_ID" == "amzn" || "$OS_ID" == "fedora" ]]; then
-      $pkg config-manager --add-repo "https://download.docker.com/linux/fedora/docker-ce.repo" 2>/dev/null || \
-        yum-config-manager --add-repo "https://download.docker.com/linux/fedora/docker-ce.repo"
-    else
-      $pkg config-manager --add-repo "https://download.docker.com/linux/centos/docker-ce.repo" 2>/dev/null || \
-        yum-config-manager --add-repo "https://download.docker.com/linux/centos/docker-ce.repo"
-    fi
-    $pkg install -y -q docker-ce docker-ce-cli containerd.io docker-compose-plugin
-  fi
-  systemctl start docker && systemctl enable docker
-  systemctl is-active --quiet docker || fatal "Docker daemon failed. Check: journalctl -u docker -n 50"
-  info "Verifying Docker..."
-  for i in {1..3}; do docker run --rm hello-world &>/dev/null && break; sleep 5; done
-  docker compose version &>/dev/null || fatal "Docker Compose plugin missing."
-  success "Docker $(docker version --format '{{.Server.Version}}') + Compose $(docker compose version --short)"
-}
-
-setup_docker_network() {
-  step "Docker Network: proxy"
-  # NEVER remove existing proxy network -- other containers may depend on it
-  if ! docker network ls --format '{{.Name}}' | grep -qx "proxy"; then
-    docker network create proxy 2>/dev/null || true
-  fi
-  docker network ls --format '{{.Name}}' | grep -qx "proxy" || fatal "Failed to create 'proxy' network"
-  success "Network 'proxy' ready"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────

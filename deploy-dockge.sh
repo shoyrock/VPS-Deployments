@@ -58,56 +58,53 @@ get_external_ip() {
 _on_exit() {
   local exit_code=$?
   local elapsed=$(( $(date +%s) - START_TIME ))
-  local ip
-  ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
-  local ext_ip; ext_ip=$(get_external_ip)
+  local ip ext_ip
+  ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<internal_ip>")
+  ext_ip=$(get_external_ip)
+  local exit_pass="<unknown>"
+  [[ -f "${AUTHELIA_DIR}/.default_password" ]] && exit_pass=$(tr -d '\n' < "${AUTHELIA_DIR}/.default_password" 2>/dev/null || echo "<unknown>")
 
-  if [[ -n "${DEPLOYED_SERVICES:-}" ]] || [[ "$DEPLOY_STATUS" != "in_progress" ]]; then
-    printf "\n"
-    if [[ "$DEPLOY_STATUS" == "success" ]]; then
-      printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
-      printf "${C_B}${C_GRN}║                   ✅  DEPLOYMENT COMPLETED SUCCESSFULLY                      ║${C_R}\n"
-      printf "${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
-    else
-      printf "${C_B}${C_RED}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
-      printf "${C_B}${C_RED}║                     ❌  DEPLOYMENT DID NOT COMPLETE                          ║${C_R}\n"
-      printf "${C_B}${C_RED}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
-    fi
-    printf "${C_B}║  Elapsed:   ${C_CYN}%dm %ds${C_R}${C_B}                                                          ║${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
-    printf "${C_B}║  VPS IP:    ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "$ip"
-    printf "${C_B}║  External:  ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "$ext_ip"
-    printf "${C_B}║  Domain:    ${C_CYN}%-16s${C_R}${C_B}                                                   ║${C_R}\n" "${DOMAIN:-<not set>}"
-    # Read Authelia password for display (always show - never skip)
-    local exit_pass="<unknown>"
-    [[ -f "${AUTHELIA_DIR}/.default_password" ]] && exit_pass=$(tr -d '\n' < "${AUTHELIA_DIR}/.default_password" 2>/dev/null || echo "<unknown>")
-
-    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
-    printf "${C_B}║  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "${ip}:81"
-    if [[ "$DEPLOY_STATUS" == "success" ]]; then
-      printf "${C_B}║  ${C_YEL}Dockge   ${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "dockge.${DOMAIN:-yourdomain.com} (via NPM)"
-      printf "${C_B}║                                                             ║${C_R}\n"
-      printf "${C_B}║  ${C_YEL}Authelia Username:  admin${C_R}                                ║${C_R}\n"
-      printf "${C_B}║  ${C_YEL}Authelia Password:  %s${C_R}                                  ║${C_R}\n" "$exit_pass"
-      printf "${C_B}║  ${C_RED}Type this password exactly as shown (no spaces)${C_R}          ║${C_R}\n"
-      printf "${C_B}║  ${C_RED}Also saved in: ${AUTHELIA_DIR}/password.txt${C_R}              ║${C_R}\n"
-      printf "${C_B}║                                                             ║${C_R}\n"
-      printf "${C_B}║  ${C_YEL}-- Changing Password or Adding 2FA --${C_R}                     ║${C_R}\n"
-      printf "${C_B}║  Run this to get your verification code:                  ║${C_R}\n"
-      printf "${C_B}║  ${C_CYN}sudo docker exec authelia cat /config/notifications.txt${C_R}   ║${C_R}\n"
-      printf "${C_B}║                                                             ║${C_R}\n"
-    fi
-    printf "${C_B}║  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}80 (HTTP), 443 (HTTPS), 81 (NPM Admin)          ${C_R}${C_B}║${C_R}\n"
-    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
-    printf "${C_B}║  Log file: ${C_CYN}%-66s${C_R}${C_B}║${C_R}\n" "$LOG_FILE"
-    printf "${C_B}╚══════════════════════════════════════════════════════════════════════════════╝${C_R}\n"
-    printf "\n"
-
-    if [[ "$DEPLOY_STATUS" == "success" ]]; then
-      printf "${C_B}${C_GRN}Your VPS is ready!${C_R} Set up DNS records and configure NPM.\n\n"
-    else
-      printf "${C_B}${C_YEL}The deployment did not finish.${C_R} Check the log:\n"
-      printf "  ${C_CYN}cat %s${C_R}\n\n" "$LOG_FILE"
-    fi
+  printf "\n"
+  if [[ "$DEPLOY_STATUS" == "success" ]]; then
+    printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
+    printf "${C_B}${C_GRN}║                   ✅  DEPLOYMENT COMPLETED SUCCESSFULLY                      ║${C_R}\n"
+    printf "${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+  else
+    printf "${C_B}${C_RED}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
+    printf "${C_B}${C_RED}║                     ❌  DEPLOYMENT DID NOT COMPLETE                          ║${C_R}\n"
+    printf "${C_B}${C_RED}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+  fi
+  printf "${C_B}║  %-72s  ║${C_R}\n" "Elapsed:  ${elapsed}s"
+  printf "${C_B}║  %-72s  ║${C_R}\n" "VPS IP:   $ip"
+  printf "${C_B}║  %-72s  ║${C_R}\n" "External: $ext_ip"
+  printf "${C_B}║  %-72s  ║${C_R}\n" "Domain:   ${DOMAIN:-<not set>}"
+  printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+  printf "${C_B}║  %-72s  ║${C_R}\n" "NPM Admin: http://${ip}:81"
+  if [[ "$DEPLOY_STATUS" == "success" ]]; then
+    printf "${C_B}║  %-72s  ║${C_R}\n" "Portainer: http://portainer.${DOMAIN}"
+    printf "${C_B}║  %-72s  ║${C_R}\n" "Authelia:  https://authelia.${DOMAIN}"
+    printf "${C_B}║  %-72s  ║${C_R}\n" ""
+    printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "Authelia Username: admin"
+    printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "Authelia Password: $exit_pass"
+    printf "${C_B}║  ${C_RED}%-72s${C_R}${C_B}  ║${C_R}\n" "Change this password immediately after first login!"
+    printf "${C_B}║  %-72s  ║${C_R}\n" "Also: ${AUTHELIA_DIR}/password.txt"
+    printf "${C_B}║  %-72s  ║${C_R}\n" ""
+    printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "-- Verification Codes --"
+    printf "${C_B}║  %-72s  ║${C_R}\n" "Authelia requires a code to change password or add 2FA."
+    printf "${C_B}║  %-72s  ║${C_R}\n" "The code appears AFTER you request it in the Authelia UI."
+    printf "${C_B}║  %-72s  ║${C_R}\n" "Then run:"
+    printf "${C_B}║  ${C_CYN}%-72s${C_R}${C_B}  ║${C_R}\n" "sudo docker exec authelia cat /config/notifications.txt"
+    printf "${C_B}║  %-72s  ║${C_R}\n" ""
+  fi
+  printf "${C_B}║  %-72s  ║${C_R}\n" "Ports: 80 (HTTP), 443 (HTTPS), 81 (NPM Admin)"
+  printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+  printf "${C_B}║  %-72s  ║${C_R}\n" "Log: $LOG_FILE"
+  printf "${C_B}╚══════════════════════════════════════════════════════════════════════════════╝${C_R}\n"
+  printf "\n"
+  if [[ "$DEPLOY_STATUS" == "success" ]]; then
+    printf "${C_B}${C_GRN}Your VPS is ready!${C_R} Set up DNS → ${C_CYN}${ext_ip}${C_R} and configure NPM.\n\n"
+  else
+    printf "${C_B}${C_YEL}Deployment failed.${C_R} Check: ${C_CYN}cat $LOG_FILE${C_R}\n\n"
   fi
   _log "INFO" "=== Script exited (code $exit_code, status: $DEPLOY_STATUS, elapsed: ${elapsed}s) ===" 2>/dev/null || true
   exit $exit_code
