@@ -1,29 +1,8 @@
 #!/usr/bin/env bash
 # Auto-elevate to root if not already running as root
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    exec sudo bash "$0" "$@"
-  fi
-
-  # Remove any Docker crowdsec container from previous runs
-  docker rm -f crowdsec 2>/dev/null || true
-  # Kill whatever is holding port 8080
-  local pid_8080; pid_8088=$(ss -tlnp 2>/dev/null | grep ':8080 ' | sed 's/.*pid=\([0-9]*\).*/\1/' | head -1)
-  [ -n "${pid_8080}" ] && kill -9 "${pid_8080}" 2>/dev/null || true
-  # Always try to stop native crowdsec (may have been restarted by systemd)
-  systemctl stop crowdsec crowdsec-firewall-bouncer 2>/dev/null || true
-  systemctl disable crowdsec crowdsec-firewall-bouncer 2>/dev/null || true
-  if command -v crowdsec &>/dev/null || command -v cscli &>/dev/null; then
-    info "Removing native crowdsec (conflicts with Docker CrowdSec on port 8080)..."
-    systemctl stop crowdsec crowdsec-firewall-bouncer 2>/dev/null || true
-    systemctl disable crowdsec crowdsec-firewall-bouncer 2>/dev/null || true
-    if [[ "$OS_FAMILY" == "debian" ]]; then
-      apt-get remove -y -qq crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
-    else
-      local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
-      $pkg remove -y -q crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
-    fi
-  fi
-}
+  exec sudo bash "$0" "$@"
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GUARANTEED COMPLETION SUMMARY — runs on exit regardless of success/failure

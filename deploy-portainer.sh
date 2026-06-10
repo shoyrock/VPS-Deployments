@@ -538,14 +538,30 @@ USEREOF
 setup_portainer_standalone() {
   step "Portainer (standalone)"
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
-  docker rm -f portainer 2>/dev/null || true
-  docker run -d --name portainer \
-    --restart always \
-    --network proxy \
-    -p 9000:9000 \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v portainer_data:/data \
-    portainer/portainer-ce:latest >> "$LOG_FILE" 2>&1 || true
+
+  cat > "${STACK_DIR}/docker-compose.portainer.yml" << 'COMPOSE_PORTAINER'
+services:
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    restart: always
+    ports:
+      - 9000:9000
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    networks:
+      - proxy
+volumes:
+  portainer_data:
+networks:
+  proxy:
+    external: true
+COMPOSE_PORTAINER
+
+  docker compose -f "${STACK_DIR}/docker-compose.portainer.yml" pull
+  docker compose -f "${STACK_DIR}/docker-compose.portainer.yml" up -d
+
   info "Waiting for Portainer to be ready..."
   for i in $(seq 1 30); do
     docker ps --format '{{.Names}}' | grep -qx "portainer" && { success "Portainer ready at http://${ip}:9000"; break; }
@@ -934,6 +950,14 @@ ${C_B}${C_GRN}╠═════════════════════
 ${C_B}${C_GRN}║  Deployment Complete  ${C_R}${C_B}(${SCRIPT_NAME} v${SCRIPT_VERSION})  ${C_CYN}$(( elapsed / 60 ))m $(( elapsed % 60 ))s${C_R}${C_B}   ║${C_R}
 ${C_B}${C_GRN}╚══════════════════════════════════════════════════════════════════════╝${C_R}
 
+${C_B}${C_YEL}── Container Summary ────────────────────────────────────────────────${C_R}
+${C_B}CONTAINER  ${C_R}  ${C_B}HOSTNAME     ${C_R}  ${C_B}PORTS              ${C_R}  ${C_B}NPM DOMAIN             ${C_R}
+${C_DIM}──────────  ────────────  ─────────────────  ───────────────────────${C_R}
+npm         npm          80, 443, 81        ${ip}:81 (admin)
+authelia    authelia     9091               authelia.${DOMAIN}
+crowdsec    crowdsec     8080 (LAPI)        (internal, no proxy needed)
+portainer   portainer    9000               portainer.${DOMAIN}
+
 ${C_B}Nginx Proxy Manager${C_R}
   Admin:   http://${ip}:81
   External: http://${ext_ip}:81
@@ -968,6 +992,8 @@ ${C_B}${C_YEL}══════════════════════
 
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
 ${C_B}Containers${C_R}  npm, authelia, crowdsec, portainer (separate compose files)
+${C_B}Compose Files${C_R}  docker-compose.npm.yml, docker-compose.authelia.yml,
+                docker-compose.crowdsec.yml, docker-compose.portainer.yml
 ${C_B}Network${C_R}   proxy (bridge)
 
 ${C_B}CrowdSec${C_R}  Collections: sshd, nginx-proxy-manager, linux
@@ -1031,6 +1057,7 @@ ${C_B}Troubleshooting:${C_R}
   NPM:      cd ${STACK_DIR} && docker compose -f docker-compose.npm.yml restart
   Authelia: cd ${STACK_DIR} && docker compose -f docker-compose.authelia.yml restart
   CrowdSec: cd ${STACK_DIR} && docker compose -f docker-compose.crowdsec.yml restart
+  Portainer: cd ${STACK_DIR} && docker compose -f docker-compose.portainer.yml restart
   CS-CLI:   docker exec crowdsec cscli metrics    docker exec crowdsec cscli decisions list
   FW:       ${C_B}CrowdSec bouncer${C_R}
   CS:      cscli metrics    cscli decisions list    cscli collections list

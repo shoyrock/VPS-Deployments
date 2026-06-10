@@ -405,15 +405,26 @@ setup_portainer() {
   step "Portainer CE"
   mkdir -p "$PORTAINER_DIR" "$CROWDSEC_DIR"
 
-  docker rm -f portainer 2>/dev/null || true
-  docker run -d --name portainer \
-    --restart always \
-    --network proxy \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v portainer_data:/data \
-    portainer/portainer-ce:latest
+  cat > "${NPM_DIR}/docker-compose.portainer.yml" << 'COMPOSE_PORTAINER'
+services:
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    networks:
+      - proxy
+volumes:
+  portainer_data:
+networks:
+  proxy:
+    external: true
+COMPOSE_PORTAINER
 
-  docker pull portainer/portainer-ce:latest
+  docker compose -f "${NPM_DIR}/docker-compose.portainer.yml" pull
+  docker compose -f "${NPM_DIR}/docker-compose.portainer.yml" up -d
 
   info "Waiting for Portainer (please wait)..."
   for i in $(seq 1 40); do
@@ -521,6 +532,14 @@ ${C_B}External:${C_R} ${ext_ip}
 
 ${C_B}${C_CYN}-- SERVICES --${C_R}
 
+${C_B}${C_YEL}── Container Summary ────────────────────────────────────────────────${C_R}
+${C_B}CONTAINER   ${C_R}  ${C_B}HOSTNAME    ${C_R}  ${C_B}PORTS              ${C_R}  ${C_B}NPM DOMAIN            ${C_R}
+${C_DIM}──────────  ───────────  ─────────────────  ──────────────────────${C_R}
+npm          npm         80, 443, 81        ${ip}:81 (admin)
+dokploy      dokploy     3000               dokploy.${DOMAIN}
+portainer    portainer   9000               portainer.${DOMAIN}
+crowdsec     crowdsec    8080 (LAPI)        (internal, no proxy needed)
+
   ${C_B}Nginx Proxy Manager${C_R}  ${C_GRN}(MAIN PROXY)${C_R}
     Admin UI:  http://${ip}:81
     HTTP:      http://${ip}:80
@@ -536,7 +555,9 @@ ${C_B}${C_CYN}-- SERVICES --${C_R}
   Note: Dokploy has native 2FA in Settings → Security
 
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
-${C_B}Containers${C_R}  npm, portainer, crowdsec (separate compose files)
+${C_B}Containers${C_R}  npm, dokploy, portainer, crowdsec (separate compose files)
+${C_B}Compose Files${C_R}  docker-compose.npm.yml, docker-compose.crowdsec.yml,
+                docker-compose.portainer.yml
 ${C_B}Network${C_R}   proxy (bridge)
 
 ${C_B}CrowdSec${C_R}  Collections: sshd, nginx-proxy-manager, linux
@@ -606,7 +627,7 @@ ${C_B}${C_CYN}-- TROUBLESHOOTING --${C_R}
 
   NPM:        cd ${NPM_DIR} && docker compose -f docker-compose.npm.yml restart
   CrowdSec:   cd ${NPM_DIR} && docker compose -f docker-compose.crowdsec.yml restart
-  Portainer:  docker restart portainer
+  Portainer:  cd ${NPM_DIR} && docker compose -f docker-compose.portainer.yml restart
   Dokploy:    docker service ls && docker service logs dokploy
   Portainer:  docker logs -f portainer
   CrowdSec:   cscli metrics    cscli decisions list
