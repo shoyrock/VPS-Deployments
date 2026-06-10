@@ -468,13 +468,52 @@ EOF" && warn "NPM acquisition written (via docker exec)" || warn "Could not conf
   docker exec crowdsec kill -HUP 1 2>/dev/null || docker restart crowdsec &>/dev/null || true
 
   info "Installing firewall bouncer..."
-  if [[ "$OS_FAMILY" == "debian" ]]; then
-    apt-get install -y -qq crowdsec-firewall-bouncer-nftables >> "$LOG_FILE" 2>&1 || \
-    apt-get install -y -qq crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
+  local bouncer_version="0.0.34"
+  local arch_map
+  case "$(uname -m)" in
+    x86_64)  arch_map="amd64" ;;
+    aarch64) arch_map="arm64" ;;
+    armv7l)  arch_map="armv7" ;;
+    *)       arch_map="$(uname -m)" ;;
+  esac
+  local bouncer_url="https://github.com/crowdsecurity/cs-firewall-bouncer/releases/download/v${bouncer_version}/crowdsec-firewall-bouncer-linux-${arch_map}.tgz"
+  local tmpdir; tmpdir=$(mktemp -d)
+  pushd "$tmpdir" &>/dev/null
+  if curl -sL --connect-timeout 10 "$bouncer_url" | tar xz 2>/dev/null; then
+    cp crowdsec-firewall-bouncer-*/crowdsec-firewall-bouncer /usr/local/bin/ 2>/dev/null
+    chmod +x /usr/local/bin/crowdsec-firewall-bouncer 2>/dev/null
+    cat > /etc/systemd/system/crowdsec-firewall-bouncer.service << 'BOUNCER_SERVICE'
+[Unit]
+Description=The firewall bouncer for CrowdSec
+After=syslog.target network.target remote-fs.target nss-lookup.target docker.service
+Before=netfilter-persistent.service
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/crowdsec-firewall-bouncer -c /etc/crowdsec/crowdsec-firewall-bouncer.yaml
+ExecStartPre=/usr/local/bin/crowdsec-firewall-bouncer -c /etc/crowdsec/crowdsec-firewall-bouncer.yaml -t
+ExecStartPost=/bin/sleep 0.1
+Restart=always
+RestartSec=10
+LimitNOFILE=65536
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
+BOUNCER_SERVICE
+    popd &>/dev/null; rm -rf "$tmpdir"
+    success "Firewall bouncer binary installed"
   else
-    local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
-    $pkg install -y -q crowdsec-firewall-bouncer-nftables >> "$LOG_FILE" 2>&1 || \
-    $pkg install -y -q crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
+    popd &>/dev/null; rm -rf "$tmpdir"
+    warn "Binary download failed -- trying apt..."
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+      apt-get install -y -qq crowdsec-firewall-bouncer-nftables >> "$LOG_FILE" 2>&1 || \
+      apt-get install -y -qq crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
+    else
+      local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
+      $pkg install -y -q crowdsec-firewall-bouncer-nftables >> "$LOG_FILE" 2>&1 || \
+      $pkg install -y -q crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
+    fi
   fi
 
   docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
@@ -486,6 +525,7 @@ EOF" && warn "NPM acquisition written (via docker exec)" || warn "Could not conf
 api_url: http://127.0.0.1:8080
 api_key: ${api_key}
 BOUNCER
+    systemctl daemon-reload 2>/dev/null || true
     systemctl enable --now crowdsec-firewall-bouncer 2>/dev/null || true
     success "Firewall bouncer registered"
   else
