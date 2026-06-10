@@ -486,12 +486,12 @@ setup_authelia_users() {
   local hash_output
   hash_output=$(docker exec -T authelia authelia crypto hash generate argon2 --password "$random_pass" 2>&1) || true
   local pass_hash
-  pass_hash=$(echo "$hash_output" | grep -o '\$argon2id\$[^[:space:]]*' | head -1) || true
+  pass_hash=$(echo "$hash_output" | grep -oE '\$argon2id\$[A-Za-z0-9$=,+/]+' | head -1) || true
 
   if [[ -z "$pass_hash" ]] || [[ ! "$pass_hash" == \$argon2id\$* ]]; then
     warn "Retrying hash generation..."
     hash_output=$(docker exec -T authelia sh -c "authelia crypto hash generate argon2 --password '$random_pass' 2>&1") || true
-    pass_hash=$(echo "$hash_output" | grep -o '\$argon2id\$[^[:space:]]*' | head -1) || true
+    pass_hash=$(echo "$hash_output" | grep -oE '\$argon2id\$[A-Za-z0-9$=,+/]+' | head -1) || true
   fi
 
   if [[ -z "$pass_hash" ]] || [[ ! "$pass_hash" == \$argon2id\$* ]]; then
@@ -504,6 +504,12 @@ setup_authelia_users() {
   printf '%s\n' '---' 'users:' '  admin:' '    disabled: false' '    displayname: "Administrator"' "    password: \"${pass_hash}\"" "    email: admin@${DOMAIN}" '    groups:' '      - admins' '      - users' > "${AUTHELIA_CONFIG_DIR}/users.yml"
 
   success "Authelia user 'admin' created with random password"
+
+  # Validate users.yml has a proper argon2id hash before restarting
+  if ! grep -qE '\$argon2id\$[A-Za-z0-9$=,+/]+' "${AUTHELIA_CONFIG_DIR}/users.yml"; then
+    fatal "users.yml missing valid argon2id hash — hash generation failed"
+  fi
+
   info "Restarting Authelia to load user database..."
   docker restart authelia >/dev/null 2>&1
 
