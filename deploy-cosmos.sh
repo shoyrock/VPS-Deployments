@@ -194,15 +194,15 @@ access_control:
       policy: two_factor
 
 session:
-  name: authelia_session
-  same_site: lax
-  expiration: 1h
-  inactivity: 5m
-  remember_me_duration: 1M
   cookies:
-    - domain: "${DOMAIN}"
+    - name: authelia_session
+      domain: "${DOMAIN}"
       authelia_url: "https://authelia.${DOMAIN}"
       default_redirection_url: "https://cosmos.${DOMAIN}"
+      same_site: lax
+      expiration: 1h
+      inactivity: 5m
+      remember_me: 1M
 
 regulation:
   max_retries: 3
@@ -218,14 +218,6 @@ notifier:
     filename: /config/notifications.txt
 EOF
 
-  # Generate random password for admin account (hash created after container starts)
-  local random_pass
-  random_pass=$(openssl rand -hex 8)
-  printf '%s' "$random_pass" > "${AUTHELIA_DIR}/.default_password"
-  chmod 600 "${AUTHELIA_DIR}/.default_password"
-  printf '%s' "$random_pass" > "${AUTHELIA_DIR}/password.txt"
-  chmod 600 "${AUTHELIA_DIR}/password.txt"
-  info "Random password generated for Authelia admin account"
   info "users.yml will be created after authelia container starts"
 }
 
@@ -345,7 +337,7 @@ USEREOF
   info "Default password: ${default_pass} (change after first login)"
 
   info "Restarting Authelia to load user database..."
-  docker restart authelia >/dev/null 2>&1
+  docker restart authelia >/dev/null 2>&1 || true
 
   # Wait for authelia to come back up
   for i in $(seq 1 30); do
@@ -780,7 +772,7 @@ NPM_ACQUIS
   if docker exec crowdsec cat /etc/crowdsec/acquis.d/npm.yaml &>/dev/null; then
     success "NPM acquisition configured"
   else
-    docker exec crowdsec bash -c "mkdir -p /etc/crowdsec/acquis.d && cat > /etc/crowdsec/acquis.d/npm.yaml << 'EOF'
+    docker exec crowdsec sh -c "mkdir -p /etc/crowdsec/acquis.d && cat > /etc/crowdsec/acquis.d/npm.yaml << 'EOF'
 filenames:
   - /npm-logs/*.log
 labels:
@@ -791,7 +783,8 @@ EOF" && warn "NPM acquisition written (via docker exec)" || warn "Could not conf
   docker exec crowdsec kill -HUP 1 2>/dev/null || docker restart crowdsec &>/dev/null || true
 
   info "Installing firewall bouncer..."
-  local bouncer_version="0.0.34"
+  local bouncer_version
+  bouncer_version=$(curl -sf --max-time 10 "https://api.github.com/repos/crowdsecurity/cs-firewall-bouncer/releases/latest" | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/') || bouncer_version="0.0.34"
   local arch_map
   case "$(uname -m)" in
     x86_64)  arch_map="amd64" ;;
@@ -844,9 +837,14 @@ BOUNCER_SERVICE
   api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer 2>/dev/null | tail -1 || true)
   if [[ -n "$api_key" ]]; then
     mkdir -p /etc/crowdsec
+    local fw_mode="iptables"
+    command -v nft &>/dev/null && fw_mode="nftables"
     cat > /etc/crowdsec/crowdsec-firewall-bouncer.yaml << BOUNCER
 api_url: http://127.0.0.1:8080
 api_key: ${api_key}
+mode: ${fw_mode}
+deny_action: DROP
+update_frequency: 10s
 BOUNCER
     systemctl daemon-reload 2>/dev/null || true
     systemctl enable --now crowdsec-firewall-bouncer 2>/dev/null || true
