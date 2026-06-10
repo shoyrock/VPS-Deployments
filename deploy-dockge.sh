@@ -85,9 +85,12 @@ _on_exit() {
     printf "${C_B}║  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "${ip}:81"
     if [[ "$DEPLOY_STATUS" == "success" ]]; then
       printf "${C_B}║  ${C_YEL}Dockge   ${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "dockge.${DOMAIN:-yourdomain.com} (via NPM)"
-      printf "${C_B}║  ${C_YEL}Authelia ${C_R}${C_B}:  https://${C_CYN}%-55s${C_R}${C_B}║${C_R}\n" "authelia.${DOMAIN:-yourdomain.com}"
-      printf "${C_B}║  ${C_RED}🔐  Temp Login: admin / %s${C_R}${C_B}%*s║${C_R}\n" "$exit_pass" $((43 - ${#exit_pass})) ""
-      printf "${C_B}║  ${C_RED}⚠️  Change password immediately after first login!${C_R}${C_B}    ║${C_R}\n"
+      printf "${C_B}║                                                             ║${C_R}\n"
+      printf "${C_B}║  ${C_YEL}Authelia Username:  admin${C_R}                                ║${C_R}\n"
+      printf "${C_B}║  ${C_YEL}Authelia Password:  %s${C_R}                                  ║${C_R}\n" "$exit_pass"
+      printf "${C_B}║  ${C_RED}Type this password exactly as shown (no spaces)${C_R}          ║${C_R}\n"
+      printf "${C_B}║  ${C_RED}Also saved in: ${AUTHELIA_DIR}/password.txt${C_R}              ║${C_R}\n"
+      printf "${C_B}║                                                             ║${C_R}\n"
     fi
     printf "${C_B}║  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}80 (HTTP), 443 (HTTPS), 81 (NPM Admin)          ${C_R}${C_B}║${C_R}\n"
     printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
@@ -339,13 +342,6 @@ totp:
 authentication_backend:
   file:
     path: /config/users.yml
-    password:
-      algorithm: argon2id
-      iterations: 1
-      key_length: 32
-      salt_length: 16
-      memory: 65536
-      parallelism: 4
 
 access_control:
   default_policy: two_factor
@@ -391,6 +387,10 @@ EOF
   random_pass=$(openssl rand -hex 8)
   printf '%s' "$random_pass" > "${AUTHELIA_DIR}/.default_password"
   chmod 600 "${AUTHELIA_DIR}/.default_password"
+
+  printf '%s' "$random_pass" > "${AUTHELIA_DIR}/password.txt"
+  chmod 600 "${AUTHELIA_DIR}/password.txt"
+
   info "Random password generated for Authelia admin account"
 
   success "Authelia configuration written to ${AUTHELIA_CONFIG_DIR}/"
@@ -399,6 +399,11 @@ EOF
 create_nginx_snippets() {
   step "NGINX Snippets for Authelia"
   mkdir -p "$AUTHELIA_SNIPPETS_DIR"
+
+  # Ensure authelia can read config files (runs as non-root uid 1001 by default)
+  chmod 755 "${AUTHELIA_CONFIG_DIR}" "${AUTHELIA_SECRETS_DIR}" 2>/dev/null || true
+  chmod 644 "${AUTHELIA_CONFIG_DIR}"/*.yml "${AUTHELIA_CONFIG_DIR}"/*.txt 2>/dev/null || true
+  chmod 600 "${AUTHELIA_SECRETS_DIR}"/* 2>/dev/null || true
 
   cat > "${AUTHELIA_SNIPPETS_DIR}/proxy.conf" << 'SNIPPET'
 client_body_buffer_size 128k;
@@ -478,53 +483,42 @@ setup_authelia_users() {
     return 0
   fi
 
-  info "Generating password hash using the Authelia container..."
+  # Use the official Authelia lite bundle pre-hashed password.
+  # Password is "authelia" — change immediately after first login.
+  # Hash source: https://github.com/authelia/authelia/blob/master/examples/compose/lite/authelia/users_database.yml
+  local default_pass="authelia"
+  local pass_hash='$argon2id$v=19$m=65536,t=3,p=4$qOKNq+u5lZHOTnsJY1Sp3g$s6zT9EKncfkmIJmykzZProUigRRJ26hlTl1WC+mG2do'
 
-  # Read the random password
-  local random_pass=""
-  if [[ -f "${AUTHELIA_DIR}/.default_password" ]]; then
-    random_pass=$(tr -d '\n' < "${AUTHELIA_DIR}/.default_password")
-  fi
-  if [[ -z "$random_pass" ]]; then
-    random_pass=$(openssl rand -hex 8)
-    printf '%s' "$random_pass" > "${AUTHELIA_DIR}/.default_password"
-    chmod 600 "${AUTHELIA_DIR}/.default_password"
-  fi
+  # Store password for display
+  printf '%s' "$default_pass" > "${AUTHELIA_DIR}/.default_password"
+  chmod 600 "${AUTHELIA_DIR}/.default_password"
+  printf '%s' "$default_pass" > "${AUTHELIA_DIR}/password.txt"
+  chmod 600 "${AUTHELIA_DIR}/password.txt"
 
-  # Use -T to disable TTY allocation — prevents ANSI color codes from corrupting output
-  local hash_output
-  hash_output=$(docker exec -T authelia authelia crypto hash generate argon2 --password "$random_pass" 2>&1) || true
-  local authelia_pass_hash
-  authelia_pass_hash=$(echo "$hash_output" | grep -oE '\$argon2id\$[A-Za-z0-9$=,+/]+' | head -1) || true
+  # Write users.yml — single-quoted YAML (matches official lite bundle format)
+  cat > "${AUTHELIA_CONFIG_DIR}/users.yml" << USEREOF
+---
+users:
+  admin:
+    disabled: false
+    displayname: 'Administrator'
+    password: '${pass_hash}'
+    email: 'admin@${DOMAIN}'
+    groups:
+      - admins
+      - users
+USEREOF
 
-  if [[ -z "$authelia_pass_hash" ]] || [[ ! "$authelia_pass_hash" == \$argon2id\$* ]]; then
-    warn "Retrying hash generation..."
-    hash_output=$(docker exec -T authelia sh -c "authelia crypto hash generate argon2 --password '$random_pass' 2>&1") || true
-    authelia_pass_hash=$(echo "$hash_output" | grep -oE '\$argon2id\$[A-Za-z0-9$=,+/]+' | head -1) || true
-  fi
-
-  if [[ -z "$authelia_pass_hash" ]] || [[ ! "$authelia_pass_hash" == \$argon2id\$* ]]; then
-    fatal "Could not generate a valid password hash. Authelia user creation failed."
-  fi
-
-  info "Hash extracted: ${authelia_pass_hash:0:30}..."
-
-  # Write users.yml with printf (avoids heredoc expansion issues)
-  printf '%s\n' '---' 'users:' '  admin:' '    disabled: false' '    displayname: "Administrator"' "    password: \"${authelia_pass_hash}\"" "    email: admin@${DOMAIN}" '    groups:' '      - admins' '      - users' > "${AUTHELIA_CONFIG_DIR}/users.yml"
-
-  success "users.yml created with verified password hash"
-
-  # Validate users.yml has a proper argon2id hash before restarting
-  if ! grep -qE '\$argon2id\$[A-Za-z0-9$=,+/]+' "${AUTHELIA_CONFIG_DIR}/users.yml"; then
-    fatal "users.yml missing valid argon2id hash — hash generation failed"
-  fi
+  success "Authelia user 'admin' created"
+  info "Default password: ${default_pass} (change after first login)"
 
   info "Restarting Authelia to load user database..."
   docker restart authelia >/dev/null 2>&1
 
+  # Wait for authelia to come back up
   for i in $(seq 1 30); do
-    docker exec authelia wget -qO- --timeout=3 http://127.0.0.1:9091/api/health 2>/dev/null | grep -q "ok" && { success "Authelia restarted and ready"; break; }
-    printf "${C_DIM}  Waiting for Authelia to restart... (%d/30)${C_R}\r" "$i"
+    docker exec authelia wget -qO- --timeout=3 http://127.0.0.1:9091/api/health 2>/dev/null | grep -q "ok" && { success "Authelia ready"; break; }
+    printf "${C_DIM}  Waiting for Authelia restart... (%d/30)${C_R}\r" "$i"
     [[ $i -eq 30 ]] && warn "Authelia restart timed out"
     sleep 2
   done
@@ -582,6 +576,7 @@ services:
   authelia:
     image: authelia/authelia:latest
     container_name: authelia
+    user: "0:0"
     hostname: authelia
     restart: always
     volumes:
