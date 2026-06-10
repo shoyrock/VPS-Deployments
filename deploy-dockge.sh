@@ -90,8 +90,10 @@ _on_exit() {
       printf "${C_B}║  ${C_YEL}Authelia Password:  %s${C_R}                                  ║${C_R}\n" "$exit_pass"
       printf "${C_B}║  ${C_RED}Type this password exactly as shown (no spaces)${C_R}          ║${C_R}\n"
       printf "${C_B}║  ${C_RED}Also saved in: ${AUTHELIA_DIR}/password.txt${C_R}              ║${C_R}\n"
-      printf "${C_B}║  ${C_DIM}Verification codes: sudo docker exec authelia cat${C_R}        ║${C_R}\n"
-      printf "${C_B}║  ${C_DIM}/config/notifications.txt${C_R}                                  ║${C_R}\n"
+      printf "${C_B}║                                                             ║${C_R}\n"
+      printf "${C_B}║  ${C_YEL}-- Changing Password or Adding 2FA --${C_R}                     ║${C_R}\n"
+      printf "${C_B}║  Run this to get your verification code:                  ║${C_R}\n"
+      printf "${C_B}║  ${C_CYN}sudo docker exec authelia cat /config/notifications.txt${C_R}   ║${C_R}\n"
       printf "${C_B}║                                                             ║${C_R}\n"
     fi
     printf "${C_B}║  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}80 (HTTP), 443 (HTTPS), 81 (NPM Admin)          ${C_R}${C_B}║${C_R}\n"
