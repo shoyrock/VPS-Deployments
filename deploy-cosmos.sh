@@ -468,11 +468,7 @@ SNIPPET1
 setup_authelia_users() {
   step "Creating Authelia User Account"
 
-  # NOTE: only true if idempotent_cleanup was skipped (normally always creates fresh)
-  if [[ -f "${AUTHELIA_CONFIG_DIR}/users.yml" ]]; then
-    info "users.yml already exists (preserved)"
-    return 0
-  fi
+  # Always create fresh users.yml (old one may have stale password)
 
   # Use the official Authelia lite bundle pre-hashed password.
   # Password is "authelia" — change immediately after first login.
