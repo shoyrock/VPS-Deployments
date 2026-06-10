@@ -3,11 +3,11 @@
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     exec sudo bash "$0" "$@"
 fi
-# deploy-casaos.sh — Docker + NPM + CasaOS + Fail2Ban
-# v2.0.0-casaos | Usage: sudo ./deploy-casaos.sh
+# deploy-casaos.sh — Docker + NPM + CasaOS + CrowdSec
+# v3.0.0-crowdsec | Usage: sudo ./deploy-casaos.sh
 set -euo pipefail
 
-readonly SCRIPT_VERSION="2.0.0-casaos"
+readonly SCRIPT_VERSION="3.0.0-crowdsec"
 readonly SCRIPT_NAME="deploy-casaos.sh"
 readonly START_TIME=$(date +%s)
 readonly CASAOS_DATA_DIR="/var/lib/casaos"
@@ -47,11 +47,11 @@ _on_exit() {
     printf "\n"
     if [[ "$DEPLOY_STATUS" == "success" ]]; then
       printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
-      printf "${C_B}${C_GRN}║                   ✅  DEPLOYMENT COMPLETED SUCCESSFULLY                      ║${C_R}\n"
+      printf "${C_B}${C_GRN}║                    ✅  DEPLOYMENT COMPLETED SUCCESSFULLY                      ║${C_R}\n"
       printf "${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
     else
       printf "${C_B}${C_RED}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
-      printf "${C_B}${C_RED}║                     ❌  DEPLOYMENT DID NOT COMPLETE                          ║${C_R}\n"
+      printf "${C_B}${C_RED}║                     ❌  DEPLOYMENT DID NOT COMPLETE                           ║${C_R}\n"
       printf "${C_B}${C_RED}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
     fi
     printf "${C_B}║  Elapsed:   ${C_CYN}%dm %ds${C_R}${C_B}                                                          ║${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
@@ -491,112 +491,45 @@ After fixing, run this script again."
   $health_ok || warn "CasaOS not responding on 8080 — check: systemctl status casaos-gateway"
 }
 
-setup_fail2ban() {
-  step "Fail2Ban"
-  if [[ "$OS_FAMILY" == "debian" ]]; then
-    apt-get install -y -qq fail2ban
-    local banaction="ufw"
+setup_crowdsec() {
+  step "CrowdSec"
+  if command -v cscli &>/dev/null; then
+    info "CrowdSec already installed"
   else
-    local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
-    $pkg install -y -q fail2ban
-    local banaction="firewallcmd-rich-rules"
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+      curl -s https://install.crowdsec.net | bash -s -- -d debian >> "$LOG_FILE" 2>&1 || { warn "CrowdSec repo setup failed"; return; }
+      apt-get install -y -qq crowdsec >> "$LOG_FILE" 2>&1 || { warn "CrowdSec install failed"; return; }
+    else
+      curl -s https://install.crowdsec.net | bash -s -- -d rhel >> "$LOG_FILE" 2>&1 || { warn "CrowdSec repo setup failed"; return; }
+      local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
+      $pkg install -y -q crowdsec >> "$LOG_FILE" 2>&1 || { warn "CrowdSec install failed"; return; }
+    fi
   fi
 
-  local fdir="/etc/fail2ban/filter.d"
-  mkdir -p "$fdir"
+  info "Installing CrowdSec collections..."
+  cscli collections install crowdsecurity/sshd 2>/dev/null || true
+  cscli collections install crowdsecurity/nginx-proxy-manager 2>/dev/null || true
+  cscli collections install crowdsecurity/linux 2>/dev/null || true
 
-  cat > "${fdir}/npm-access.conf" << 'FILTER'
-# Fail2Ban filter for Nginx Proxy Manager (NPM) access logs
-# NPM uses a custom format; standard nginx filters will NOT match.
-# Matches: 401/403/404 responses (brute force, scanning, enumeration)
-[Definition]
-failregex = ^.*\s+(?:401|403|404)\s+.*\[Client\s+<HOST>\]\s+\[Length\s+\d+\]\s+.*$
-ignoreregex = ^.*\s+(?:404)\s+.*".*\.(?:png|jpe?g|gif|ico|svg|css|js|ttf|woff2?|eot|map)(?:\?[^"]*)?"\s+.*$
-FILTER
-
-  if [[ ! -f "${fdir}/nginx-http-auth.conf" ]]; then
-    cat > "${fdir}/nginx-http-auth.conf" << 'FILTER'
-[Definition]
-failregex = ^ \[error\] \d+#\d+: \*\d+ user "[^"]*":? (password mismatch|was not found in "[^"]*"|login attempt failed), client: <HOST>, server: \S*, request: "\S+ \S+ HTTP/\d+\.\d+", host: "\S+"\s*$
-ignoreregex =
-datepattern = {^LN-BEG}%%ExY(?#\s)-(?#\s)%%m(?#\s)-(?#\s)%%d(?#\s)%%H(?#\s):(?#\s)%%M(?#\s):(?#\s)%%S(?:\.%f)?(?:\s+%%z)?
-              ^[^\[]*\[({DATE})\s+[-+]\d{4}\]
-FILTER
+  info "Installing firewall bouncer..."
+  if [[ "$OS_FAMILY" == "debian" ]]; then
+    dpkg -l crowdsec-firewall-bouncer-iptables &>/dev/null || apt-get install -y -qq crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
+  else
+    rpm -q crowdsec-firewall-bouncer-iptables &>/dev/null || {
+      local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
+      $pkg install -y -q crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
+    }
   fi
 
-  if [[ ! -f "${fdir}/nginx-botsearch.conf" ]]; then
-    cat > "${fdir}/nginx-botsearch.conf" << 'FILTER'
-[Definition]
-failregex = ^<HOST>.*"(\.\\|\%\%|\%[0-9a-fA-F][0-9a-fA-F]|\.(git|svn|htaccess|env|ssh|idea|vscode)).*".*(404|403|500)
-            ^.*(404|403|500).*[Cc]lient\s+<HOST>.*".*(admin|wp-login|phpmyadmin|xmlrpc|config\.xml|\.env|wp-config).*"
-ignoreregex =
-FILTER
-  fi
-
-  mkdir -p "$NPM_LOGS_DIR"
-  touch "${NPM_LOGS_DIR}/fallback_http_access.log" \
-        "${NPM_LOGS_DIR}/fallback_http_error.log" \
-        "${NPM_LOGS_DIR}/default-host_access.log" \
-        "${NPM_LOGS_DIR}/default-host_error.log" 2>/dev/null || true
-
-  cat > /etc/fail2ban/jail.local << EOF
-# Auto-generated by ${SCRIPT_NAME} v${SCRIPT_VERSION} on $(date -Iseconds)
-#
-# NOTE: NPM uses a CUSTOM access log format. The IP is inside [Client IP] instead
-# of at the start. This breaks built-in nginx-* filters. We use a custom 'npm-access'
-# filter for access logs. Error logs still use standard format.
-
-[DEFAULT]
-bantime   = 3600
-findtime  = 600
-maxretry  = 5
-banaction = ${banaction}
-allowipv6 = auto
-
-[sshd]
-enabled  = true
-port     = ssh
-filter   = sshd
-backend  = systemd
-maxretry = 3
-
-[npm-auth]
-enabled  = true
-port     = http,https,81
-filter   = nginx-http-auth
-backend  = auto
-logpath  = ${NPM_LOGS_DIR}/*_error.log
-maxretry = 3
-findtime = 60
-
-[npm-forceful-browsing]
-enabled  = true
-port     = http,https
-filter   = npm-access
-backend  = auto
-logpath  = ${NPM_LOGS_DIR}/*_access.log
-maxretry = 15
-findtime = 60
-bantime  = 3600
-
-[npm-botsearch]
-enabled  = true
-port     = http,https
-filter   = nginx-botsearch
-backend  = auto
-logpath  = ${NPM_LOGS_DIR}/*_error.log
-maxretry = 2
-findtime = 600
-bantime  = 86400
-EOF
-
-  mkdir -p /var/log/fail2ban
-  systemctl restart fail2ban && systemctl enable fail2ban
+  systemctl enable --now crowdsec >> "$LOG_FILE" 2>&1 || true
+  systemctl enable --now crowdsec-firewall-bouncer 2>/dev/null || true
 
   sleep 2
-  local jails; jails=$(fail2ban-client status 2>/dev/null | grep "Jail list" | sed 's/.*://' | tr -d ' ' || true)
-  [[ -n "$jails" ]] && success "Active jails: ${jails}" || warn "Check jails: fail2ban-client status"
-  success "Fail2Ban configured"
+  if systemctl is-active --quiet crowdsec 2>/dev/null; then
+    success "CrowdSec active (local mode)"
+  else
+    warn "CrowdSec not running — check ${LOG_FILE}"
+  fi
 }
 
 setup_firewall() {
@@ -705,7 +638,7 @@ ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/nul
 ${C_B}Compose${C_R}   $(docker compose version --short 2>/dev/null || echo N/A)
 ${C_B}Network${C_R}   proxy (bridge)
 
-${C_B}Fail2Ban${C_R}  Jails: sshd, npm-auth, npm-forceful-browsing, npm-botsearch
+${C_B}CrowdSec${C_R}  Collections: sshd, nginx-proxy-manager, linux
 ${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
 
 ${C_B}${C_YEL}Step 1 — NPM Admin${C_R}
@@ -740,10 +673,8 @@ ${C_B}${C_YEL}Step 4 — Secure Admin Port${C_R}
 ${C_B}Compose${C_R}   $(docker compose version --short 2>/dev/null || echo N/A)
 ${C_B}Network${C_R}   proxy (bridge)
 
-${C_B}Fail2Ban${C_R}
-  Config:    /etc/fail2ban/jail.local
-  Jails:     sshd, npm-auth, npm-forceful-browsing, npm-botsearch
-  Status:    fail2ban-client status
+${C_B}CrowdSec${C_R}
+  Status:    cscli metrics    cscli decisions list
 
 ${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
 
@@ -771,7 +702,7 @@ ${C_B}${C_CYN}-- TROUBLESHOOTING --${C_R}
   NPM logs:   docker logs -f npm
   CasaOS:     systemctl status casaos-gateway
   Restart:    cd ${NPM_DIR} && docker compose restart
-  Fail2Ban:   fail2ban-client status
+  CrowdSec:   cscli metrics    cscli decisions list
   Firewall:   ${fw_cmd}
   Deploy log: ${LOG_FILE}
 
@@ -780,7 +711,7 @@ EOF
 }
 
 main() {
-  printf "\n${C_B}${C_CYN}VPS Deployment — Docker + NPM + CasaOS + Fail2Ban${C_R}\n"
+  printf "\n${C_B}${C_CYN}VPS Deployment — Docker + NPM + CasaOS + CrowdSec${C_R}\n"
   printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
   preflight_checks
   idempotent_cleanup
@@ -790,11 +721,11 @@ main() {
   setup_docker_network
   setup_casaos
   setup_nginx_proxy_manager
-  setup_fail2ban
+  setup_crowdsec
   setup_firewall
   setup_logrotate
   print_summary
-  DEPLOYED_SERVICES="NPM, CasaOS, Fail2Ban"
+  DEPLOYED_SERVICES="NPM, CasaOS, CrowdSec"
   DEPLOY_STATUS="success"
 }
 

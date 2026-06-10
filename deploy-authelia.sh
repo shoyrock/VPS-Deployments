@@ -36,11 +36,11 @@ _on_exit() {
     printf "\n"
     if [[ "$DEPLOY_STATUS" == "success" ]]; then
       printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
-      printf "${C_B}${C_GRN}║                   ✅  AUTHELIA DEPLOYMENT COMPLETE                           ║${C_R}\n"
+      printf "${C_B}${C_GRN}║                    ✅  AUTHELIA DEPLOYMENT COMPLETE                            ║${C_R}\n"
       printf "${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
     else
       printf "${C_B}${C_RED}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
-      printf "${C_B}${C_RED}║                     ❌  DEPLOYMENT DID NOT COMPLETE                          ║${C_R}\n"
+      printf "${C_B}${C_RED}║                     ❌  DEPLOYMENT DID NOT COMPLETE                           ║${C_R}\n"
       printf "${C_B}${C_RED}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
     fi
     printf "${C_B}║  Internal:  ${C_CYN}%-16s${C_R}${C_B}  Elapsed: ${C_CYN}%dm %02ds${C_R}                              ║${C_R}\n" "$ip" "$((elapsed/60))" "$((elapsed%60))"

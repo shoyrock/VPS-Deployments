@@ -107,9 +107,9 @@ fi
 header() {
   printf "\n${C_B}${C_CYN}"
   printf "╔══════════════════════════════════════════════════════════════════╗\n"
-  printf "║          VPS SELF-HOSTING DEPLOYMENT SUITE v%s              ║\n" "$SCRIPT_VERSION"
+  printf "║           VPS SELF-HOSTING DEPLOYMENT SUITE v%s               ║\n" "$SCRIPT_VERSION"
   printf "╠══════════════════════════════════════════════════════════════════╣\n"
-  printf "║  One script to deploy them all — Docker, Fail2Ban, Firewall    ║\n"
+  printf "║   One script to deploy them all — Docker, CrowdSec, Firewall     ║\n"
   printf "╚══════════════════════════════════════════════════════════════════╝"
   printf "${C_R}\n\n"
 }

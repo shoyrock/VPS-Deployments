@@ -3,15 +3,15 @@
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     exec sudo bash "$0" "$@"
 fi
-# deploy-yunohost.sh — Hardened VPS Deployment for YunoHost + NPM
-# v2.1.0-yunohost | Usage: chmod +x deploy-yunohost.sh && sudo ./deploy-yunohost.sh
+# deploy-yunohost.sh — Hardened VPS Deployment for YunoHost + NPM + CrowdSec
+# v3.0.0-crowdsec | Usage: chmod +x deploy-yunohost.sh && sudo ./deploy-yunohost.sh
 #
 # YunoHost ONLY supports Debian 12 (Bookworm) or newer.
-# It explicitly rejects Ubuntu and all RHEL-based distributions.
+# CrowdSec replaces YunoHost's fail2ban for IPS.
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="2.1.0-yunohost"
+readonly SCRIPT_VERSION="3.0.0-crowdsec"
 readonly SCRIPT_NAME="deploy-yunohost.sh"
 readonly START_TIME=$(date +%s)
 readonly NPM_DIR="/opt/npm"
@@ -59,11 +59,11 @@ _on_exit() {
     printf "\n"
     if [[ "$DEPLOY_STATUS" == "success" ]]; then
       printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
-      printf "${C_B}${C_GRN}║                   ✅  DEPLOYMENT COMPLETED SUCCESSFULLY                      ║${C_R}\n"
+      printf "${C_B}${C_GRN}║                    ✅  DEPLOYMENT COMPLETED SUCCESSFULLY                      ║${C_R}\n"
       printf "${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
     else
       printf "${C_B}${C_RED}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
-      printf "${C_B}${C_RED}║                     ❌  DEPLOYMENT DID NOT COMPLETE                          ║${C_R}\n"
+      printf "${C_B}${C_RED}║                     ❌  DEPLOYMENT DID NOT COMPLETE                           ║${C_R}\n"
       printf "${C_B}${C_RED}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
     fi
     printf "${C_B}║  Elapsed:   ${C_CYN}%dm %ds${C_R}${C_B}                                                          ║${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
@@ -310,115 +310,40 @@ COMPOSE
   success "NPM deployed: http://${ip}:81"
 }
 
-## FAIL2BAN
-setup_fail2ban() {
-  step "Fail2Ban"
-
-  apt-get install -y -qq fail2ban
-  local banaction="ufw"
-
-  # NPM uses a CUSTOM access log format — IP is inside [Client IP], not at start.
-  # Built-in fail2ban nginx filters will NOT match. Custom filter required.
-  local fdir="/etc/fail2ban/filter.d"
-  mkdir -p "$fdir"
-
-  cat > "${fdir}/npm-access.conf" << 'FILTER'
-# Fail2Ban filter for NPM access logs. NPM uses custom format;
-# standard nginx filters will NOT match. Matches 401/403/404 responses.
-[Definition]
-failregex = ^.*\s+(?:401|403|404)\s+.*\[Client\s+<HOST>\]\s+\[Length\s+\d+\]\s+.*$
-ignoreregex = ^.*\s+(?:404)\s+.*".*\.(?:png|jpe?g|gif|ico|svg|css|js|ttf|woff2?|eot|map)(?:\?[^"]*)?"\s+.*$
-FILTER
-
-  if [[ ! -f "${fdir}/nginx-http-auth.conf" ]]; then
-    cat > "${fdir}/nginx-http-auth.conf" << 'FILTER'
-[Definition]
-failregex = ^ \[error\] \d+#\d+: \*\d+ user "[^"]*":? (password mismatch|was not found in "[^"]*"|login attempt failed), client: <HOST>, server: \S*, request: "\S+ \S+ HTTP/\d+\.\d+", host: "\S+"\s*$
-ignoreregex =
-datepattern = {^LN-BEG}%%ExY(?#\s)-(?#\s)%%m(?#\s)-(?#\s)%%d(?#\s)%%H(?#\s):(?#\s)%%M(?#\s):(?#\s)%%S(?:\.%f)?(?:\s+%%z)?
-              ^[^\[]*\[({DATE})\s+[-+]\d{4}\]
-FILTER
+## CROWDSEC
+setup_crowdsec() {
+  step "CrowdSec"
+  if command -v cscli &>/dev/null; then
+    info "CrowdSec already installed"
+  else
+    curl -s https://install.crowdsec.net | bash -s -- -d debian >> "$LOG_FILE" 2>&1 || { warn "CrowdSec repo setup failed"; return; }
+    apt-get install -y -qq crowdsec >> "$LOG_FILE" 2>&1 || { warn "CrowdSec install failed"; return; }
   fi
 
-  if [[ ! -f "${fdir}/nginx-botsearch.conf" ]]; then
-    cat > "${fdir}/nginx-botsearch.conf" << 'FILTER'
-[Definition]
-failregex = ^<HOST>.*"(\.\.\\|\\%\\%|\%[0-9a-fA-F][0-9a-fA-F]|\.(git|svn|htaccess|env|ssh|idea|vscode)).*".*(404|403|500)
-            ^.*(404|403|500).*[Cc]lient\s+<HOST>.*".*(admin|wp-login|phpmyadmin|xmlrpc|config\.xml|\.env|wp-config).*"
-ignoreregex =
-FILTER
+  info "Installing CrowdSec collections..."
+  cscli collections install crowdsecurity/sshd 2>/dev/null || true
+  cscli collections install crowdsecurity/nginx-proxy-manager 2>/dev/null || true
+  cscli collections install crowdsecurity/linux 2>/dev/null || true
+
+  info "Installing firewall bouncer..."
+  dpkg -l crowdsec-firewall-bouncer-iptables &>/dev/null || apt-get install -y -qq crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
+
+  systemctl enable --now crowdsec >> "$LOG_FILE" 2>&1 || true
+  systemctl enable --now crowdsec-firewall-bouncer 2>/dev/null || true
+
+  # Disable YunoHost's fail2ban to avoid conflicts with CrowdSec
+  if systemctl is-active --quiet fail2ban 2>/dev/null; then
+    info "Disabling YunoHost-managed fail2ban (CrowdSec handles IPS now)..."
+    systemctl stop fail2ban
+    systemctl disable fail2ban
   fi
-
-  mkdir -p "$NPM_LOGS_DIR"
-  touch "${NPM_LOGS_DIR}/fallback_http_access.log" \
-        "${NPM_LOGS_DIR}/fallback_http_error.log" \
-        "${NPM_LOGS_DIR}/default-host_access.log" \
-        "${NPM_LOGS_DIR}/default-host_error.log" 2>/dev/null || true
-
-  cat > /etc/fail2ban/jail.local << EOF
-# Auto-generated by ${SCRIPT_NAME} v${SCRIPT_VERSION} on $(date -Iseconds)
-#
-# CRITICAL: NPM uses a CUSTOM access log format. Built-in nginx-* filters
-# will NOT match. We use a custom 'npm-access' filter for access logs.
-# Log files are at: ${NPM_LOGS_DIR}/
-
-[DEFAULT]
-bantime   = 3600
-findtime  = 600
-maxretry  = 5
-banaction = ${banaction}
-allowipv6 = auto
-
-[sshd]
-enabled  = true
-port     = ssh
-filter   = sshd
-backend  = systemd
-maxretry = 3
-
-# NPM error logs use standard nginx format → built-in filter works.
-[npm-auth]
-enabled  = true
-port     = 81
-filter   = nginx-http-auth
-backend  = auto
-logpath  = ${NPM_LOGS_DIR}/*_error.log
-maxretry = 3
-findtime = 60
-
-# Uses CUSTOM npm-access filter (built-in filters BROKEN on NPM access logs).
-[npm-forceful-browsing]
-enabled  = true
-port     = 81
-filter   = npm-access
-backend  = auto
-logpath  = ${NPM_LOGS_DIR}/*_access.log
-maxretry = 15
-findtime = 60
-bantime  = 3600
-
-# Only reads error logs (access log pattern differs).
-[npm-botsearch]
-enabled  = true
-port     = 81
-filter   = nginx-botsearch
-backend  = auto
-logpath  = ${NPM_LOGS_DIR}/*_error.log
-maxretry = 2
-findtime = 600
-bantime  = 86400
-
-# DISABLED: nginx-badbots — uses apache-badbots filter expecting standard access log.
-# DISABLED: nginx-limit-req — NPM doesn't configure rate limiting by default.
-EOF
-
-  mkdir -p /var/log/fail2ban
-  systemctl restart fail2ban && systemctl enable fail2ban
 
   sleep 2
-  local jails; jails=$(fail2ban-client status 2>/dev/null | grep "Jail list" | sed 's/.*://' | tr -d ' ' || true)
-  [[ -n "$jails" ]] && success "Active jails: ${jails}" || warn "Check jails: fail2ban-client status"
-  success "Fail2Ban configured"
+  if systemctl is-active --quiet crowdsec 2>/dev/null; then
+    success "CrowdSec active (local mode)"
+  else
+    warn "CrowdSec not running — check ${LOG_FILE}"
+  fi
 }
 
 ## LOG ROTATION
@@ -492,7 +417,7 @@ ${C_B}${C_CYN}── YUNOHOST ──${C_R}
       --username admin --password 'YourSecurePassword123'
   Admin:    https://your-domain.com/yunohost/admin
   CLI:      yunohost --help
-  Services: nginx, dnsmasq, nftables (YunoHost-managed), fail2ban, postfix, dovecot
+  Services: nginx, dnsmasq, nftables (YunoHost-managed), CrowdSec, postfix, dovecot
 
 ${C_B}${C_CYN}── NGINX PROXY MANAGER ──${C_R}
   Admin:    http://${ip}:81  (admin@example.com / changeme)
@@ -502,10 +427,9 @@ ${C_B}${C_CYN}── NGINX PROXY MANAGER ──${C_R}
   SSL:      ${NPM_LE_DIR}
   Logs:     ${NPM_LOGS_DIR}
 
-${C_B}${C_CYN}── FAIL2BAN JAILS ──${C_R}
-  Config:   /etc/fail2ban/jail.local
-  Filters:  /etc/fail2ban/filter.d/npm-access.conf (custom)
-  Jails:    sshd, npm-auth, npm-forceful-browsing, npm-botsearch
+${C_B}${C_CYN}── CROWDSEC ──${C_R}
+  Status:   cscli metrics    cscli decisions list
+  Config:   /etc/crowdsec/
 
 ${C_B}${C_CYN}── PORTS ──${C_R}
   22   SSH         Server access
@@ -547,12 +471,12 @@ main() {
   install_docker
   setup_docker_network
   setup_nginx_proxy_manager
-  setup_fail2ban
+  setup_crowdsec
   setup_yunohost_firewall_npm
   setup_logrotate
 
   DEPLOY_STATUS="success"
-  DEPLOYED_SERVICES="YunoHost,NPM,Fail2Ban"
+  DEPLOYED_SERVICES="YunoHost,NPM,CrowdSec"
 
   print_summary
 }

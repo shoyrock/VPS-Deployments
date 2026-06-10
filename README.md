@@ -12,7 +12,7 @@
 
 ---
 
-One-shot, hardened deployment scripts for fresh VPS instances. Every script includes **Nginx Proxy Manager** (main reverse proxy + SSL), **Fail2Ban** (with custom filters for NPM's log format), and **firewall rules**.
+One-shot, hardened deployment scripts for fresh VPS instances. Every script includes **Nginx Proxy Manager** (main reverse proxy + SSL), **CrowdSec** (IP firewall with NPM-aware collections), and **firewall rules**.
 
 ---
 
@@ -161,11 +161,11 @@ INTERNET ──► UFW/Firewalld ──► NPM (80/443/81) ──► Docker prox
 
 **Only 3 ports are exposed to the internet.** All tool containers are internal-only — no host ports. They communicate with NPM via Docker's internal `proxy` network using their hostnames. NPM is the single entry point for all HTTP/HTTPS traffic.
 
-**Fail2Ban** (all scripts) includes:
-- `sshd` jail — SSH brute force protection
-- `npm-auth` — NPM login brute force
-- `npm-forceful-browsing` — Bot/scanner detection (custom filter for NPM's log format)
-- `npm-botsearch` — Admin panel enumeration detection
+**CrowdSec** (all scripts) includes:
+- `crowdsecurity/sshd` collection — SSH brute force protection
+- `crowdsecurity/nginx-proxy-manager` collection — NPM-specific attack detection
+- `crowdsecurity/linux` collection — Linux system-wide rules
+- `crowdsec-firewall-bouncer-iptables` — Real-time IP blocking via iptables
 
 ## Authelia 2FA (Portainer, Dockge, Cosmos)
 
@@ -337,10 +337,10 @@ sudo ufw delete allow 81/tcp && sudo ufw reload
 
 | Issue | Fix |
 |-------|-----|
-| `Permission denied to socket` | Use `sudo` for `fail2ban-client` |
+| `Permission denied to socket` | Use `sudo` for `docker` commands |
 | Containers unreachable | `grep DEFAULT_FORWARD_POLICY /etc/default/ufw` — should be `ACCEPT` |
 | Port 80/443 conflict | `ss -tlnp \| grep ':80 '` — another service may still be bound |
-| Fail2Ban not catching | `sudo fail2ban-regex -v /opt/npm/data/logs/proxy-host-1_access.log /etc/fail2ban/filter.d/npm-access.conf` (or `/opt/<tool>-stack/data/logs/` for unified stacks) |
+| CrowdSec not catching | `sudo cscli metrics && sudo cscli decisions list` |
 | Script failed | Check `/var/log/vps-deploy.log` |
 
 ### Restarting Stacks
