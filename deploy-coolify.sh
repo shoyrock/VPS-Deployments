@@ -2,54 +2,19 @@
 # Auto-elevate to root if not already running as root
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     exec sudo bash "$0" "$@"
-fi
-# deploy-coolify.sh — Docker + NPM + Coolify + CrowdSec (v3.0.0-crowdsec)
-# Idempotent VPS deployment. Usage: sudo ./deploy-coolify.sh
-# NPM owns ports 80/443. Coolify UI on 8000, proxied through NPM.
-# Coolify's Traefik is stopped to avoid port conflicts.
-set -euo pipefail
-IFS=$'\n\t'
+  fi
 
-readonly SCRIPT_VERSION="3.0.0-crowdsec"
-readonly SCRIPT_NAME="deploy-coolify.sh"
-readonly START_TIME=$(date +%s)
-readonly COOLIFY_DIR="/data/coolify"
-readonly NPM_DIR="/opt/npm"
-readonly NPM_DATA_DIR="${NPM_DIR}/data"
-readonly NPM_LE_DIR="${NPM_DIR}/letsencrypt"
-readonly NPM_LOGS_DIR="${NPM_DATA_DIR}/logs"
-readonly CROWDSEC_DIR="${NPM_DIR}/crowdsec"
-readonly LOG_FILE="/var/log/vps-deploy.log"
-
-# Colors (TTY only)
-if [[ -t 1 ]]; then
-  C_R='\033[0m'; C_B='\033[1m'; C_RED='\033[0;31m'; C_GRN='\033[0;32m'
-  C_YEL='\033[0;33m'; C_BLU='\033[0;34m'; C_CYN='\033[0;36m'; C_DIM='\033[2m'
-else
-  C_R=''; C_B=''; C_RED=''; C_GRN=''; C_YEL=''; C_BLU=''; C_CYN=''; C_DIM=''
-fi
-
-_ts() { date '+%Y-%m-%d %H:%M:%S'; }
-_log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}" >> "$LOG_FILE" 2>/dev/null || true; }
-info()    { printf "${C_BLU}ℹ${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
-warn()    { printf "${C_YEL}⚠${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
-error()   { printf "${C_RED}✖${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }
-success() { printf "${C_GRN}✔${C_R}  %s\n" "$*"; _log "SUCCESS" "$@"; }
-fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; DEPLOY_STATUS="failed"; exit 1; }
-step()    { printf "\n${C_B}${C_CYN}── %s ──${C_R}\n" "$*"; _log "STEP" "$@"; }
-
-# Deployment status tracking
-DEPLOY_STATUS="in_progress"
-DEPLOYED_SERVICES=""
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# EXTERNAL IP
-# ═══════════════════════════════════════════════════════════════════════════════
-get_external_ip() {
-  curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
-  curl -s -4 --max-time 10 https://ifconfig.me 2>/dev/null || \
-  curl -s -4 --max-time 10 https://icanhazip.com 2>/dev/null || \
-  echo "unknown"
+  if command -v crowdsec &>/dev/null || command -v cscli &>/dev/null; then
+    info "Removing native crowdsec (conflicts with Docker CrowdSec on port 8080)..."
+    systemctl stop crowdsec crowdsec-firewall-bouncer 2>/dev/null || true
+    systemctl disable crowdsec crowdsec-firewall-bouncer 2>/dev/null || true
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+      apt-get remove -y -qq crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
+    else
+      local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
+      $pkg remove -y -q crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
+    fi
+  fi
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -509,15 +474,7 @@ BOUNCER_SERVICE
     success "Firewall bouncer binary installed"
   else
     popd &>/dev/null; rm -rf "$tmpdir"
-    warn "Binary download failed -- trying apt..."
-    if [[ "$OS_FAMILY" == "debian" ]]; then
-      apt-get install -y -qq crowdsec-firewall-bouncer-nftables >> "$LOG_FILE" 2>&1 || \
-      apt-get install -y -qq crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
-    else
-      local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
-      $pkg install -y -q crowdsec-firewall-bouncer-nftables >> "$LOG_FILE" 2>&1 || \
-      $pkg install -y -q crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
-    fi
+    fatal "Firewall bouncer download failed -- check network connectivity"
   fi
 
   docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true

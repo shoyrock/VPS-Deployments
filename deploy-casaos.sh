@@ -159,6 +159,18 @@ idempotent_cleanup() {
   fi
   info "Removing old config directories..."
   rm -rf /opt/npm /casaos 2>/dev/null || true
+
+  if command -v crowdsec &>/dev/null || command -v cscli &>/dev/null; then
+    info "Removing native crowdsec (conflicts with Docker CrowdSec on port 8080)..."
+    systemctl stop crowdsec crowdsec-firewall-bouncer 2>/dev/null || true
+    systemctl disable crowdsec crowdsec-firewall-bouncer 2>/dev/null || true
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+      apt-get remove -y -qq crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
+    else
+      local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
+      $pkg remove -y -q crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
+    fi
+  fi
 }
 
 
@@ -776,15 +788,7 @@ BOUNCER_SERVICE
     success "Firewall bouncer binary installed"
   else
     popd &>/dev/null; rm -rf "$tmpdir"
-    warn "Binary download failed -- trying apt..."
-    if [[ "$OS_FAMILY" == "debian" ]]; then
-      apt-get install -y -qq crowdsec-firewall-bouncer-nftables >> "$LOG_FILE" 2>&1 || \
-      apt-get install -y -qq crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
-    else
-      local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
-      $pkg install -y -q crowdsec-firewall-bouncer-nftables >> "$LOG_FILE" 2>&1 || \
-      $pkg install -y -q crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
-    fi
+    fatal "Firewall bouncer download failed -- check network connectivity"
   fi
 
   docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true

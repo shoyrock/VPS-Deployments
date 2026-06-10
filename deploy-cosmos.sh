@@ -16,7 +16,7 @@ readonly COSMOS_DATA_DIR="/opt/cosmos-stack/cosmos-data"
 readonly NPM_DATA_DIR="${STACK_DIR}/data"
 readonly NPM_LE_DIR="${STACK_DIR}/letsencrypt"
 readonly NPM_LOGS_DIR="${NPM_DATA_DIR}/logs"
-readonly CROWDSEC_DIR="${NPM_DIR}/crowdsec"
+readonly CROWDSEC_DIR="${STACK_DIR}/crowdsec"
 readonly LOG_FILE="/var/log/vps-deploy.log"
 
 # -- Authelia paths --
@@ -821,15 +821,7 @@ BOUNCER_SERVICE
     success "Firewall bouncer binary installed"
   else
     popd &>/dev/null; rm -rf "$tmpdir"
-    warn "Binary download failed -- trying apt..."
-    if [[ "$OS_FAMILY" == "debian" ]]; then
-      apt-get install -y -qq crowdsec-firewall-bouncer-nftables >> "$LOG_FILE" 2>&1 || \
-      apt-get install -y -qq crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
-    else
-      local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
-      $pkg install -y -q crowdsec-firewall-bouncer-nftables >> "$LOG_FILE" 2>&1 || \
-      $pkg install -y -q crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
-    fi
+    fatal "Firewall bouncer download failed -- check network connectivity"
   fi
 
   docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
@@ -851,6 +843,40 @@ BOUNCER
     success "Firewall bouncer registered"
   else
     warn "Could not register firewall bouncer -- run manually: docker exec crowdsec cscli bouncers add my-bouncer"
+  fi
+}
+
+idempotent_cleanup() {
+  step "Cleanup"
+  if command -v docker &>/dev/null; then
+    info "Removing ALL existing containers and volumes..."
+    docker ps -aq 2>/dev/null | xargs -r docker stop &>/dev/null || true
+    docker ps -aq 2>/dev/null | xargs -r docker rm -f &>/dev/null || true
+    docker volume ls -q 2>/dev/null | xargs -r docker volume rm -f &>/dev/null || true
+  fi
+
+  if [[ -d "${STACK_DIR}" ]]; then
+    info "Removing previous stack directory: ${STACK_DIR}"
+    rm -rf "${STACK_DIR}" 2>/dev/null || true
+  fi
+
+  if [[ "$OS_FAMILY" == "debian" ]]; then
+    dpkg -l 2>/dev/null | grep -E "docker|containerd|runc" | awk '{print $2}' | xargs -r apt-get remove -y -qq &>/dev/null || true
+    apt-get autoremove -y -qq &>/dev/null || true
+  else
+    yum remove -y -q docker-ce docker-ce-cli containerd.io 2>/dev/null || true
+  fi
+
+  if command -v crowdsec &>/dev/null || command -v cscli &>/dev/null; then
+    info "Removing native crowdsec (conflicts with Docker CrowdSec on port 8080)..."
+    systemctl stop crowdsec crowdsec-firewall-bouncer 2>/dev/null || true
+    systemctl disable crowdsec crowdsec-firewall-bouncer 2>/dev/null || true
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+      apt-get remove -y -qq crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
+    else
+      local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
+      $pkg remove -y -q crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables >> "$LOG_FILE" 2>&1 || true
+    fi
   fi
 }
 
