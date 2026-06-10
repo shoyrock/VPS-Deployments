@@ -273,8 +273,8 @@ install_docker() {
   systemctl is-active --quiet docker || fatal "Docker daemon failed. Check: journalctl -u docker -n 50"
   info "Verifying Docker..."
   for i in {1..3}; do docker run --rm hello-world &>/dev/null && break; sleep 5; done
-  docker compose version &>/dev/null || fatal "Docker Compose plugin missing."
-  success "Docker $(docker version --format '{{.Server.Version}}') + Compose $(docker compose version --short)"
+  docker compose version &>/dev/null && success "Docker $(docker version --format '{{.Server.Version}}') + Compose $(docker compose version --short)" || \
+    success "Docker $(docker version --format '{{.Server.Version}}')"
 }
 
 setup_docker_network() {
@@ -544,44 +544,41 @@ setup_portainer_standalone() {
 }
 
 setup_stack() {
-  step "Deploying NPM + Authelia + CrowdSec Stack"
-  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR" && cd "$STACK_DIR"
+  step "Deploying NPM, Authelia, CrowdSec (separate compose files)"
+  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR" "$AUTHELIA_CONFIG_DIR" "$AUTHELIA_SECRETS_DIR"
 
-  local authelia_config_path="${AUTHELIA_CONFIG_DIR}"
-  local authelia_secrets_path="${AUTHELIA_SECRETS_DIR}"
-
-  cat > docker-compose.yml << COMPOSE
+  cat > "${STACK_DIR}/docker-compose.npm.yml" << 'COMPOSE_NPM'
 services:
   npm:
-    image: 'jc21/nginx-proxy-manager:latest'
+    image: jc21/nginx-proxy-manager:latest
     restart: always
     container_name: npm
     hostname: npm
     ports:
-      - '0.0.0.0:80:80'
-      - '0.0.0.0:443:443'
-      - '0.0.0.0:81:81'
+      - 0.0.0.0:80:80
+      - 0.0.0.0:443:443
+      - 0.0.0.0:81:81
     volumes:
       - ./data:/data
       - ./letsencrypt:/etc/letsencrypt
     networks:
       - proxy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:81/"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+networks:
+  proxy:
+    external: true
+COMPOSE_NPM
 
+  cat > "${STACK_DIR}/docker-compose.authelia.yml" << 'COMPOSE_AUTHELIA'
+services:
   authelia:
     image: authelia/authelia:latest
     container_name: authelia
-    user: "0:0"
     hostname: authelia
     restart: always
+    user: "0:0"
     volumes:
-      - ${authelia_config_path}:/config
-      - ${authelia_secrets_path}:/config/secrets:ro
+      - ./authelia/config:/config
+      - ./authelia/secrets:/config/secrets:ro
     environment:
       - AUTHELIA_JWT_SECRET_FILE=/config/secrets/jwt_session
       - AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE=/config/secrets/storage_encryption
@@ -590,44 +587,42 @@ services:
       - TZ=America/New_York
     networks:
       - proxy
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "--timeout=3", "http://127.0.0.1:9091/api/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+networks:
+  proxy:
+    external: true
+COMPOSE_AUTHELIA
 
+  cat > "${STACK_DIR}/docker-compose.crowdsec.yml" << 'COMPOSE_CROWDSEC'
+services:
   crowdsec:
     image: crowdsecurity/crowdsec:latest
     container_name: crowdsec
     hostname: crowdsec
     restart: unless-stopped
-    environment:
-      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux
-      - TZ=UTC
+    ports:
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./crowdsec/data:/var/lib/crowdsec/data
       - ./crowdsec/config:/etc/crowdsec
       - ./data/logs:/npm-logs:ro
       - /var/log:/var/log:ro
-    ports:
-      - "127.0.0.1:8080:8080"
+    environment:
+      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux
+      - TZ=UTC
     networks:
       - proxy
-
 networks:
   proxy:
     external: true
-COMPOSE
+COMPOSE_CROWDSEC
 
   info "Pulling Docker images (NPM, Authelia, CrowdSec) — this may take a few minutes..."
-  docker compose pull
-  docker rm -f npm 2>/dev/null || true
-  docker rm -f authelia 2>/dev/null || true
-  docker rm -f crowdsec 2>/dev/null || true
+  docker compose -f "${STACK_DIR}/docker-compose.npm.yml" pull
+  docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" pull
+  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" pull
 
-  info "Starting containers — please wait..."
-  docker compose up -d
+  info "Starting NPM..."
+  docker compose -f "${STACK_DIR}/docker-compose.npm.yml" up -d
 
   info "Verifying NPM ports (80, 443, 81) are bound..."
   local ports_ok=false
@@ -687,6 +682,8 @@ COMPOSE
   done
   printf "\n"
 
+  info "Starting Authelia..."
+  docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" up -d
   info "Waiting for Authelia to be ready..."
   for i in $(seq 1 40); do
     docker exec authelia wget -qO- --timeout=5 http://127.0.0.1:9091/api/health &>/dev/null && { success "Authelia ready"; break; }
@@ -697,6 +694,8 @@ COMPOSE
   done
   printf "\n"
 
+  info "Starting CrowdSec..."
+  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d
   info "Waiting for CrowdSec container to be ready..."
   for i in $(seq 1 30); do
     docker ps --format '{{.Names}}' | grep -qx "crowdsec" && { success "CrowdSec container running"; break; }
@@ -958,7 +957,7 @@ ${C_B}${C_YEL}══════════════════════
   Snippets:  ${AUTHELIA_SNIPPETS_DIR}
 
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
-${C_B}Compose${C_R}   $(docker compose version --short 2>/dev/null || echo N/A)
+${C_B}Containers${C_R}  npm, authelia, crowdsec, portainer (separate compose files)
 ${C_B}Network${C_R}   proxy (bridge)
 
 ${C_B}CrowdSec${C_R}  Collections: sshd, nginx-proxy-manager, linux
@@ -1019,7 +1018,11 @@ ${C_B}NGINX Snippets (for NPM Advanced tab):${C_R}
 
 ${C_B}Troubleshooting:${C_R}
   Logs:    docker logs -f npm    docker logs -f portainer    docker logs -f authelia
-  Restart: cd ${STACK_DIR} && docker compose restart
+  NPM:      cd ${STACK_DIR} && docker compose -f docker-compose.npm.yml restart
+  Authelia: cd ${STACK_DIR} && docker compose -f docker-compose.authelia.yml restart
+  CrowdSec: cd ${STACK_DIR} && docker compose -f docker-compose.crowdsec.yml restart
+  CS-CLI:   docker exec crowdsec cscli metrics    docker exec crowdsec cscli decisions list
+  FW:       ${C_B}CrowdSec bouncer${C_R}
   CS:      cscli metrics    cscli decisions list    cscli collections list
   FW:      ${fw_cmd}
   Log:     ${LOG_FILE}

@@ -249,8 +249,8 @@ install_docker() {
     docker run --rm hello-world &>/dev/null && break
     sleep 5
   done
-  docker compose version &>/dev/null || fatal "Docker Compose plugin missing."
-  success "Docker $(docker version --format '{{.Server.Version}}') + Compose $(docker compose version --short)"
+  docker compose version &>/dev/null && success "Docker $(docker version --format '{{.Server.Version}}') + Compose $(docker compose version --short)" || \
+    success "Docker $(docker version --format '{{.Server.Version}}')"
 }
 
 setup_docker_network() {
@@ -276,36 +276,32 @@ setup_docker_swarm() {
 
 setup_nginx_proxy_manager() {
   step "Nginx Proxy Manager"
-  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" && cd "$NPM_DIR"
-  cat > docker-compose.yml << 'COMPOSE'
+  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR"
+
+  cat > "${NPM_DIR}/docker-compose.npm.yml" << 'COMPOSE_NPM'
 services:
-  app:
-    image: 'jc21/nginx-proxy-manager:latest'
+  npm:
+    image: jc21/nginx-proxy-manager:latest
     restart: always
     container_name: npm
     ports:
-      - '0.0.0.0:80:80'
-      - '0.0.0.0:443:443'
-      - '0.0.0.0:81:81'
+      - 0.0.0.0:80:80
+      - 0.0.0.0:443:443
+      - 0.0.0.0:81:81
     volumes:
       - ./data:/data
       - ./letsencrypt:/etc/letsencrypt
     networks:
       - proxy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:81/"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-
 networks:
   proxy:
     external: true
-COMPOSE
+COMPOSE_NPM
 
-  docker compose pull
-  docker compose up -d
+  docker compose -f "${NPM_DIR}/docker-compose.npm.yml" pull
+
+  info "Starting NPM..."
+  docker compose -f "${NPM_DIR}/docker-compose.npm.yml" up -d
 
   info "Verifying NPM ports (80, 443, 81) are bound..."
   local ports_ok=false
@@ -386,52 +382,17 @@ setup_dokploy() {
 
 setup_portainer() {
   step "Portainer CE"
-  mkdir -p "$PORTAINER_DIR" "$CROWDSEC_DIR" && cd "$PORTAINER_DIR"
-  cat > docker-compose.yml << 'COMPOSE'
-services:
-  portainer:
-    image: 'portainer/portainer-ce:latest'
-    restart: always
-    container_name: portainer
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - portainer_data:/data
-    networks:
-      - proxy
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9000/api/status"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
+  mkdir -p "$PORTAINER_DIR" "$CROWDSEC_DIR"
 
-volumes:
-  portainer_data:
+  docker rm -f portainer 2>/dev/null || true
+  docker run -d --name portainer \
+    --restart always \
+    --network proxy \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v portainer_data:/data \
+    portainer/portainer-ce:latest
 
-networks:
-  proxy:
-    external: true
-
-  crowdsec:
-    image: crowdsecurity/crowdsec:latest
-    container_name: crowdsec
-    hostname: crowdsec
-    restart: unless-stopped
-    environment:
-      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux
-      - TZ=UTC
-    volumes:
-      - ./crowdsec/data:/var/lib/crowdsec/data
-      - ./crowdsec/config:/etc/crowdsec
-      - ./data/logs:/npm-logs:ro
-      - /var/log:/var/log:ro
-    ports:
-      - "127.0.0.1:8080:8080"
-    networks:
-      - proxy
-COMPOSE
-
-  docker compose pull && docker compose up -d
+  docker pull portainer/portainer-ce:latest
 
   info "Waiting for Portainer (please wait)..."
   for i in $(seq 1 40); do
@@ -554,7 +515,7 @@ ${C_B}${C_CYN}-- SERVICES --${C_R}
   Note: Dokploy has native 2FA in Settings → Security
 
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
-${C_B}Compose${C_R}   $(docker compose version --short 2>/dev/null || echo N/A)
+${C_B}Containers${C_R}  npm, portainer, crowdsec (separate compose files)
 ${C_B}Network${C_R}   proxy (bridge)
 
 ${C_B}CrowdSec${C_R}  Collections: sshd, nginx-proxy-manager, linux
@@ -622,7 +583,9 @@ fi)
 
 ${C_B}${C_CYN}-- TROUBLESHOOTING --${C_R}
 
-  NPM:        docker logs -f npm    cd ${NPM_DIR} && docker compose restart
+  NPM:        cd ${NPM_DIR} && docker compose -f docker-compose.npm.yml restart
+  CrowdSec:   cd ${NPM_DIR} && docker compose -f docker-compose.crowdsec.yml restart
+  Portainer:  docker restart portainer
   Dokploy:    docker service ls && docker service logs dokploy
   Portainer:  docker logs -f portainer
   CrowdSec:   cscli metrics    cscli decisions list
@@ -636,6 +599,35 @@ EOF
 
 setup_crowdsec() {
   step "CrowdSec (Docker)"
+
+  mkdir -p "$CROWDSEC_DIR"
+
+  cat > "${NPM_DIR}/docker-compose.crowdsec.yml" << 'COMPOSE_CROWDSEC'
+services:
+  crowdsec:
+    image: crowdsecurity/crowdsec:latest
+    container_name: crowdsec
+    hostname: crowdsec
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./crowdsec/data:/var/lib/crowdsec/data
+      - ./crowdsec/config:/etc/crowdsec
+      - ./data/logs:/npm-logs:ro
+      - /var/log:/var/log:ro
+    environment:
+      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux
+      - TZ=UTC
+    networks:
+      - proxy
+networks:
+  proxy:
+    external: true
+COMPOSE_CROWDSEC
+
+  docker compose -f "${NPM_DIR}/docker-compose.crowdsec.yml" pull
+  docker compose -f "${NPM_DIR}/docker-compose.crowdsec.yml" up -d
 
   info "Waiting for CrowdSec container to be ready..."
   local cs_ready=false

@@ -350,63 +350,61 @@ USEREOF
 }
 
 setup_stack() {
-  step "Deploying Stack (NPM + Cosmos + Authelia)"
-  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$COSMOS_DATA_DIR" "$CROWDSEC_DIR" && cd "$STACK_DIR"
+  step "Deploying Stack (NPM + Cosmos + Authelia + CrowdSec)"
+  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$COSMOS_DATA_DIR" "$CROWDSEC_DIR"
 
-  cat > docker-compose.yml << 'COMPOSE'
+  cat > "${STACK_DIR}/docker-compose.npm.yml" << 'COMPOSE_NPM'
 services:
   npm:
-    image: 'jc21/nginx-proxy-manager:latest'
+    image: jc21/nginx-proxy-manager:latest
+    restart: always
     container_name: npm
     hostname: npm
-    restart: always
     ports:
-      - '0.0.0.0:80:80'
-      - '0.0.0.0:443:443'
-      - '0.0.0.0:81:81'
+      - 0.0.0.0:80:80
+      - 0.0.0.0:443:443
+      - 0.0.0.0:81:81
     volumes:
       - ./data:/data
       - ./letsencrypt:/etc/letsencrypt
     networks:
       - proxy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:81/"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+networks:
+  proxy:
+    external: true
+COMPOSE_NPM
 
+  cat > "${STACK_DIR}/docker-compose.cosmos.yml" << 'COMPOSE_COSMOS'
+services:
   cosmos-server:
-    image: 'azukaar/cosmos-server:latest'
+    image: azukaar/cosmos-server:latest
     container_name: cosmos-server
     hostname: cosmos-server
     restart: always
     privileged: true
-    # No host ports -- accessed only via NPM proxy at http://cosmos-server:80
-    # For Constellation VPN, add UDP 4242 via UFW or NPM Stream Hosts
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket
       - /:/mnt/host
-      - /opt/cosmos-stack/cosmos-data:/config
+      - ./cosmos:/config
     networks:
       - proxy
-    healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
+networks:
+  proxy:
+    external: true
+COMPOSE_COSMOS
 
+  cat > "${STACK_DIR}/docker-compose.authelia.yml" << 'COMPOSE_AUTHELIA'
+services:
   authelia:
     image: authelia/authelia:latest
     container_name: authelia
-    user: "0:0"
     hostname: authelia
     restart: always
+    user: "0:0"
     volumes:
-      - /opt/cosmos-stack/authelia/config:/config
-      - /opt/cosmos-stack/authelia/secrets:/config/secrets:ro
+      - ./authelia/config:/config
+      - ./authelia/secrets:/config/secrets:ro
     environment:
       - AUTHELIA_JWT_SECRET_FILE=/config/secrets/jwt_session
       - AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE=/config/secrets/storage_encryption
@@ -415,43 +413,42 @@ services:
       - TZ=America/New_York
     networks:
       - proxy
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "--timeout=3", "http://127.0.0.1:9091/api/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-
 networks:
   proxy:
     external: true
+COMPOSE_AUTHELIA
 
+  cat > "${STACK_DIR}/docker-compose.crowdsec.yml" << 'COMPOSE_CROWDSEC'
+services:
   crowdsec:
     image: crowdsecurity/crowdsec:latest
     container_name: crowdsec
     hostname: crowdsec
     restart: unless-stopped
-    environment:
-      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux
-      - TZ=UTC
+    ports:
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./crowdsec/data:/var/lib/crowdsec/data
       - ./crowdsec/config:/etc/crowdsec
       - ./data/logs:/npm-logs:ro
       - /var/log:/var/log:ro
-    ports:
-      - "127.0.0.1:8080:8080"
+    environment:
+      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux
+      - TZ=UTC
     networks:
       - proxy
-COMPOSE
+networks:
+  proxy:
+    external: true
+COMPOSE_CROWDSEC
 
-  info "Pulling Docker images -- this may take a few minutes..."
-  docker compose pull
-  info "Starting containers -- please wait..."
-  docker rm -f npm 2>/dev/null || true
-  docker rm -f cosmos-server 2>/dev/null || true
-  docker rm -f authelia 2>/dev/null || true
-  docker compose up -d
+  docker compose -f "${STACK_DIR}/docker-compose.npm.yml" pull
+  docker compose -f "${STACK_DIR}/docker-compose.cosmos.yml" pull
+  docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" pull
+  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" pull
+
+  info "Starting NPM..."
+  docker compose -f "${STACK_DIR}/docker-compose.npm.yml" up -d
 
   info "Verifying NPM ports (80, 443, 81) are bound..."
   local ports_ok=false
@@ -511,6 +508,15 @@ COMPOSE
     sleep 2
   done
   printf "\n"
+
+  info "Starting Cosmos Server..."
+  docker compose -f "${STACK_DIR}/docker-compose.cosmos.yml" up -d
+
+  info "Starting Authelia..."
+  docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" up -d
+
+  info "Starting CrowdSec..."
+  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d
 
   info "Waiting for Cosmos Server..."
   for i in $(seq 1 60); do
@@ -653,7 +659,7 @@ EOF
 cat << EOF
 
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
-${C_B}Compose${C_R}   $(docker compose version --short 2>/dev/null || echo N/A)
+${C_B}Containers${C_R}  npm, cosmos-server, authelia, crowdsec (separate compose files)
 ${C_B}Network${C_R}   proxy (bridge)
 
 ${C_B}CrowdSec${C_R}  Collections: sshd, nginx-proxy-manager, linux
@@ -725,7 +731,10 @@ ${C_B}${C_YEL}Step 7 -- Change Default Password${C_R}
 ${C_B}${C_CYN}-- TROUBLESHOOTING --${C_R}
 
   Logs:       docker logs -f npm   docker logs -f cosmos-server   docker logs -f authelia
-  Restart:    cd ${STACK_DIR} && docker compose restart
+  Restart:    cd ${STACK_DIR} && docker compose -f docker-compose.npm.yml restart
+              cd ${STACK_DIR} && docker compose -f docker-compose.cosmos.yml restart
+              cd ${STACK_DIR} && docker compose -f docker-compose.authelia.yml restart
+              cd ${STACK_DIR} && docker compose -f docker-compose.crowdsec.yml restart
   CrowdSec:   cscli metrics    cscli decisions list
   Firewall:   ${fw_cmd}
   Deploy log: ${LOG_FILE}

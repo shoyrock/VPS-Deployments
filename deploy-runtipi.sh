@@ -233,8 +233,8 @@ install_docker() {
   info "Verifying Docker, please wait..."
   for i in {1..3}; do docker run --rm hello-world &>/dev/null && break; printf "${C_DIM}  Verifying Docker... (%d/3)${C_R}\r" "$i"; sleep 5; done
   printf "${C_GRN}✔${C_R}  Docker verified\n"
-  docker compose version &>/dev/null || fatal "Docker Compose plugin missing."
-  success "Docker $(docker version --format '{{.Server.Version}}') + Compose $(docker compose version --short)"
+  docker compose version &>/dev/null && success "Docker $(docker version --format '{{.Server.Version}}') + Compose $(docker compose version --short)" || \
+    success "Docker $(docker version --format '{{.Server.Version}}')"
 }
 
 setup_docker_network() {
@@ -249,55 +249,57 @@ setup_docker_network() {
 
 setup_nginx_proxy_manager() {
   step "Nginx Proxy Manager"
-  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR" && cd "$NPM_DIR"
-  cat > docker-compose.yml << 'COMPOSE'
+  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR"
+
+  cat > "${NPM_DIR}/docker-compose.npm.yml" << 'COMPOSE_NPM'
 services:
-  app:
-    image: 'jc21/nginx-proxy-manager:latest'
+  npm:
+    image: jc21/nginx-proxy-manager:latest
     restart: always
     container_name: npm
     ports:
-      - '0.0.0.0:80:80'
-      - '0.0.0.0:443:443'
-      - '0.0.0.0:81:81'
+      - 0.0.0.0:80:80
+      - 0.0.0.0:443:443
+      - 0.0.0.0:81:81
     volumes:
       - ./data:/data
       - ./letsencrypt:/etc/letsencrypt
     networks:
       - proxy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:81/"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-
 networks:
   proxy:
     external: true
+COMPOSE_NPM
 
+  cat > "${NPM_DIR}/docker-compose.crowdsec.yml" << 'COMPOSE_CROWDSEC'
+services:
   crowdsec:
     image: crowdsecurity/crowdsec:latest
     container_name: crowdsec
     hostname: crowdsec
     restart: unless-stopped
-    environment:
-      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux
-      - TZ=UTC
+    ports:
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./crowdsec/data:/var/lib/crowdsec/data
       - ./crowdsec/config:/etc/crowdsec
       - ./data/logs:/npm-logs:ro
       - /var/log:/var/log:ro
-    ports:
-      - "127.0.0.1:8080:8080"
+    environment:
+      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux
+      - TZ=UTC
     networks:
       - proxy
-COMPOSE
+networks:
+  proxy:
+    external: true
+COMPOSE_CROWDSEC
 
-  docker compose pull
-  info "Starting NPM, please wait..."
-  docker compose up -d
+  docker compose -f "${NPM_DIR}/docker-compose.npm.yml" pull
+  docker compose -f "${NPM_DIR}/docker-compose.crowdsec.yml" pull
+
+  info "Starting NPM..."
+  docker compose -f "${NPM_DIR}/docker-compose.npm.yml" up -d
 
   info "Verifying NPM ports (80, 443, 81) are bound, please wait..."
   local ports_ok=false
@@ -350,6 +352,9 @@ COMPOSE
     fi
     sleep 2
   done
+
+  info "Starting CrowdSec..."
+  docker compose -f "${NPM_DIR}/docker-compose.crowdsec.yml" up -d
 
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
   success "NPM deployed: http://${ip}:81"
@@ -481,7 +486,7 @@ ${C_B}Runtipi${C_R}
   Network:   proxy
 
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
-${C_B}Compose${C_R}   $(docker compose version --short 2>/dev/null || echo N/A)
+${C_B}Containers${C_R}  npm, crowdsec, runtipi (separate compose files)
 ${C_B}Network${C_R}   proxy (bridge)
 
 ${C_B}CrowdSec${C_R}  Collections: sshd, nginx-proxy-manager, linux
@@ -516,7 +521,7 @@ ${C_B}${C_YEL}Step 3 — SSL Certificate${C_R}
 
 ${C_B}${C_YEL}Step 4 — Secure Admin Port${C_R}
   $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "  ufw delete allow 81/tcp && ufw reload"; else echo "  firewall-cmd --permanent --remove-port=81/tcp && firewall-cmd --reload"; fi)${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
-${C_B}Compose${C_R}   $(docker compose version --short 2>/dev/null || echo N/A)
+${C_B}Containers${C_R}  npm, crowdsec, runtipi (separate compose files)
 ${C_B}Network${C_R}   proxy (bridge)
 
 ${C_B}CrowdSec${C_R}
@@ -549,7 +554,9 @@ ${C_B}${C_CYN}-- TROUBLESHOOTING --${C_R}
 
   Logs:       docker logs -f npm
               docker logs -f tipi-reverse-proxy
-  Restart:    cd ${NPM_DIR} && docker compose restart
+${C_B}Restart${C_R}
+  NPM:      cd ${NPM_DIR} && docker compose -f docker-compose.npm.yml restart
+  CrowdSec: cd ${NPM_DIR} && docker compose -f docker-compose.crowdsec.yml restart
               cd ${TIPI_DIR} && ./runtipi-cli restart
   CrowdSec:   cscli metrics    cscli decisions list
   Firewall:   ${fw_cmd}
