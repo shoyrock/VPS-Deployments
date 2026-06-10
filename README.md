@@ -167,6 +167,54 @@ INTERNET ──► UFW/Firewalld ──► NPM (80/443/81) ──► Docker prox
 - `npm-forceful-browsing` — Bot/scanner detection (custom filter for NPM's log format)
 - `npm-botsearch` — Admin panel enumeration detection
 
+## Authelia 2FA (Portainer, Dockge, Cosmos)
+
+The three unified stack scripts (Portainer, Dockge, Cosmos) include **Authelia** for two-factor authentication.
+
+### Default Login
+
+| Field | Value |
+|-------|-------|
+| URL | `https://authelia.YOURDOMAIN.com` |
+| Username | `admin` |
+| Password | `authelia` |
+
+**Change this password immediately after first login.**
+
+### Identity Verification Codes
+
+Authelia requires a one-time code for sensitive actions (changing password, adding TOTP). Since email is not configured, codes are written to a file:
+
+```bash
+# Get your verification code
+sudo docker exec authelia cat /config/notifications.txt
+```
+
+Paste the code from that file into the "One-Time Code" dialog, then click **Verify**.
+
+### Change Your Password
+
+1. Login to Authelia with `admin` / `authelia`
+2. You will be prompted for identity verification — get the code from the command above
+3. Go to **Settings** → **Password** → enter new password
+4. Authelia will generate a new hash and update `users.yml` automatically
+
+### Set Up TOTP (Two-Factor Authentication)
+
+1. Login to Authelia
+2. Go to **Settings** → **Two-Factor Authentication** → **One-Time Password** → **Add**
+3. Scan the QR code with your phone's authenticator app (Google Authenticator, Microsoft Authenticator, Authy, etc.)
+4. Enter the 6-digit code to confirm
+5. Now all your dashboards require 2FA
+
+### Protect Dashboards with Authelia
+
+To require Authelia 2FA before accessing a dashboard:
+
+1. In NPM, edit the proxy host's **Advanced** tab
+2. Paste the contents of `/opt/<tool>-stack/authelia/snippets/authelia-authrequest.conf`
+3. Save
+
 ### How Built-in Proxies Are Handled
 
 | Tool | Built-in Proxy | Status | What Script Does |
