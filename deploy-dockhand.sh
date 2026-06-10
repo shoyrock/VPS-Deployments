@@ -406,11 +406,11 @@ services:
     networks:
       - proxy
   crowdsec-dashboard:
-    image: crowdsecurity/crowdsec-dashboard:latest
+    image: partitio/crowdsec-dashboard:latest
     container_name: crowdsec-dashboard
     restart: unless-stopped
     environment:
-      - CS_LAPI_URL=http://crowdsec:8080
+      - CROWDSEC_API_URL=http://crowdsec:8080
     networks:
       - proxy
 networks:

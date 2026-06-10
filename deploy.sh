@@ -13,6 +13,7 @@ fi
 #
 # Direct usage: ./deploy.sh portainer
 #               ./deploy.sh dockge
+#               ./deploy.sh dockhand
 #               ./deploy.sh coolify
 # ═══════════════════════════════════════════════════════════════════════════════
 set -euo pipefail
@@ -85,12 +86,17 @@ TOOL_DESCRIPTIONS[9]="FreedomBox — Debian home server with Cockpit admin"
 TOOL_PORTS[9]="80, 443, 81 (Debian 12 only)"
 TOOL_CATEGORIES[9]="Debian Server Distro"
 
-TOOL_NAMES[10]="harden"
-TOOL_DESCRIPTIONS[10]="🔒 Harden VPS — SSH lockdown, CrowdSec, GeoIP block, auto-updates"
-TOOL_PORTS[10]="—"
-TOOL_CATEGORIES[10]="Security"
+TOOL_NAMES[10]="dockhand"
+TOOL_DESCRIPTIONS[10]="Nginx Proxy Manager + Dockhand — Next-gen Docker manager with SSO"
+TOOL_PORTS[10]="80, 443, 81"
+TOOL_CATEGORIES[10]="NPM + Container Manager"
 
-readonly TOOL_COUNT=10
+TOOL_NAMES[11]="harden"
+TOOL_DESCRIPTIONS[11]="🔒 Harden VPS — SSH lockdown, CrowdSec, GeoIP block, auto-updates"
+TOOL_PORTS[11]="—"
+TOOL_CATEGORIES[11]="Security"
+
+readonly TOOL_COUNT=11
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COLORS & UI
@@ -212,6 +218,7 @@ if [[ $# -gt 0 ]]; then
   case "$requested" in
     portainer|npm|vps)                requested="portainer" ;;
     dockge)                           requested="dockge" ;;
+    dockhand)                         requested="dockhand" ;;
     coolify)                          requested="coolify" ;;
     dokploy)                          requested="dokploy" ;;
 

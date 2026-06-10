@@ -706,12 +706,13 @@ NPM_ACQUIS
   if docker exec crowdsec cat /etc/crowdsec/acquis.d/npm.yaml &>/dev/null; then
     success "NPM acquisition configured"
   else
-    docker exec crowdsec sh -c "mkdir -p /etc/crowdsec/acquis.d && cat > /etc/crowdsec/acquis.d/npm.yaml << 'EOF'
+    docker exec -i crowdsec sh -c "mkdir -p /etc/crowdsec/acquis.d && cat > /etc/crowdsec/acquis.d/npm.yaml" << 'EOF' || true
 filenames:
   - /npm-logs/*.log
 labels:
   type: nginx
-EOF" && warn "NPM acquisition written (via docker exec)" || warn "Could not configure NPM acquisition"
+EOF
+    warn "NPM acquisition written (via docker exec)"
   fi
 
   docker exec crowdsec kill -HUP 1 2>/dev/null || docker restart crowdsec &>/dev/null || true
