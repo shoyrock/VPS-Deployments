@@ -89,6 +89,7 @@ _on_exit() {
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
     printf "${C_B}║  %-72s  ║${C_R}\n" "Portainer: http://portainer.${DOMAIN}"
     printf "${C_B}║  %-72s  ║${C_R}\n" "Authelia:  https://authelia.${DOMAIN}"
+    printf "${C_B}║  %-72s  ║${C_R}\n" "CrowdSec:  http://crowdsec.${DOMAIN}"
     printf "${C_B}║  %-72s  ║${C_R}\n" ""
     printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "Authelia Username: admin"
     printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "Authelia Password: $exit_pass"
@@ -639,6 +640,14 @@ services:
       - TZ=UTC
     networks:
       - proxy
+  crowdsec-dashboard:
+    image: crowdsecurity/crowdsec-dashboard:latest
+    container_name: crowdsec-dashboard
+    restart: unless-stopped
+    environment:
+      - CS_LAPI_URL=http://crowdsec:8080
+    networks:
+      - proxy
 networks:
   proxy:
     external: true
@@ -710,13 +719,21 @@ COMPOSE_CROWDSEC
   done
   printf "\n"
 
-  info "Starting CrowdSec..."
+  info "Starting CrowdSec + Dashboard..."
   docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d
   info "Waiting for CrowdSec container to be ready..."
   for i in $(seq 1 30); do
     docker ps --format '{{.Names}}' | grep -qx "crowdsec" && { success "CrowdSec container running"; break; }
     printf "${C_DIM}  Waiting for CrowdSec container... (%d/30)${C_R}\r" "$i"
     [[ $i -eq 30 ]] && warn "CrowdSec container not found"
+    sleep 2
+  done
+  printf "\n"
+  info "Waiting for CrowdSec Dashboard to be ready..."
+  for i in $(seq 1 30); do
+    docker ps --format '{{.Names}}' | grep -qx "crowdsec-dashboard" && { success "CrowdSec Dashboard ready"; break; }
+    printf "${C_DIM}  Waiting for CrowdSec Dashboard... (%d/30)${C_R}\r" "$i"
+    [[ $i -eq 30 ]] && warn "CrowdSec Dashboard timeout"
     sleep 2
   done
   printf "\n"
@@ -819,7 +836,7 @@ BOUNCER_SERVICE
 
   docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
   local api_key
-  api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer 2>/dev/null | tail -1 || true)
+   api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer 2>/dev/null | grep -oE '[a-f0-9]{32,}' | head -1 || true)
   if [[ -n "$api_key" ]]; then
     mkdir -p /etc/crowdsec
     local fw_mode="iptables"
@@ -946,7 +963,8 @@ ${C_B}CONTAINER  ${C_R}  ${C_B}HOSTNAME     ${C_R}  ${C_B}PORTS              ${C
 ${C_DIM}──────────  ────────────  ─────────────────  ───────────────────────${C_R}
 npm         npm          80, 443, 81        ${ip}:81 (admin)
 authelia    authelia     9091               authelia.${DOMAIN}
-crowdsec    crowdsec     8080 (LAPI)        (internal, no proxy needed)
+crowdsec    crowdsec     8080 (LAPI)        crowdsec.${DOMAIN}
+  dshbrd      dshbrd       3000               crowdsec.${DOMAIN}
 portainer   portainer    9000               portainer.${DOMAIN}
 
 ${C_B}Nginx Proxy Manager${C_R}
@@ -998,6 +1016,7 @@ ${C_B}${C_YEL}Step 1 -- NPM Admin${C_R}
 ${C_B}${C_YEL}Step 2 -- Add DNS Records${C_R}
   A  authelia.${DOMAIN}   → ${ip}
   A  portainer.${DOMAIN}  → ${ip}
+  A  crowdsec.${DOMAIN}   → ${ip}
   A  *.${DOMAIN}          → ${ip}  (wildcard for other services)
 
 ${C_B}${C_YEL}Step 3 -- Add Proxy Hosts in NPM${C_R}
@@ -1023,6 +1042,18 @@ ${C_B}${C_YEL}Step 3 -- Add Proxy Hosts in NPM${C_R}
   └──────────────────────────────────────┘
   Save → SSL tab → Request cert → Force SSL ON
   → Advanced tab: paste contents of authelia-authrequest.conf snippet
+
+  ${C_B}CrowdSec Dashboard:${C_R}
+  ┌──────────────────────────────────────────────┐
+  │ Domain Names:    crowdsec.${DOMAIN}           │
+  │ Scheme:          http                         │
+  │ Forward Host:    crowdsec-dashboard           │
+  │ Forward Port:    3000                         │
+  │ Block Exploits:  ON                           │
+  │ Access List:     Publicly Accessible          │
+  └──────────────────────────────────────────────┘
+  Save → SSL tab → Request cert → Force SSL ON
+  → The dashboard does NOT need Authelia 2FA (read-only metrics)
 
 ${C_B}${C_YEL}Step 4 -- Authelia Setup${C_R}
   Open:   https://authelia.${DOMAIN}

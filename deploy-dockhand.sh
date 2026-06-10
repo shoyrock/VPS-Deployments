@@ -79,6 +79,7 @@ _on_exit() {
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
     printf "${C_B}║  %-72s  ║${C_R}\n" "Dockhand:  http://dockhand.${DOMAIN}"
     printf "${C_B}║  %-72s  ║${C_R}\n" "           http://${ip}:3000 (direct)"
+    printf "${C_B}║  %-72s  ║${C_R}\n" "CrowdSec:  http://crowdsec.${DOMAIN}"
     printf "${C_B}║  %-72s  ║${C_R}\n" ""
     printf "${C_B}║  ${C_GRN}%-72s${C_R}${C_B}  ║${C_R}\n" "Dockhand has built-in SSO & MFA — no Authelia needed."
   fi
@@ -404,6 +405,14 @@ services:
       - TZ=UTC
     networks:
       - proxy
+  crowdsec-dashboard:
+    image: crowdsecurity/crowdsec-dashboard:latest
+    container_name: crowdsec-dashboard
+    restart: unless-stopped
+    environment:
+      - CS_LAPI_URL=http://crowdsec:8080
+    networks:
+      - proxy
 networks:
   proxy:
     external: true
@@ -583,6 +592,15 @@ setup_crowdsec() {
   fi
   success "CrowdSec container running"
 
+  info "Waiting for CrowdSec Dashboard to be ready..."
+  for i in $(seq 1 30); do
+    docker ps --format '{{.Names}}' | grep -qx "crowdsec-dashboard" && { success "CrowdSec Dashboard ready"; break; }
+    printf "${C_DIM}  Waiting for CrowdSec Dashboard... (%d/30)${C_R}\r" "$i"
+    [[ $i -eq 30 ]] && warn "CrowdSec Dashboard timeout"
+    sleep 2
+  done
+  printf "\n"
+
   info "Verifying collections..."
   docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/sshd" && success "sshd collection" || warn "sshd collection not found"
   docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/nginx-proxy-manager" && success "nginx-proxy-manager collection" || warn "nginx-proxy-manager not found"
@@ -655,7 +673,7 @@ BOUNCER_SERVICE
 
   docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
   local api_key
-  api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer 2>/dev/null | tail -1 || true)
+  api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer 2>/dev/null | grep -oE '[a-f0-9]{32,}' | head -1 || true)
   if [[ -n "$api_key" ]]; then
     mkdir -p /etc/crowdsec
     local fw_mode="iptables"
