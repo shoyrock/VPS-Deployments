@@ -143,7 +143,6 @@ preflight_checks() {
     *) fatal "Unsupported arch: ${ARCH}. Need x86_64 or arm64." ;;
   esac
   success "Arch: ${ARCH} (${DOCKER_ARCH})"
-  readonly CROWDSEC_CHOICE 2>/dev/null || true
 
   info "Checking internet..."
   if ! curl -sf --max-time 10 https://download.docker.com/ >/dev/null 2>&1 && \
@@ -600,11 +599,12 @@ npm_create_proxy_host() {
 
 npm_request_ssl() {
   local HOST_ID="$1"
-  local EMAIL="${2:-admin@${DOMAIN}}"
+  local DOMAIN_NAME="$2"
+  local EMAIL="${3:-admin@${DOMAIN}}"
   local JSON
-  JSON=$(jq -nc --arg email "$EMAIL" '{
+  JSON=$(jq -nc --arg email "$EMAIL" --arg domain "$DOMAIN_NAME" '{
     provider: "letsencrypt",
-    domain_names: [],
+    domain_names: [$domain],
     letsencrypt_email: $email,
     letsencrypt_agree: true
   }')
@@ -630,7 +630,7 @@ automate_npm() {
   local dockhand_id
   dockhand_id=$(npm_create_proxy_host "dockhand.${DOMAIN}" "dockhand" 3000 true true)
   if [[ -n "$dockhand_id" ]]; then
-    npm_request_ssl "$dockhand_id"
+    npm_request_ssl "$dockhand_id" "dockhand.${DOMAIN}"
   fi
 
   # Create proxy host for CrowdSec dashboard (if on amd64)
@@ -638,7 +638,7 @@ automate_npm() {
     local crowdsec_id
     crowdsec_id=$(npm_create_proxy_host "crowdsec.${DOMAIN}" "crowdsec-dashboard" 3000 false true)
     if [[ -n "$crowdsec_id" ]]; then
-      npm_request_ssl "$crowdsec_id"
+      npm_request_ssl "$crowdsec_id" "crowdsec.${DOMAIN}"
     fi
   fi
 
@@ -737,7 +737,7 @@ setup_fail2ban() {
 failregex = ^<HOST> - - \[.*\] ".*" 4\d\d .*$
 ignoreregex =
 FILTER
-  cat > /etc/fail2ban/jail.d/nginx-proxy-manager.conf << 'JAIL'
+  cat > /etc/fail2ban/jail.d/nginx-proxy-manager.conf << JAIL
 [nginx-proxy-manager]
 enabled = true
 port    = http,https

@@ -531,9 +531,9 @@ USEREOF
 
   # Wait for authelia to come up
   for i in $(seq 1 30); do
-    docker exec authelia wget -qO- --timeout=3 http://127.0.0.1:9091/api/health 2>/dev/null | grep -q "ok" && { success "Authelia ready"; break; }
-    printf "${C_DIM}  Waiting for Authelia restart... (%d/30)${C_R}\r" "$i"
-    [[ $i -eq 30 ]] && warn "Authelia restart timed out"
+    docker ps --format '{{.Names}}' | grep -qx "authelia" && { success "Authelia ready"; break; }
+    printf "${C_DIM}  Waiting for Authelia to start... (%d/30)${C_R}\r" "$i"
+    [[ $i -eq 30 ]] && warn "Authelia start timed out"
     sleep 2
   done
   printf "\n"
@@ -641,9 +641,6 @@ services:
       - TZ=UTC
     networks:
       - proxy
-networks:
-  proxy:
-    external: true
 COMPOSE_CROWDSEC
 
   if [[ "$DOCKER_ARCH" == "amd64" ]]; then
@@ -655,6 +652,7 @@ COMPOSE_CROWDSEC
     environment:
       - CROWDSEC_API_URL=http://crowdsec:8080
       - MB_DB_FILE=/data/crowdsec.db
+      - DISABLE_LOGIN=true
     volumes:
       - ./crowdsec/dashboard-data:/data
       - ./crowdsec/data:/var/lib/crowdsec/data:ro
@@ -662,6 +660,13 @@ COMPOSE_CROWDSEC
       - proxy
 DASHBOARD
   fi
+
+  # networks section must come last (after conditional dashboard append)
+  cat >> "${STACK_DIR}/docker-compose.crowdsec.yml" << 'NETS'
+networks:
+  proxy:
+    external: true
+NETS
 
   info "Pulling Docker images (NPM, Authelia, CrowdSec) — this may take a few minutes..."
   docker compose -f "${STACK_DIR}/docker-compose.npm.yml" pull
@@ -869,9 +874,6 @@ BOUNCER
   fi
 }
 
-  fi
-}
-
 setup_fail2ban() {
   step "Fail2Ban (ARM alternative to CrowdSec)"
 
@@ -884,7 +886,7 @@ setup_fail2ban() {
   fi
 
   # Create NPM jail
-  cat > /etc/fail2ban/jail.d/nginx-proxy-manager.conf << 'JAIL'
+  cat > /etc/fail2ban/jail.d/nginx-proxy-manager.conf << JAIL
 [nginx-proxy-manager]
 enabled = true
 port = http,https
