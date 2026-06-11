@@ -3,13 +3,13 @@
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     exec sudo bash "$0" "$@"
 fi
-# deploy-dockhand.sh -- Docker + NPM + Dockhand + CrowdSec (v4.1.0-oneclick)
+# deploy-dockhand.sh -- Docker + NPM + Dockhand + CrowdSec (v4.2.0-oneclick-final)
 # One‑click VPS deployment. Usage: sudo ./deploy-dockhand.sh
-# Dockhand: built-in SSO, MFA, user management + stack file visibility (NO Authelia needed)
+# Dockhand: built-in SSO, MFA, user management + full host file access (read/write)
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.1.0-oneclick"
+readonly SCRIPT_VERSION="4.2.0-oneclick-final"
 readonly SCRIPT_NAME="deploy-dockhand.sh"
 readonly START_TIME=$(date +%s)
 readonly STACK_DIR="/opt/dockhand-stack"
@@ -82,7 +82,7 @@ _on_exit() {
     printf "${C_B}║  %-72s  ║${C_R}\n" "           http://${ip}:3000 (direct)"
     [[ "$(uname -m)" == "x86_64" ]] && printf "${C_B}║  %-72s  ║${C_R}\n" "CrowdSec:  https://crowdsec.${DOMAIN}"
     printf "${C_B}║  %-72s  ║${C_R}\n" ""
-    printf "${C_B}║  ${C_GRN}%-72s${C_R}${C_B}  ║${C_R}\n" "Dockhand has built-in SSO & MFA — no Authelia needed."
+    printf "${C_B}║  ${C_GRN}%-72s${C_R}${C_B}  ║${C_R}\n" "Dockhand has full read/write host file access."
   fi
   printf "${C_B}║  %-72s  ║${C_R}\n" "Ports: 80 (HTTP), 443 (HTTPS), 81 (NPM Admin)"
   printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
@@ -201,11 +201,9 @@ idempotent_cleanup() {
     snap remove docker 2>/dev/null || true
   fi
 
-  # ═════════════════════════════════════════════════════════════════
-  # FIX: Immediately recreate the stack directory after cleaning
+  # Immediately recreate the stack directory after cleaning
   mkdir -p "$STACK_DIR" "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR" "$DOCKHAND_DATA_DIR"
   success "Stack directory recreated: $STACK_DIR"
-  # ═════════════════════════════════════════════════════════════════
 }
 
 system_update() {
@@ -282,7 +280,6 @@ install_docker() {
 
 setup_docker_network() {
   step "Docker Network: proxy"
-  # NEVER remove existing proxy network -- other containers may depend on it
   if ! docker network ls --format '{{.Name}}' | grep -qx "proxy"; then
     docker network create proxy 2>/dev/null || true
   fi
@@ -292,8 +289,6 @@ setup_docker_network() {
 
 get_user_domain() {
   step "Domain Configuration"
-
-  # Check for persisted domain from a previous deployment
   if [[ -f "${DOMAIN_PERSIST_FILE}" ]]; then
     local existing_domain
     existing_domain=$(tr -d '\n' < "${DOMAIN_PERSIST_FILE}" 2>/dev/null || true)
@@ -306,24 +301,17 @@ get_user_domain() {
       printf "\n${C_CYN}Switching to new domain entry...${C_R}\n"
     fi
   fi
-
-  # Fresh domain prompt
   printf "\n${C_B}Enter your root domain${C_R} (e.g., example.com): "
   read -r DOMAIN
   [[ -z "$DOMAIN" ]] && fatal "Domain is required."
   DOMAIN=$(echo "$DOMAIN" | sed 's|https\?://||' | sed 's|/.*||' | tr -d ' ')
-
-  # Persist domain outside STACK_DIR so it survives cleanup
   printf '%s' "$DOMAIN" > "${DOMAIN_PERSIST_FILE}" || warn "Could not persist domain to ${DOMAIN_PERSIST_FILE}"
-
   success "Domain set to: $DOMAIN"
 }
 
 setup_dockhand() {
   step "Dockhand (standalone)"
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
-
-  # Ensure Dockhand data directory exists (bind mount)
   mkdir -p "${DOCKHAND_DATA_DIR}"
 
   cat > "${STACK_DIR}/docker-compose.dockhand.yml" << 'COMPOSE_DOCKHAND'
@@ -338,7 +326,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./dockhand-data:/app/data
-      - /opt/dockhand-stack:/host/opt/dockhand-stack:ro    # <-- Make stack files visible in Dockhand
+      - /:/host           # <-- FULL HOST READ-WRITE (not read-only)
     networks:
       - proxy
 networks:
@@ -348,14 +336,13 @@ COMPOSE_DOCKHAND
 
   info "Pulling Dockhand image..."
   docker compose -f "${STACK_DIR}/docker-compose.dockhand.yml" pull
-  docker compose -f "${STACK_DIR}/docker-compose.dockhand.yml" up -d
+  docker compose -f "${STACK_DIR}/docker-compose.dockhand.yml" up -d --force-recreate
 
   info "Waiting for Dockhand to be ready..."
   for i in $(seq 1 30); do
     printf "\r  ${C_DIM}Waiting for Dockhand... %d/30${C_R}" "$i"
     sleep 2
     if docker ps --format '{{.Names}}' | grep -qx "dockhand"; then
-      # Verify internal health
       if curl -sf --max-time 5 http://127.0.0.1:3000 &>/dev/null; then
         printf "\r"
         success "Dockhand ready at http://${ip}:3000"
@@ -368,11 +355,10 @@ COMPOSE_DOCKHAND
 }
 
 setup_stack() {
-  step "Deploying NPM and CrowdSec (separate compose files)"
+  step "Deploying NPM and CrowdSec"
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
   mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR"
 
-  # NPM compose file
   cat > "${STACK_DIR}/docker-compose.npm.yml" << 'COMPOSE_NPM'
 services:
   npm:
@@ -394,7 +380,6 @@ networks:
     external: true
 COMPOSE_NPM
 
-  # CrowdSec compose file – generated all at once to avoid YAML structure errors
   {
     echo 'services:'
     echo '  crowdsec:'
@@ -414,8 +399,6 @@ COMPOSE_NPM
     echo '      - TZ=UTC'
     echo '    networks:'
     echo '      - proxy'
-
-    # If amd64, add the dashboard service
     if [[ "$DOCKER_ARCH" == "amd64" ]]; then
       echo ''
       echo '  crowdsec-dashboard:'
@@ -428,14 +411,13 @@ COMPOSE_NPM
       echo '    networks:'
       echo '      - proxy'
     fi
-
     echo ''
     echo 'networks:'
     echo '  proxy:'
     echo '    external: true'
   } > "${STACK_DIR}/docker-compose.crowdsec.yml"
 
-  info "Pulling Docker images — this may take a few minutes, please wait..."
+  info "Pulling images..."
   docker compose -f "${STACK_DIR}/docker-compose.npm.yml" pull
   docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" pull
 
@@ -502,7 +484,7 @@ COMPOSE_NPM
 
   info "Starting CrowdSec..."
   docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d
-  info "Waiting for CrowdSec container to be ready..."
+  info "Waiting for CrowdSec container..."
   for i in $(seq 1 30); do
     docker ps --format '{{.Names}}' | grep -qx "crowdsec" && { success "CrowdSec container running"; break; }
     printf "${C_DIM}  Waiting for CrowdSec container... (%d/30)${C_R}\r" "$i"
@@ -512,7 +494,7 @@ COMPOSE_NPM
   printf "\n"
 
   if [[ "$DOCKER_ARCH" == "amd64" ]]; then
-    info "Waiting for CrowdSec Dashboard to be ready..."
+    info "Waiting for CrowdSec Dashboard..."
     for i in $(seq 1 30); do
       docker ps --format '{{.Names}}' | grep -qx "crowdsec-dashboard" && { success "CrowdSec Dashboard ready"; break; }
       printf "${C_DIM}  Waiting for CrowdSec Dashboard... (%d/30)${C_R}\r" "$i"
@@ -632,7 +614,6 @@ npm_request_ssl() {
 automate_npm() {
   step "Automating NPM setup (proxy hosts + SSL)"
 
-  # Change password and get a fresh token
   if ! npm_change_password; then
     warn "Could not change NPM password; continuing with manual setup needed"
     return
@@ -658,7 +639,7 @@ automate_npm() {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Firewall, logrotate, CrowdSec setup (unchanged from original)
+# Firewall, logrotate, CrowdSec setup
 # ═══════════════════════════════════════════════════════════════════════════════
 setup_firewall() {
   step "Firewall"
@@ -840,7 +821,7 @@ BOUNCER
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Final summary (retaining all original details + new info)
+# Final summary
 # ═══════════════════════════════════════════════════════════════════════════════
 print_summary() {
   local elapsed=$(( $(date +%s) - START_TIME ))
@@ -882,7 +863,7 @@ ${C_B}Dockhand${C_R}
   Network:   proxy
   Data:      ${DOCKHAND_DATA_DIR}
   Auth:      Built-in SSO, MFA, user management (setup wizard on first visit)
-  Files:     Stack files visible under /host/opt/dockhand-stack
+  Host Files: FULL READ/WRITE access under /host
 
 ${C_B}CrowdSec${C_R}
   Dashboard: https://crowdsec.${DOMAIN}  (if amd64)
@@ -897,7 +878,7 @@ ${C_B}${C_YEL}Next Steps (already done automatically):${C_R}
   ✅ Proxy hosts for Dockhand & CrowdSec created
   ✅ Let's Encrypt SSL certificates requested (may take a moment to issue)
   ✅ NPM admin password securely changed
-  ✅ Stack files visible in Dockhand's file browser
+  ✅ Dockhand has full read/write access to the host filesystem
 
 ${C_B}Access:${C_R}
   - Dockhand:   https://dockhand.${DOMAIN}
@@ -929,7 +910,6 @@ main() {
   setup_firewall
   setup_crowdsec
   setup_logrotate
-  # NEW: automatic NPM configuration
   automate_npm
   DEPLOY_STATUS="success"
   DEPLOYED_SERVICES="npm,dockhand,crowdsec,firewall,ssl"
