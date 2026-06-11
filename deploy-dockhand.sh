@@ -3,6 +3,15 @@
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     exec sudo bash "$0" "$@"
 fi
+
+# ------------------------------------------------------------
+# Silent carriage-return fix – no re-exec needed
+# ------------------------------------------------------------
+if [[ -n "$(tr -d '\r' < "$0" | cmp -s - "$0" 2>&1 || true)" ]]; then
+    exec /bin/bash <(tr -d '\r' < "$0") "$@"
+fi
+# ------------------------------------------------------------
+
 # deploy-dockhand.sh -- Docker + NPM + Dockhand + CrowdSec (v4.2.0-oneclick-final)
 # One-click VPS deployment. Usage: sudo ./deploy-dockhand.sh
 # Dockhand: built-in SSO, MFA, user management + full host file access (read/write)
