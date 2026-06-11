@@ -3,6 +3,21 @@
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     exec sudo bash "$0" "$@"
 fi
+
+# ---------- SELF-HEALING LINE ENDING FIX ----------
+# If the script contains carriage returns (CRLF from Windows), remove them
+# and re-execute itself. This makes the script immune to broken downloads.
+if grep -q $'\r' "$0"; then
+    # Create a temporary cleaned copy
+    clean_script=$(mktemp /tmp/deploy-dockhand.XXXXXX.sh)
+    tr -d '\r' < "$0" > "$clean_script"
+    chmod +x "$clean_script"
+    # Replace the original with the clean version for future use (optional)
+    cp "$clean_script" "$0" 2>/dev/null || true
+    exec sudo bash "$clean_script" "$@"
+fi
+# ---------------------------------------------------
+
 # deploy-dockhand.sh -- Docker + NPM + Dockhand + CrowdSec (v4.2.0-oneclick-final)
 # One-click VPS deployment. Usage: sudo ./deploy-dockhand.sh
 # Dockhand: built-in SSO, MFA, user management + full host file access (read/write)
