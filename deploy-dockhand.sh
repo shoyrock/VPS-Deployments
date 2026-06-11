@@ -360,8 +360,12 @@ COMPOSE_DOCKHAND
 setup_stack() {
   step "Deploying NPM and CrowdSec"
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
-  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR" "${CROWDSEC_DIR}/dashboard-data"
-  chmod 777 "${CROWDSEC_DIR}/dashboard-data" 2>/dev/null || true
+  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR"
+  # Generate CrowdSec LAPI credentials for dashboard (used in both compose and machine registration)
+  local CROWDSEC_LOGIN CROWDSEC_PASSWORD BETTER_AUTH_SECRET
+  CROWDSEC_LOGIN="dashboard-user-$(openssl rand -hex 4 2>/dev/null || echo "a1b2c3d4")"
+  CROWDSEC_PASSWORD="$(openssl rand -base64 24 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 32)")"
+  BETTER_AUTH_SECRET="$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")"
 
   cat > "${STACK_DIR}/docker-compose.npm.yml" << 'COMPOSE_NPM'
 services:
@@ -411,11 +415,10 @@ COMPOSE_NPM
       echo '    restart: unless-stopped'
       echo '    environment:'
       echo '      - CROWDSEC_API_URL=http://crowdsec:8080'
-      echo '      - MB_DB_FILE=/data/crowdsec.db'
-      echo '      - MB_SITE_LOCATION=https://crowdsec.'"${DOMAIN}"''
-      echo '      - MB_SITE_URL=https://crowdsec.'"${DOMAIN}"''
+      echo '      - CROWDSEC_LOGIN='"${CROWDSEC_LOGIN}"''
+      echo '      - CROWDSEC_PASSWORD='"${CROWDSEC_PASSWORD}"''
+      echo '      - BETTER_AUTH_SECRET='"${BETTER_AUTH_SECRET}"''
       echo '    volumes:'
-      echo '      - ./crowdsec/dashboard-data:/data'
       echo '      - ./crowdsec/data:/var/lib/crowdsec/data:ro'
       echo '    networks:'
       echo '      - proxy'
@@ -492,7 +495,7 @@ COMPOSE_NPM
   printf "\r"
 
   info "Starting CrowdSec..."
-  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d
+  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec
   info "Waiting for CrowdSec container..."
   for i in $(seq 1 30); do
     docker ps --format '{{.Names}}' | grep -qx "crowdsec" && { success "CrowdSec container running"; break; }
@@ -503,6 +506,10 @@ COMPOSE_NPM
   printf "\n"
 
   if [[ "$DOCKER_ARCH" == "amd64" ]]; then
+    info "Registering CrowdSec LAPI machine for dashboard..."
+    docker exec crowdsec cscli machines add "$CROWDSEC_LOGIN" --password "$CROWDSEC_PASSWORD" 2>/dev/null || true
+    info "Starting CrowdSec Dashboard..."
+    docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec-dashboard
     info "Waiting for CrowdSec Dashboard..."
     for i in $(seq 1 30); do
       docker ps --format '{{.Names}}' | grep -qx "crowdsec-dashboard" && { success "CrowdSec Dashboard ready"; break; }
