@@ -360,7 +360,8 @@ COMPOSE_DOCKHAND
 setup_stack() {
   step "Deploying NPM and CrowdSec"
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
-  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR"
+  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR" "${CROWDSEC_DIR}/dashboard-data"
+  chmod 777 "${CROWDSEC_DIR}/dashboard-data" 2>/dev/null || true
 
   cat > "${STACK_DIR}/docker-compose.npm.yml" << 'COMPOSE_NPM'
 services:
@@ -412,6 +413,7 @@ COMPOSE_NPM
       echo '      - CROWDSEC_API_URL=http://crowdsec:8080'
       echo '      - MB_DB_FILE=/data/crowdsec.db'
       echo '      - MB_SITE_LOCATION=https://crowdsec.'"${DOMAIN}"''
+      echo '      - MB_SITE_URL=https://crowdsec.'"${DOMAIN}"''
       echo '    volumes:'
       echo '      - ./crowdsec/dashboard-data:/data'
       echo '      - ./crowdsec/data:/var/lib/crowdsec/data:ro'

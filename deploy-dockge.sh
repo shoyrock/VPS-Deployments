@@ -549,7 +549,8 @@ USEREOF
 setup_stack() {
   step "Deploying NPM, Dockge, Authelia, CrowdSec (separate compose files)"
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
-  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "${STACK_DIR}/data" "/opt/stacks" "$CROWDSEC_DIR" "$AUTHELIA_CONFIG_DIR" "$AUTHELIA_SECRETS_DIR"
+  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "${STACK_DIR}/data" "/opt/stacks" "$CROWDSEC_DIR" "$AUTHELIA_CONFIG_DIR" "$AUTHELIA_SECRETS_DIR" "${CROWDSEC_DIR}/dashboard-data"
+  chmod 777 "${CROWDSEC_DIR}/dashboard-data" 2>/dev/null || true
 
   cat > "${STACK_DIR}/docker-compose.npm.yml" << 'COMPOSE_NPM'
 services:
@@ -647,6 +648,7 @@ COMPOSE_CROWDSEC
       - CROWDSEC_API_URL=http://crowdsec:8080
       - MB_DB_FILE=/data/crowdsec.db
       - MB_SITE_LOCATION=https://crowdsec.${DOMAIN}
+      - MB_SITE_URL=https://crowdsec.${DOMAIN}
     volumes:
       - ./crowdsec/dashboard-data:/data
       - ./crowdsec/data:/var/lib/crowdsec/data:ro
