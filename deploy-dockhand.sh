@@ -1,4 +1,4 @@
-#!/usr/bin/#!/usr/bin/env bash
+#!/usr/bin/env bash
 # Auto-elevate to root if not already running as root
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     exec sudo bash "$0" "$@"
@@ -371,6 +371,7 @@ setup_stack() {
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
   mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR"
 
+  # NPM compose file
   cat > "${STACK_DIR}/docker-compose.npm.yml" << 'COMPOSE_NPM'
 services:
   npm:
@@ -392,43 +393,46 @@ networks:
     external: true
 COMPOSE_NPM
 
-  cat > "${STACK_DIR}/docker-compose.crowdsec.yml" << 'COMPOSE_CROWDSEC'
-services:
-  crowdsec:
-    image: crowdsecurity/crowdsec:latest
-    container_name: crowdsec
-    hostname: crowdsec
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:8080:8080"
-    volumes:
-      - ./crowdsec/data:/var/lib/crowdsec/data
-      - ./crowdsec/config:/etc/crowdsec
-      - ./data/logs:/npm-logs:ro
-      - /var/log:/var/log:ro
-    environment:
-      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux
-      - TZ=UTC
-    networks:
-      - proxy
-networks:
-  proxy:
-    external: true
-COMPOSE_CROWDSEC
+  # CrowdSec compose file – generated all at once to avoid YAML structure errors
+  {
+    echo 'services:'
+    echo '  crowdsec:'
+    echo '    image: crowdsecurity/crowdsec:latest'
+    echo '    container_name: crowdsec'
+    echo '    hostname: crowdsec'
+    echo '    restart: unless-stopped'
+    echo '    ports:'
+    echo '      - "127.0.0.1:8080:8080"'
+    echo '    volumes:'
+    echo '      - ./crowdsec/data:/var/lib/crowdsec/data'
+    echo '      - ./crowdsec/config:/etc/crowdsec'
+    echo '      - ./data/logs:/npm-logs:ro'
+    echo '      - /var/log:/var/log:ro'
+    echo '    environment:'
+    echo '      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux'
+    echo '      - TZ=UTC'
+    echo '    networks:'
+    echo '      - proxy'
 
-  if [[ "$DOCKER_ARCH" == "amd64" ]]; then
-    cat >> "${STACK_DIR}/docker-compose.crowdsec.yml" << 'DASHBOARD'
-  crowdsec-dashboard:
-    image: partitio/crowdsec-dashboard:latest
-    container_name: crowdsec-dashboard
-    restart: unless-stopped
-    environment:
-      - CROWDSEC_API_URL=http://crowdsec:8080
-      - DISABLE_LOGIN=true              # FIX: allow access without API key
-    networks:
-      - proxy
-DASHBOARD
-  fi
+    # If amd64, add the dashboard service
+    if [[ "$DOCKER_ARCH" == "amd64" ]]; then
+      echo ''
+      echo '  crowdsec-dashboard:'
+      echo '    image: partitio/crowdsec-dashboard:latest'
+      echo '    container_name: crowdsec-dashboard'
+      echo '    restart: unless-stopped'
+      echo '    environment:'
+      echo '      - CROWDSEC_API_URL=http://crowdsec:8080'
+      echo '      - DISABLE_LOGIN=true'
+      echo '    networks:'
+      echo '      - proxy'
+    fi
+
+    echo ''
+    echo 'networks:'
+    echo '  proxy:'
+    echo '    external: true'
+  } > "${STACK_DIR}/docker-compose.crowdsec.yml"
 
   info "Pulling Docker images — this may take a few minutes, please wait..."
   docker compose -f "${STACK_DIR}/docker-compose.npm.yml" pull
