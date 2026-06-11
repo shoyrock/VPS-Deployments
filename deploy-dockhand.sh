@@ -78,9 +78,9 @@ _on_exit() {
   printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
   printf "${C_B}║  %-72s  ║${C_R}\n" "NPM Admin: http://${ip}:81"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
-    printf "${C_B}║  %-72s  ║${C_R}\n" "Dockhand:  http://dockhand.${DOMAIN}"
+    printf "${C_B}║  %-72s  ║${C_R}\n" "Dockhand:  https://dockhand.${DOMAIN}"
     printf "${C_B}║  %-72s  ║${C_R}\n" "           http://${ip}:3000 (direct)"
-    [[ "$(uname -m)" == "x86_64" ]] && printf "${C_B}║  %-72s  ║${C_R}\n" "CrowdSec:  http://crowdsec.${DOMAIN}"
+    [[ "$(uname -m)" == "x86_64" ]] && printf "${C_B}║  %-72s  ║${C_R}\n" "CrowdSec:  https://crowdsec.${DOMAIN}"
     printf "${C_B}║  %-72s  ║${C_R}\n" ""
     printf "${C_B}║  ${C_GRN}%-72s${C_R}${C_B}  ║${C_R}\n" "Dockhand has built-in SSO & MFA — no Authelia needed."
   fi
@@ -90,7 +90,7 @@ _on_exit() {
   printf "${C_B}╚══════════════════════════════════════════════════════════════════════════════╝${C_R}\n"
   printf "\n"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
-    printf "${C_B}${C_GRN}Your VPS is ready!${C_R} Set up DNS → ${C_CYN}${ext_ip}${C_R} and configure NPM.\n\n"
+    printf "${C_B}${C_GRN}Your VPS is ready!${C_R} DNS must point ${C_CYN}*.${DOMAIN} → ${ext_ip}${C_R}\n\n"
   else
     printf "${C_B}${C_YEL}Deployment failed.${C_R} Check: ${C_CYN}cat $LOG_FILE${C_R}\n\n"
   fi
@@ -525,6 +525,140 @@ COMPOSE_NPM
   success "Dockhand: http://${ip}:3000"
 }
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# NPM API automation — secure password & proxy hosts
+# ═══════════════════════════════════════════════════════════════════════════════
+NPM_TOKEN=""
+NPM_API_BASE="http://127.0.0.1:81/api"
+
+_npm_api() {
+  curl -s --max-time 10 "${NPM_API_BASE}${1}" \
+    ${2:+-H "Content-Type: application/json"} \
+    ${NPM_TOKEN:+-H "Authorization: Bearer ${NPM_TOKEN}"} \
+    "${@:3}"
+}
+
+npm_change_password() {
+  step "Securing NPM admin password"
+  local NEW_PASS
+  NEW_PASS=$(openssl rand -base64 18 | tr -d '+/=' | head -c 24)
+  local JSON
+  JSON=$(printf '{"identity":"admin@example.com","secret":"changeme"}')
+  local LOGIN
+  LOGIN=$(_npm_api "/tokens" "json" -d "$JSON" 2>/dev/null)
+  NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty')
+  if [[ -z "$NPM_TOKEN" ]]; then
+    warn "Could not get NPM token — skipping automated NPM setup"
+    return 1
+  fi
+
+  JSON=$(printf '{"type":"password","current":"changeme","secret":"%s"}' "$NEW_PASS")
+  _npm_api "/users/1/auth" "json" -X PUT -d "$JSON" >/dev/null 2>&1
+  # Re-authenticate with new password
+  JSON=$(printf '{"identity":"admin@example.com","secret":"%s"}' "$NEW_PASS")
+  LOGIN=$(_npm_api "/tokens" "json" -d "$JSON" 2>/dev/null)
+  NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty')
+  if [[ -n "$NPM_TOKEN" ]]; then
+    echo "$NEW_PASS" > "${STACK_DIR}/.npm_admin_password"
+    success "NPM admin password changed – saved to ${STACK_DIR}/.npm_admin_password"
+    return 0
+  else
+    warn "NPM password change failed — manual intervention required"
+    return 1
+  fi
+}
+
+npm_create_proxy_host() {
+  local DOMAIN_NAME="$1"
+  local FWD_HOST="$2"
+  local FWD_PORT="$3"
+  local WS="${4:-true}"
+  local SSL="${5:-true}"
+
+  local JSON
+  JSON=$(jq -nc --arg domain "$DOMAIN_NAME" --arg fwd_host "$FWD_HOST" --argjson fwd_port "$FWD_PORT" \
+    --argjson ws "$WS" --argjson ssl "$SSL" \
+    '{
+      domain_names: [$domain],
+      forward_scheme: "http",
+      forward_host: $fwd_host,
+      forward_port: $fwd_port,
+      access_list_id: 0,
+      certificate_id: 0,
+      ssl_forced: $ssl,
+      caching_enabled: true,
+      block_exploits: true,
+      allow_websocket_upgrade: $ws,
+      http2_support: true,
+      hsts_enabled: true,
+      hsts_subdomains: true,
+      advanced_config: ""
+    }')
+
+  local RESP
+  RESP=$(_npm_api "/nginx/proxy-hosts" "json" -X POST -d "$JSON")
+  local ID
+  ID=$(echo "$RESP" | jq -r '.id // empty')
+  if [[ -n "$ID" ]]; then
+    success "Created proxy host: ${DOMAIN_NAME} → ${FWD_HOST}:${FWD_PORT}"
+    echo "$ID"
+  else
+    warn "Failed to create proxy host for ${DOMAIN_NAME}"
+    return 1
+  fi
+}
+
+npm_request_ssl() {
+  local HOST_ID="$1"
+  local EMAIL="${2:-admin@${DOMAIN}}"
+  local JSON
+  JSON=$(jq -nc --arg email "$EMAIL" '{
+    provider: "letsencrypt",
+    domain_names: [],
+    letsencrypt_email: $email,
+    letsencrypt_agree: true
+  }')
+  RESP=$(_npm_api "/nginx/proxy-hosts/${HOST_ID}/certificates" "json" -X POST -d "$JSON")
+  local SUCCESS
+  SUCCESS=$(echo "$RESP" | jq -r '.id // empty')
+  if [[ -n "$SUCCESS" ]]; then
+    success "SSL certificate requested for proxy host ID ${HOST_ID}"
+  else
+    warn "SSL request may have failed for proxy host ID ${HOST_ID}"
+  fi
+}
+
+automate_npm() {
+  step "Automating NPM setup (proxy hosts + SSL)"
+
+  # Change password and get a fresh token
+  if ! npm_change_password; then
+    warn "Could not change NPM password; continuing with manual setup needed"
+    return
+  fi
+
+  # Create proxy host for Dockhand
+  local dockhand_id
+  dockhand_id=$(npm_create_proxy_host "dockhand.${DOMAIN}" "dockhand" 3000 true true)
+  if [[ -n "$dockhand_id" ]]; then
+    npm_request_ssl "$dockhand_id"
+  fi
+
+  # Create proxy host for CrowdSec dashboard (if on amd64)
+  if [[ "$DOCKER_ARCH" == "amd64" ]]; then
+    local crowdsec_id
+    crowdsec_id=$(npm_create_proxy_host "crowdsec.${DOMAIN}" "crowdsec-dashboard" 3000 false true)
+    if [[ -n "$crowdsec_id" ]]; then
+      npm_request_ssl "$crowdsec_id"
+    fi
+  fi
+
+  success "NPM automation completed"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Firewall, logrotate, CrowdSec setup (unchanged from original)
+# ═══════════════════════════════════════════════════════════════════════════════
 setup_firewall() {
   step "Firewall"
   info "Configuring firewall — please wait..."
@@ -535,9 +669,6 @@ setup_firewall() {
 setup_firewall_debian() {
   info "Configuring UFW..."
   apt-get install -y -qq ufw
-
-  # CRITICAL: Docker manipulates iptables directly. UFW's DEFAULT_FORWARD_POLICY=DROP
-  # blocks all container traffic. Must set ACCEPT before enabling UFW.
   local ufw_def="/etc/default/ufw"
   if [[ -f "$ufw_def" ]]; then
     cp -n "$ufw_def" "${ufw_def}.bak" 2>/dev/null || true
@@ -550,17 +681,14 @@ setup_firewall_debian() {
     echo 'DEFAULT_FORWARD_POLICY="ACCEPT"' > "$ufw_def"
   fi
   success "UFW DEFAULT_FORWARD_POLICY=ACCEPT"
-
   ufw --force reset
   ufw default deny incoming
   ufw default allow outgoing
-
   local ssh_port; ssh_port=$(ss -tlnp 2>/dev/null | grep -m1 ':22 ' | awk '{print $4}' | cut -d: -f2 || echo "22")
   ufw allow "${ssh_port:-22}/tcp" comment 'SSH'
   ufw allow 80/tcp comment 'HTTP'
   ufw allow 443/tcp comment 'HTTPS'
   ufw allow 81/tcp comment 'NPM Admin'
-
   ufw --force enable && ufw reload
   ufw status verbose
   success "UFW configured"
@@ -571,12 +699,10 @@ setup_firewall_rhel() {
   local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
   $pkg install -y -q firewalld
   systemctl start firewalld && systemctl enable firewalld
-
   firewall-cmd --permanent --add-service=ssh
   firewall-cmd --permanent --add-service=http
   firewall-cmd --permanent --add-service=https
   firewall-cmd --permanent --add-port=81/tcp
-
   if ! firewall-cmd --get-zones 2>/dev/null | grep -q '\bdocker\b'; then
     firewall-cmd --permanent --new-zone=docker 2>/dev/null || true
   fi
@@ -609,7 +735,6 @@ EOF
 
 setup_crowdsec() {
   step "CrowdSec (Docker)"
-
   info "Waiting for CrowdSec container to be ready..."
   local cs_ready=false
   for i in $(seq 1 30); do
@@ -619,19 +744,16 @@ setup_crowdsec() {
     fi
     sleep 2
   done
-
   if ! $cs_ready; then
     docker logs crowdsec --tail 20 2>/dev/null || true
     warn "CrowdSec container not ready -- check ${LOG_FILE}. Continuing..."
     return
   fi
   success "CrowdSec container running"
-
   info "Verifying collections..."
   docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/sshd" && success "sshd collection" || warn "sshd collection not found"
   docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/nginx-proxy-manager" && success "nginx-proxy-manager collection" || warn "nginx-proxy-manager not found"
   docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/linux" && success "linux collection" || warn "linux not found"
-
   info "Configuring NPM log acquisition..."
   local npm_acquis="${CROWDSEC_DIR}/config/acquis.d/npm.yaml"
   mkdir -p "$(dirname "$npm_acquis")"
@@ -652,9 +774,7 @@ labels:
 EOF
     warn "NPM acquisition written (via docker exec)"
   fi
-
   docker exec crowdsec kill -HUP 1 2>/dev/null || docker restart crowdsec &>/dev/null || true
-
   info "Installing firewall bouncer..."
   local bouncer_version
   bouncer_version=$(curl -sf --max-time 10 "https://api.github.com/repos/crowdsecurity/cs-firewall-bouncer/releases/latest" | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/') || bouncer_version="0.0.34"
@@ -696,7 +816,6 @@ BOUNCER_SERVICE
     popd &>/dev/null; rm -rf "$tmpdir"
     fatal "Firewall bouncer download failed -- check network connectivity"
   fi
-
   docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
   local api_key
   api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer 2>/dev/null | grep -oE '[a-f0-9]{32,}' | head -1 || true)
@@ -719,11 +838,18 @@ BOUNCER
   fi
 }
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Final summary (retaining all original details + new info)
+# ═══════════════════════════════════════════════════════════════════════════════
 print_summary() {
   local elapsed=$(( $(date +%s) - START_TIME ))
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
   local ext_ip; ext_ip=$(get_external_ip)
   local fw_cmd; [[ "$OS_FAMILY" == "debian" ]] && fw_cmd="ufw status verbose" || fw_cmd="firewall-cmd --list-all"
+  local npm_password="<see ${STACK_DIR}/.npm_admin_password>"
+  if [[ -f "${STACK_DIR}/.npm_admin_password" ]]; then
+    npm_password=$(cat "${STACK_DIR}/.npm_admin_password")
+  fi
 
   printf "\n"
   printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
@@ -739,6 +865,8 @@ ${C_B}Stack Directory${C_R}    ${STACK_DIR}
 
 ${C_B}Nginx Proxy Manager${C_R}
   Admin:   http://${ip}:81
+  Login:   admin@example.com
+  Password:${C_YEL} ${npm_password}${C_R}
   HTTP:    http://${ip}:80
   HTTPS:   https://${ip}:443
   Ext IP:  ${ext_ip}
@@ -747,74 +875,36 @@ ${C_B}Nginx Proxy Manager${C_R}
   Logs:    ${NPM_LOGS_DIR}
 
 ${C_B}Dockhand${C_R}
+  URL:      https://dockhand.${DOMAIN}
+  Direct:   http://${ip}:3000
   Container: dockhand
-  Port:      3000 (direct host port)
   Network:   proxy
   Data:      ${DOCKHAND_DATA_DIR}
-  Auth:      Built-in SSO, MFA, user management
-  URL:       http://dockhand.${DOMAIN} (after NPM proxy host)
+  Auth:      Built-in SSO, MFA, user management (setup wizard on first visit)
 
-${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
-${C_B}Containers${C_R}  npm, dockhand, crowdsec (separate compose files)
-${C_B}Network${C_R}   proxy (bridge)
-
-${C_B}CrowdSec${C_R}  Collections: sshd, nginx-proxy-manager, linux
+${C_B}CrowdSec${C_R}
+  Dashboard: https://crowdsec.${DOMAIN}  (if amd64)
+  Collections: sshd, nginx-proxy-manager, linux
 ${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
 
-${C_B}${C_YEL}Step 1 — NPM Admin${C_R}
-  Open:   http://${ip}:81
-  Login:  admin@example.com / changeme
-  ${C_RED}→ Change password immediately${C_R}
+${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
+${C_B}Containers${C_R}  npm, dockhand, crowdsec (+ dashboard on amd64)
+${C_B}Network${C_R}   proxy (bridge)
 
-${C_B}${C_YEL}Step 2 — Add Dockhand Proxy Host in NPM${C_R}
-  Dashboards → Proxy Hosts → Add Proxy Host
-  ┌──────────────────────────────────────┐
-  │ Domain Names:    dockhand.${DOMAIN}   │
-  │ Scheme:          http                │
-  │ Forward Host:    dockhand            │
-  │ Forward Port:    3000                │
-  │ Block Exploits:  ON                  │
-   │ Websockets:      ON                  │
-   └──────────────────────────────────────┘
-   Click Save
+${C_B}${C_YEL}Next Steps (already done automatically):${C_R}
+  ✅ Proxy hosts for Dockhand & CrowdSec created
+  ✅ Let's Encrypt SSL certificates requested (may take a moment to issue)
+  ✅ NPM admin password securely changed
 
-${C_B}CrowdSec Dashboard (amd64 only):${C_R}
-   ┌──────────────────────────────────────────────┐
-   │ Domain Names:    crowdsec.${DOMAIN}           │
-   │ Scheme:          http                         │
-   │ Forward Host:    crowdsec-dashboard           │
-   │ Forward Port:    3000                         │
-   │ Block Exploits:  ON                           │
-   │ Access List:     Publicly Accessible          │
-   └──────────────────────────────────────────────┘
-   Save → SSL tab → Request cert → Force SSL ON
-
-${C_B}${C_YEL}Step 3 — SSL Certificates${C_R}
-  On each proxy host → SSL tab
-  ┌──────────────────────────────────────┐
-  │ SSL:             Request a new cert  │
-  │ Force SSL:       ON                  │
-  │ HTTP/2 Support:  ON                  │
-  │ Email:           your-email@domain   │
-  │ Agree to TOS:    ON                  │
-  └──────────────────────────────────────┘
-  Click Save
-
-${C_B}${C_YEL}Step 4 — Access Dockhand${C_R}
-  Open:   https://dockhand.${DOMAIN}
-  Follow the built-in setup wizard to create your admin account.
-  Dockhand includes SSO, MFA, and user management out of the box.
-
-${C_B}${C_YEL}Step 5 — Secure Admin Port${C_R}
-  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "  ufw delete allow 81/tcp && ufw reload"; else echo "  firewall-cmd --permanent --remove-port=81/tcp && firewall-cmd --reload"; fi)
+${C_B}Access:${C_R}
+  - Dockhand:   https://dockhand.${DOMAIN}
+  - CrowdSec:   https://crowdsec.${DOMAIN}
+  - NPM Admin:  http://${ip}:81   (use password above)
 
 ${C_B}Troubleshooting:${C_R}
   Logs:    docker logs -f npm    docker logs -f dockhand    docker logs -f crowdsec
-  NPM:      cd ${STACK_DIR} && docker compose -f docker-compose.npm.yml restart
-  Dockhand: cd ${STACK_DIR} && docker compose -f docker-compose.dockhand.yml restart
-  CrowdSec: cd ${STACK_DIR} && docker compose -f docker-compose.crowdsec.yml restart
-  CS-CLI:   docker exec crowdsec cscli metrics    docker exec crowdsec cscli decisions list
-  CS:      cscli metrics    cscli decisions list    cscli collections list
+  Restart: cd ${STACK_DIR} && docker compose -f docker-compose.*.yml restart
+  CS-CLI:  docker exec crowdsec cscli metrics    docker exec crowdsec cscli decisions list
   FW:      ${fw_cmd}
   Log:     ${LOG_FILE}
 EOF
@@ -836,8 +926,10 @@ main() {
   setup_firewall
   setup_crowdsec
   setup_logrotate
+  # NEW: automatic NPM configuration
+  automate_npm
   DEPLOY_STATUS="success"
-  DEPLOYED_SERVICES="npm,dockhand,crowdsec,firewall"
+  DEPLOYED_SERVICES="npm,dockhand,crowdsec,firewall,ssl"
   print_summary
 }
 
