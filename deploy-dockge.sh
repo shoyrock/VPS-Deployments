@@ -28,6 +28,7 @@ DOMAIN=""  # Set at runtime via user prompt
 # Deployment status tracking for guaranteed completion summary
 DEPLOY_STATUS="in_progress"
 DEPLOYED_SERVICES=""
+CROWDSEC_CHOICE="crowdsec"    # crowdsec | fail2ban
 
 # Colors (TTY only)
 if [[ -t 1 ]]; then
@@ -84,7 +85,9 @@ _on_exit() {
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
     printf "${C_B}║  %-72s  ║${C_R}\n" "Dockge:    http://dockge.${DOMAIN}"
     printf "${C_B}║  %-72s  ║${C_R}\n" "Authelia:  https://authelia.${DOMAIN}"
-    printf "${C_B}║  %-72s  ║${C_R}\n" "CrowdSec:  http://crowdsec.${DOMAIN}"
+    [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]] && printf "${C_B}║  %-72s  ║${C_R}\n" "CrowdSec:  http://crowdsec.${DOMAIN}"
+    [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" != "x86_64" ]] && printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "ARM: CrowdSec CLI-only — see guide below"
+    [[ "$CROWDSEC_CHOICE" == "fail2ban" ]] && printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "Fail2Ban:  Active (ARM) — manage with fail2ban-client"
     printf "${C_B}║  %-72s  ║${C_R}\n" ""
     printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "Authelia Username: admin"
     printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "Authelia Password: $exit_pass"
@@ -152,6 +155,7 @@ preflight_checks() {
     aarch64|arm64) readonly DOCKER_ARCH="arm64" ;;
     *) fatal "Unsupported arch: ${ARCH}. Need x86_64 or arm64." ;;
   esac
+  readonly CROWDSEC_CHOICE 2>/dev/null || true
   success "Arch: ${ARCH} (${DOCKER_ARCH})"
 
   info "Checking internet..."
@@ -627,18 +631,27 @@ services:
       - TZ=UTC
     networks:
       - proxy
+networks:
+  proxy:
+    external: true
+COMPOSE_CROWDSEC
+
+  if [[ "$DOCKER_ARCH" == "amd64" ]]; then
+    cat >> "${STACK_DIR}/docker-compose.crowdsec.yml" << 'DASHBOARD'
   crowdsec-dashboard:
     image: partitio/crowdsec-dashboard:latest
     container_name: crowdsec-dashboard
     restart: unless-stopped
     environment:
       - CROWDSEC_API_URL=http://crowdsec:8080
+      - MB_DB_FILE=/data/crowdsec.db
+    volumes:
+      - ./crowdsec/dashboard-data:/data
+      - ./crowdsec/data:/var/lib/crowdsec/data:ro
     networks:
       - proxy
-networks:
-  proxy:
-    external: true
-COMPOSE_CROWDSEC
+DASHBOARD
+  fi
 
   info "Pulling Docker images — this may take a few minutes, please wait..."
   docker compose -f "${STACK_DIR}/docker-compose.npm.yml" pull
@@ -720,10 +733,29 @@ COMPOSE_CROWDSEC
 
   info "Starting CrowdSec..."
   docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d
+  info "Waiting for CrowdSec container to be ready..."
+  for i in $(seq 1 30); do
+    docker ps --format '{{.Names}}' | grep -qx "crowdsec" && { success "CrowdSec container running"; break; }
+    printf "${C_DIM}  Waiting for CrowdSec container... (%d/30)${C_R}\r" "$i"
+    [[ $i -eq 30 ]] && warn "CrowdSec container not found"
+    sleep 2
+  done
+  printf "\n"
+
+  if [[ "$DOCKER_ARCH" == "amd64" ]]; then
+    info "Waiting for CrowdSec Dashboard to be ready..."
+    for i in $(seq 1 30); do
+      docker ps --format '{{.Names}}' | grep -qx "crowdsec-dashboard" && { success "CrowdSec Dashboard ready"; break; }
+      printf "${C_DIM}  Waiting for CrowdSec Dashboard... (%d/30)${C_R}\r" "$i"
+      [[ $i -eq 30 ]] && warn "CrowdSec Dashboard timeout"
+      sleep 2
+    done
+    printf "\n"
+  fi
 
   success "NPM: http://${ip}:81"
-  success "Dockge: http://${ip}:5001"
-  success "Authelia: http://${ip}:9091"
+  success "Dockge ready (access via NPM proxy)"
+  success "Authelia deployed (access via NPM proxy)"
 }
 
 
@@ -820,6 +852,58 @@ print_summary() {
   local ext_ip; ext_ip=$(get_external_ip)
   local fw_cmd; [[ "$OS_FAMILY" == "debian" ]] && fw_cmd="ufw status verbose" || fw_cmd="firewall-cmd --list-all"
 
+  local crowdsec_display="crowdsec    crowdsec     8080 (LAPI)        crowdsec.${DOMAIN} (amd64 only)"
+  [[ "$CROWDSEC_CHOICE" == "fail2ban" ]] && crowdsec_display="fail2ban   fail2ban   —                  (internal, no proxy needed)"
+
+  local dns_crowdsec=""
+  local proxy_crowdsec=""
+  if [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]]; then
+    dns_crowdsec="  A  crowdsec.${DOMAIN}   → ${ip}  (CrowdSec Dashboard)"
+    proxy_crowdsec=$(cat << 'CROWDPROXY'
+
+     ${C_B}CrowdSec Dashboard:${C_R}
+     ┌──────────────────────────────────────────────┐
+     │ Domain Names:    crowdsec.${DOMAIN}           │
+     │ Scheme:          http                         │
+     │ Forward Host:    crowdsec-dashboard           │
+     │ Forward Port:    3000                         │
+     │ Block Exploits:  ON                           │
+     │ Access List:     Publicly Accessible          │
+     └──────────────────────────────────────────────┘
+     Save → SSL tab → Request cert → Force SSL ON
+     → Dashboard is read-only — no Authelia 2FA needed
+CROWDPROXY
+)
+  elif [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" != "x86_64" ]]; then
+    dns_crowdsec="  A  crowdsec.${DOMAIN}   → ${ip}  (not used — CLI-only)"
+    proxy_crowdsec=$(cat << 'CROWDSECCLI'
+
+     ${C_B}CrowdSec (CLI-only, ARM):${C_R}
+     ┌────────────────────────────────────────────────┐
+     │ No dashboard — manage CrowdSec via CLI         │
+     │ Check alerts:   cscli alerts list              │
+     │ Check bouncers: cscli bouncers list            │
+     │ Check metrics:  cscli metrics                  │
+     │ Decisions:      cscli decisions list           │
+     │ Logs:           sudo journalctl -u crowdsec -f │
+     └────────────────────────────────────────────────┘
+CROWDSECCLI
+)
+  else
+    dns_crowdsec="  A  crowdsec.${DOMAIN}   → ${ip}  (not used with Fail2Ban)"
+    proxy_crowdsec=$(cat << 'FAIL2BANPROXY'
+
+     ${C_B}Fail2Ban (ARM):${C_R}
+     ┌────────────────────────────────────────────────┐
+     │ No proxy host needed — Fail2Ban runs on host   │
+     │ Manage with: fail2ban-client status nginx-proxy-manager
+     │ Ban IP: fail2ban-client set nginx-proxy-manager banip <IP>
+     │ Unban IP: fail2ban-client set nginx-proxy-manager unbanip <IP>
+     └────────────────────────────────────────────────┘
+FAIL2BANPROXY
+)
+  fi
+
   printf "\n"
   printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
   printf "${C_B}${C_GRN}║                     🎉  DEPLOYMENT COMPLETE                                  ║${C_R}\n"
@@ -847,6 +931,22 @@ ${C_B}Dockge${C_R}
   Network:   proxy
   Stacks:    /opt/stacks
 
+${C_B}${C_YEL}── Container Summary ────────────────────────────────────────────────${C_R}
+${C_B}CONTAINER  ${C_R}  ${C_B}HOSTNAME     ${C_R}  ${C_B}PORTS              ${C_R}  ${C_B}NPM DOMAIN             ${C_R}
+${C_DIM}──────────  ────────────  ─────────────────  ───────────────────────${C_R}
+npm         npm          80, 443, 81        ${ip}:81 (admin)
+dockge      dockge       5001               dockge.${DOMAIN}
+authelia    authelia     9091               authelia.${DOMAIN}
+${crowdsec_display}
+
+${C_B}${C_GRN}── NPM Proxy Forwarding ──────────────────────────────────────${C_R}
+${C_B}Domain${C_R}                     ${C_B}Forward to${C_R}
+${C_DIM}──────────────────────────  ──────────────────────────${C_R}
+authelia.${DOMAIN}          → authelia:9091
+dockge.${DOMAIN}            → dockge:5001
+$(if [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]]; then echo "crowdsec.${DOMAIN}         → crowdsec-dashboard:3000"; fi)
+$(if [[ "$CROWDSEC_CHOICE" == "fail2ban" ]]; then echo "# Fail2Ban active — no proxy host needed"; fi)
+
 ${C_B}${C_YEL}════════════════════════════════════════════════════════════════${C_R}
 ${C_B}${C_YEL}  🔐  AUTHELIA LOGIN CREDENTIALS (SAVE THESE)${C_R}
 ${C_B}${C_YEL}════════════════════════════════════════════════════════════════${C_R}
@@ -867,10 +967,10 @@ ${C_B}Authelia${C_R}
   Snippets:  ${AUTHELIA_SNIPPETS_DIR}/
 
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
-${C_B}Containers${C_R}  npm, dockge, authelia, crowdsec (separate compose files)
+${C_B}Containers${C_R}  npm, dockge, authelia, ${CROWDSEC_CHOICE} (separate compose files)
 ${C_B}Network${C_R}   proxy (bridge)
 
-${C_B}CrowdSec${C_R}  Collections: sshd, nginx-proxy-manager, linux
+${C_B}${CROWDSEC_CHOICE^^}${C_R}  Collections: sshd, nginx-proxy-manager, linux
 ${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
 
 ${C_B}${C_YEL}Step 1 — NPM Admin${C_R}
@@ -878,7 +978,13 @@ ${C_B}${C_YEL}Step 1 — NPM Admin${C_R}
   Login:  admin@example.com / changeme
   ${C_RED}→ Change password immediately${C_R}
 
-${C_B}${C_YEL}Step 2 — Add Proxy Host in NPM${C_R}
+${C_B}${C_YEL}Step 2 — Add DNS Records${C_R}
+  A  authelia.${DOMAIN}   → ${ip}
+  A  dockge.${DOMAIN}     → ${ip}
+  ${dns_crowdsec}
+  A  *.${DOMAIN}          → ${ip}  (wildcard for other services)
+
+${C_B}${C_YEL}Step 3 — Add Proxy Host in NPM${C_R}
   Dashboards → Proxy Hosts → Add Proxy Host
   ┌──────────────────────────────────────┐
   │ Domain Names:    authelia.${DOMAIN}   │
@@ -889,7 +995,7 @@ ${C_B}${C_YEL}Step 2 — Add Proxy Host in NPM${C_R}
   └──────────────────────────────────────┘
   Click Save
 
-${C_B}${C_YEL}Step 2b — Add Dockge Proxy Host${C_R}
+${C_B}${C_YEL}Step 3b — Add Dockge Proxy Host${C_R}
   Dashboards → Proxy Hosts → Add Proxy Host
   ┌──────────────────────────────────────┐
   │ Domain Names:    dockge.${DOMAIN}     │
@@ -901,11 +1007,13 @@ ${C_B}${C_YEL}Step 2b — Add Dockge Proxy Host${C_R}
   │   @authelia_signin {                 │
   │     return 302 https://authelia.${DOMAIN}?rd=\$scheme://\$http_host\$request_uri; │
   │   }                                  │
-  │   include /opt/dockge-stack/authelia/snippets/authelia-authrequest.conf; │
-  └──────────────────────────────────────┘
-  Click Save
+│   include /opt/dockge-stack/authelia/snippets/authelia-authrequest.conf; │
+   └──────────────────────────────────────┘
+   Click Save
 
-${C_B}${C_YEL}Step 3 — SSL Certificates${C_R}
+${proxy_crowdsec}
+
+${C_B}${C_YEL}Step 4 — SSL Certificates${C_R}
   On each proxy host → SSL tab
   ┌──────────────────────────────────────┐
   │ SSL:             Request a new cert  │
@@ -916,16 +1024,16 @@ ${C_B}${C_YEL}Step 3 — SSL Certificates${C_R}
   └──────────────────────────────────────┘
   Click Save
 
-${C_B}${C_YEL}Step 4 — Change Authelia Password${C_R}
+${C_B}${C_YEL}Step 5 — Change Authelia Password${C_R}
   docker exec -it authelia authelia crypto hash generate argon2 --password 'YOUR_NEW_PASSWORD'
   # Then edit ${AUTHELIA_CONFIG_DIR}/users.yml and replace the password hash
 
-${C_B}${C_YEL}Step 5 — Register TOTP Device${C_R}
+${C_B}${C_YEL}Step 6 — Register TOTP Device${C_R}
   1. Log in to https://authelia.${DOMAIN}
   2. Go to Settings → Two-Factor Authentication
   3. Scan QR code with your authenticator app
 
-${C_B}${C_YEL}Step 6 — Protect Any Service${C_R}
+${C_B}${C_YEL}Step 7 — Protect Any Service${C_R}
   In NPM, edit the proxy host's Advanced tab:
   ┌────────────────────────────────────────────────────┐
   │ include /opt/dockge-stack/authelia/snippets/authelia-authrequest.conf; │
@@ -936,7 +1044,7 @@ ${C_B}${C_YEL}Step 6 — Protect Any Service${C_R}
   │ }                                                  │
   └────────────────────────────────────────────────────┘
 
-${C_B}${C_YEL}Step 7 — Secure Admin Port${C_R}
+${C_B}${C_YEL}Step 8 — Secure Admin Port${C_R}
   $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "  ufw delete allow 81/tcp && ufw reload"; else echo "  firewall-cmd --permanent --remove-port=81/tcp && firewall-cmd --reload"; fi)
 
 ${C_B}Troubleshooting:${C_R}
@@ -944,7 +1052,7 @@ ${C_B}Troubleshooting:${C_R}
   NPM:      cd ${STACK_DIR} && docker compose -f docker-compose.npm.yml restart
   Dockge:   cd ${STACK_DIR} && docker compose -f docker-compose.dockge.yml restart
   Authelia: cd ${STACK_DIR} && docker compose -f docker-compose.authelia.yml restart
-  CrowdSec: cd ${STACK_DIR} && docker compose -f docker-compose.crowdsec.yml restart
+  CrowdSec: cd ${STACK_DIR} && docker compose -f docker-compose.${CROWDSEC_CHOICE}.yml restart
   CS-CLI:   docker exec crowdsec cscli metrics    docker exec crowdsec cscli decisions list
   CS:      cscli metrics    cscli decisions list    cscli collections list
   FW:      ${fw_cmd}
@@ -953,6 +1061,37 @@ EOF
   _log "INFO" "=== Deployment completed in $(( elapsed / 60 ))m $(( elapsed % 60 ))s ==="
 }
 
+
+setup_fail2ban() {
+  step "Fail2Ban (ARM alternative to CrowdSec)"
+  info "Installing Fail2Ban..."
+  if [[ "$OS_FAMILY" == "debian" ]]; then
+    apt-get install -y -qq fail2ban
+  else
+    local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
+    $pkg install -y -q fail2ban
+  fi
+  mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/filter.d
+  cat > /etc/fail2ban/filter.d/nginx-proxy-manager.conf << 'FILTER'
+[Definition]
+failregex = ^<HOST> - - \[.*\] ".*" 4\d\d .*$
+ignoreregex =
+FILTER
+  cat > /etc/fail2ban/jail.d/nginx-proxy-manager.conf << 'JAIL'
+[nginx-proxy-manager]
+enabled = true
+port    = http,https
+filter  = nginx-proxy-manager
+logpath = ${NPM_LOGS_DIR}/*_access.log
+maxretry = 5
+bantime  = 3600
+findtime = 600
+JAIL
+  systemctl enable fail2ban
+  systemctl restart fail2ban
+  success "Fail2Ban installed with NPM jail"
+  DEPLOYED_SERVICES+=",fail2ban"
+}
 
 setup_crowdsec() {
   step "CrowdSec (Docker)"
@@ -973,15 +1112,6 @@ setup_crowdsec() {
     return
   fi
   success "CrowdSec container running"
-
-  info "Waiting for CrowdSec Dashboard to be ready..."
-  for i in $(seq 1 30); do
-    docker ps --format '{{.Names}}' | grep -qx "crowdsec-dashboard" && { success "CrowdSec Dashboard ready"; break; }
-    printf "${C_DIM}  Waiting for CrowdSec Dashboard... (%d/30)${C_R}\r" "$i"
-    [[ $i -eq 30 ]] && warn "CrowdSec Dashboard timeout"
-    sleep 2
-  done
-  printf "\n"
 
   info "Verifying collections..."
   docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/sshd" && success "sshd collection" || warn "sshd collection not found"
@@ -1091,12 +1221,25 @@ main() {
   setup_stack
   setup_authelia_users
   setup_firewall
-  setup_crowdsec
+  if [[ "$DOCKER_ARCH" == "amd64" ]]; then
+    setup_crowdsec
+  else
+    printf "\n${C_YEL}ARM architecture detected — CrowdSec dashboard not available.${C_R}\n"
+    printf "${C_B}Options:${C_R}\n"
+    printf "  ${C_CYN}1)${C_R} CrowdSec (CLI-only, no dashboard)\n"
+    printf "  ${C_CYN}2)${C_R} Fail2Ban (traditional, no dashboard needed)\n"
+    printf "${C_B}Choice [1/2]:${C_R} "
+    read -r arm_choice
+    case "$arm_choice" in
+      2) setup_fail2ban; CROWDSEC_CHOICE="fail2ban" ;;
+      *) setup_crowdsec ;;
+    esac
+  fi
   setup_logrotate
   print_summary
   # Mark deployment as successful for the exit trap summary
   DEPLOY_STATUS="success"
-  DEPLOYED_SERVICES="npm,dockge,authelia,crowdsec"
+  DEPLOYED_SERVICES="npm,dockge,authelia,${CROWDSEC_CHOICE}"
 }
 
 main "$@"

@@ -3,8 +3,17 @@
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     exec sudo bash "$0" "$@"
 fi
+
+# ------------------------------------------------------------
+# Silent carriage-return fix � no re-exec needed
+# ------------------------------------------------------------
+if [[ -n "$(tr -d '\r' < "$0" | cmp -s - "$0" 2>&1 || true)" ]]; then
+    exec /bin/bash <(tr -d '\r' < "$0") "$@"
+fi
+# ------------------------------------------------------------
+
 # deploy-dockhand.sh -- Docker + NPM + Dockhand + CrowdSec (v4.2.0-oneclick-final)
-# One‑click VPS deployment. Usage: sudo ./deploy-dockhand.sh
+# One-click VPS deployment. Usage: sudo ./deploy-dockhand.sh
 # Dockhand: built-in SSO, MFA, user management + full host file access (read/write)
 set -euo pipefail
 IFS=$'\n\t'
@@ -26,6 +35,7 @@ DOMAIN=""  # Set at runtime via user prompt
 # Deployment status tracking for guaranteed completion summary
 DEPLOY_STATUS="in_progress"
 DEPLOYED_SERVICES=""
+CROWDSEC_CHOICE="crowdsec"    # crowdsec | fail2ban
 
 # Colors (TTY only)
 if [[ -t 1 ]]; then
@@ -37,16 +47,16 @@ fi
 
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
 _log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}" >> "$LOG_FILE" 2>/dev/null || true; }
-info()    { printf "${C_BLU}ℹ${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
-warn()    { printf "${C_YEL}⚠${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
-error()   { printf "${C_RED}✖${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }
-success() { printf "${C_GRN}✔${C_R}  %s\n" "$*"; _log "SUCCESS" "$@"; }
+info()    { printf "${C_BLU}?${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
+warn()    { printf "${C_YEL}?${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
+error()   { printf "${C_RED}?${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }
+success() { printf "${C_GRN}?${C_R}  %s\n" "$*"; _log "SUCCESS" "$@"; }
 fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; DEPLOY_STATUS="failed"; exit 1; }
-step()    { printf "\n${C_B}${C_CYN}── %s ──${C_R}\n" "$*"; _log "STEP" "$@"; }
+step()    { printf "\n${C_B}${C_CYN}-- %s --${C_R}\n" "$*"; _log "STEP" "$@"; }
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# GUARANTEED COMPLETION SUMMARY — runs on exit regardless of success/failure
-# ═══════════════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------------------
+# GUARANTEED COMPLETION SUMMARY � runs on exit regardless of success/failure
+# -------------------------------------------------------------------------------
 get_external_ip() {
   curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
   curl -s -4 --max-time 10 https://ifconfig.me 2>/dev/null || \
@@ -63,34 +73,36 @@ _on_exit() {
 
   printf "\n"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
-    printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
-    printf "${C_B}${C_GRN}║                    ✅  DEPLOYMENT COMPLETED SUCCESSFULLY                      ║${C_R}\n"
-    printf "${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    printf "${C_B}${C_GRN}+------------------------------------------------------------------------------+${C_R}\n"
+    printf "${C_B}${C_GRN}�                    ?  DEPLOYMENT COMPLETED SUCCESSFULLY                      �${C_R}\n"
+    printf "${C_B}${C_GRN}�------------------------------------------------------------------------------�${C_R}\n"
   else
-    printf "${C_B}${C_RED}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
-    printf "${C_B}${C_RED}║                     ❌  DEPLOYMENT DID NOT COMPLETE                           ║${C_R}\n"
-    printf "${C_B}${C_RED}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    printf "${C_B}${C_RED}+------------------------------------------------------------------------------+${C_R}\n"
+    printf "${C_B}${C_RED}�                     ?  DEPLOYMENT DID NOT COMPLETE                           �${C_R}\n"
+    printf "${C_B}${C_RED}�------------------------------------------------------------------------------�${C_R}\n"
   fi
-  printf "${C_B}║  %-72s  ║${C_R}\n" "Elapsed:  ${elapsed}s"
-  printf "${C_B}║  %-72s  ║${C_R}\n" "VPS IP:   $ip"
-  printf "${C_B}║  %-72s  ║${C_R}\n" "External: $ext_ip"
-  printf "${C_B}║  %-72s  ║${C_R}\n" "Domain:   ${DOMAIN:-<not set>}"
-  printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
-  printf "${C_B}║  %-72s  ║${C_R}\n" "NPM Admin: http://${ip}:81"
+  printf "${C_B}�  %-72s  �${C_R}\n" "Elapsed:  ${elapsed}s"
+  printf "${C_B}�  %-72s  �${C_R}\n" "VPS IP:   $ip"
+  printf "${C_B}�  %-72s  �${C_R}\n" "External: $ext_ip"
+  printf "${C_B}�  %-72s  �${C_R}\n" "Domain:   ${DOMAIN:-<not set>}"
+  printf "${C_B}�------------------------------------------------------------------------------�${C_R}\n"
+  printf "${C_B}�  %-72s  �${C_R}\n" "NPM Admin: http://${ip}:81"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
-    printf "${C_B}║  %-72s  ║${C_R}\n" "Dockhand:  https://dockhand.${DOMAIN}"
-    printf "${C_B}║  %-72s  ║${C_R}\n" "           http://${ip}:3000 (direct)"
-    [[ "$(uname -m)" == "x86_64" ]] && printf "${C_B}║  %-72s  ║${C_R}\n" "CrowdSec:  https://crowdsec.${DOMAIN}"
-    printf "${C_B}║  %-72s  ║${C_R}\n" ""
-    printf "${C_B}║  ${C_GRN}%-72s${C_R}${C_B}  ║${C_R}\n" "Dockhand has full read/write host file access."
+    printf "${C_B}�  %-72s  �${C_R}\n" "Dockhand:  https://dockhand.${DOMAIN}"
+    printf "${C_B}�  %-72s  �${C_R}\n" "           https://dockhand.${DOMAIN} (NPM)"
+    [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]] && printf "${C_B}�  %-72s  �${C_R}\n" "CrowdSec:  http://crowdsec.${DOMAIN}"
+    [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" != "x86_64" ]] && printf "${C_B}�  ${C_YEL}%-72s${C_R}${C_B}  �${C_R}\n" "ARM: CrowdSec CLI-only — see guide below"
+    [[ "$CROWDSEC_CHOICE" == "fail2ban" ]] && printf "${C_B}�  ${C_YEL}%-72s${C_R}${C_B}  �${C_R}\n" "Fail2Ban:  Active (ARM) — manage with fail2ban-client"
+    printf "${C_B}�  %-72s  �${C_R}\n" ""
+    printf "${C_B}�  ${C_GRN}%-72s${C_R}${C_B}  �${C_R}\n" "Dockhand has full read/write host file access."
   fi
-  printf "${C_B}║  %-72s  ║${C_R}\n" "Ports: 80 (HTTP), 443 (HTTPS), 81 (NPM Admin)"
-  printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
-  printf "${C_B}║  %-72s  ║${C_R}\n" "Log: $LOG_FILE"
-  printf "${C_B}╚══════════════════════════════════════════════════════════════════════════════╝${C_R}\n"
+  printf "${C_B}�  %-72s  �${C_R}\n" "Ports: 80 (HTTP), 443 (HTTPS), 81 (NPM Admin)"
+  printf "${C_B}�------------------------------------------------------------------------------�${C_R}\n"
+  printf "${C_B}�  %-72s  �${C_R}\n" "Log: $LOG_FILE"
+  printf "${C_B}+------------------------------------------------------------------------------+${C_R}\n"
   printf "\n"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
-    printf "${C_B}${C_GRN}Your VPS is ready!${C_R} DNS must point ${C_CYN}*.${DOMAIN} → ${ext_ip}${C_R}\n\n"
+    printf "${C_B}${C_GRN}Your VPS is ready!${C_R} DNS must point ${C_CYN}*.${DOMAIN} ? ${ext_ip}${C_R}\n\n"
   else
     printf "${C_B}${C_YEL}Deployment failed.${C_R} Check: ${C_CYN}cat $LOG_FILE${C_R}\n\n"
   fi
@@ -139,6 +151,7 @@ preflight_checks() {
     *) fatal "Unsupported arch: ${ARCH}. Need x86_64 or arm64." ;;
   esac
   success "Arch: ${ARCH} (${DOCKER_ARCH})"
+  readonly CROWDSEC_CHOICE 2>/dev/null || true
 
   info "Checking internet..."
   if ! curl -sf --max-time 10 https://download.docker.com/ >/dev/null 2>&1 && \
@@ -209,7 +222,7 @@ idempotent_cleanup() {
 system_update() {
   step "System Update"
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-  info "Updating packages — this may take a few minutes, please wait..."
+  info "Updating packages � this may take a few minutes, please wait..."
   if [[ "$OS_FAMILY" == "debian" ]]; then
     apt-get update -qq && apt-get upgrade -y -qq && apt-get autoremove -y -qq && apt-get autoclean -qq
   else
@@ -221,7 +234,7 @@ system_update() {
 
 install_dependencies() {
   step "Dependencies"
-  info "Installing required packages — please wait..."
+  info "Installing required packages � please wait..."
   if [[ "$OS_FAMILY" == "debian" ]]; then
     apt-get install -y -qq ca-certificates curl gnupg lsb-release \
       software-properties-common apt-transport-https jq cron logrotate
@@ -238,7 +251,7 @@ install_docker() {
   if command -v docker &>/dev/null && docker version &>/dev/null; then
     success "Docker already installed: $(docker --version)"; return 0
   fi
-  info "Installing Docker CE — this may take a few minutes, please wait..."
+  info "Installing Docker CE � this may take a few minutes, please wait..."
   if [[ "$OS_FAMILY" == "debian" ]]; then
     install -m 0755 -d /etc/apt/keyrings
     curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" -o /etc/apt/keyrings/docker.asc 2>/dev/null || \
@@ -293,7 +306,7 @@ get_user_domain() {
     local existing_domain
     existing_domain=$(tr -d '\n' < "${DOMAIN_PERSIST_FILE}" 2>/dev/null || true)
     if [[ -n "$existing_domain" ]]; then
-      printf "\n${C_YEL}⚠️  Previous deployment detected with domain: ${C_B}${existing_domain}${C_R}\n"
+      printf "\n${C_YEL}??  Previous deployment detected with domain: ${C_B}${existing_domain}${C_R}\n"
       printf "${C_YEL}   Press ${C_B}Y${C_R}${C_YEL} + Enter to REUSE this domain${C_R}\n"
       printf "${C_YEL}   Press ${C_B}N${C_R}${C_YEL} + Enter to enter a NEW domain${C_R}\n\n"
       read -rp "Reuse '${existing_domain}'? [Y/n]: " use_existing
@@ -321,8 +334,6 @@ services:
     container_name: dockhand
     hostname: dockhand
     restart: unless-stopped
-    ports:
-      - 3000:3000
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./dockhand-data:/app/data
@@ -343,9 +354,9 @@ COMPOSE_DOCKHAND
     printf "\r  ${C_DIM}Waiting for Dockhand... %d/30${C_R}" "$i"
     sleep 2
     if docker ps --format '{{.Names}}' | grep -qx "dockhand"; then
-      if curl -sf --max-time 5 http://127.0.0.1:3000 &>/dev/null; then
+      if docker exec dockhand wget -qO- --timeout=3 http://127.0.0.1:3000/ &>/dev/null; then
         printf "\r"
-        success "Dockhand ready at http://${ip}:3000"
+        success "Dockhand ready"
         break
       fi
     fi
@@ -407,7 +418,11 @@ COMPOSE_NPM
       echo '    restart: unless-stopped'
       echo '    environment:'
       echo '      - CROWDSEC_API_URL=http://crowdsec:8080'
+      echo '      - MB_DB_FILE=/data/crowdsec.db'
       echo '      - DISABLE_LOGIN=true'
+      echo '    volumes:'
+      echo '      - ./crowdsec/dashboard-data:/data'
+      echo '      - ./crowdsec/data:/var/lib/crowdsec/data:ro'
       echo '    networks:'
       echo '      - proxy'
     fi
@@ -505,12 +520,12 @@ COMPOSE_NPM
   fi
 
   success "NPM: http://${ip}:81"
-  success "Dockhand: http://${ip}:3000"
+  success "Dockhand: https://dockhand.${DOMAIN}"
 }
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# NPM API automation — secure password & proxy hosts
-# ═══════════════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------------------
+# NPM API automation � secure password & proxy hosts
+# -------------------------------------------------------------------------------
 NPM_TOKEN=""
 NPM_API_BASE="http://127.0.0.1:81/api"
 
@@ -531,7 +546,7 @@ npm_change_password() {
   LOGIN=$(_npm_api "/tokens" "json" -d "$JSON" 2>/dev/null)
   NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty')
   if [[ -z "$NPM_TOKEN" ]]; then
-    warn "Could not get NPM token — skipping automated NPM setup"
+    warn "Could not get NPM token � skipping automated NPM setup"
     return 1
   fi
 
@@ -543,10 +558,10 @@ npm_change_password() {
   NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty')
   if [[ -n "$NPM_TOKEN" ]]; then
     echo "$NEW_PASS" > "${STACK_DIR}/.npm_admin_password"
-    success "NPM admin password changed – saved to ${STACK_DIR}/.npm_admin_password"
+    success "NPM admin password changed � saved to ${STACK_DIR}/.npm_admin_password"
     return 0
   else
-    warn "NPM password change failed — manual intervention required"
+    warn "NPM password change failed � manual intervention required"
     return 1
   fi
 }
@@ -583,7 +598,7 @@ npm_create_proxy_host() {
   local ID
   ID=$(echo "$RESP" | jq -r '.id // empty')
   if [[ -n "$ID" ]]; then
-    success "Created proxy host: ${DOMAIN_NAME} → ${FWD_HOST}:${FWD_PORT}"
+    success "Created proxy host: ${DOMAIN_NAME} ? ${FWD_HOST}:${FWD_PORT}"
     echo "$ID"
   else
     warn "Failed to create proxy host for ${DOMAIN_NAME}"
@@ -638,12 +653,12 @@ automate_npm() {
   success "NPM automation completed"
 }
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------------------
 # Firewall, logrotate, CrowdSec setup
-# ═══════════════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------------------
 setup_firewall() {
   step "Firewall"
-  info "Configuring firewall — please wait..."
+  info "Configuring firewall � please wait..."
   if [[ "$OS_FAMILY" == "debian" ]]; then setup_firewall_debian
   else setup_firewall_rhel; fi
 }
@@ -713,6 +728,37 @@ ${NPM_LOGS_DIR}/*.log {
 }
 EOF
   success "Log rotation: ${NPM_LOGS_DIR}/*.log (14 days)"
+}
+
+setup_fail2ban() {
+  step "Fail2Ban (ARM alternative to CrowdSec)"
+  info "Installing Fail2Ban..."
+  if [[ "$OS_FAMILY" == "debian" ]]; then
+    apt-get install -y -qq fail2ban
+  else
+    local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
+    $pkg install -y -q fail2ban
+  fi
+  mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/filter.d
+  cat > /etc/fail2ban/filter.d/nginx-proxy-manager.conf << 'FILTER'
+[Definition]
+failregex = ^<HOST> - - \[.*\] ".*" 4\d\d .*$
+ignoreregex =
+FILTER
+  cat > /etc/fail2ban/jail.d/nginx-proxy-manager.conf << 'JAIL'
+[nginx-proxy-manager]
+enabled = true
+port    = http,https
+filter  = nginx-proxy-manager
+logpath = ${NPM_LOGS_DIR}/*_access.log
+maxretry = 5
+bantime  = 3600
+findtime = 600
+JAIL
+  systemctl enable fail2ban
+  systemctl restart fail2ban
+  success "Fail2Ban installed with NPM jail"
+  DEPLOYED_SERVICES+=",fail2ban"
 }
 
 setup_crowdsec() {
@@ -820,9 +866,9 @@ BOUNCER
   fi
 }
 
-# ═══════════════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------------------
 # Final summary
-# ═══════════════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------------------
 print_summary() {
   local elapsed=$(( $(date +%s) - START_TIME ))
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
@@ -834,16 +880,74 @@ print_summary() {
   fi
 
   printf "\n"
-  printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
-  printf "${C_B}${C_GRN}║                     🎉  DEPLOYMENT COMPLETE                                  ║${C_R}\n"
-  printf "${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
-  printf "${C_B}║  ${C_CYN}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}${C_B}                                                      ║${C_R}\n"
-  printf "${C_B}║  Elapsed: ${C_CYN}%dm %ds${C_R}${C_B}                                                     ║${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
-  printf "${C_B}╚══════════════════════════════════════════════════════════════════════════════╝${C_R}\n"
+  printf "${C_B}${C_GRN}+------------------------------------------------------------------------------+${C_R}\n"
+  printf "${C_B}${C_GRN}�                     ??  DEPLOYMENT COMPLETE                                  �${C_R}\n"
+  printf "${C_B}${C_GRN}�------------------------------------------------------------------------------�${C_R}\n"
+  printf "${C_B}�  ${C_CYN}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}${C_B}                                                      �${C_R}\n"
+  printf "${C_B}�  Elapsed: ${C_CYN}%dm %ds${C_R}${C_B}                                                     �${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
+  printf "${C_B}+------------------------------------------------------------------------------+${C_R}\n"
+
+  local crowdsec_display="crowdsec    crowdsec     8080 (LAPI)        crowdsec.${DOMAIN} (amd64 only)"
+  [[ "$CROWDSEC_CHOICE" == "fail2ban" ]] && crowdsec_display="fail2ban   fail2ban   —                  (internal, no proxy needed)"
+  local dns_crowdsec=""
+  local proxy_crowdsec=""
+  if [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]]; then
+    dns_crowdsec="  A  crowdsec.${DOMAIN}   → ${ip}  (CrowdSec Dashboard)"
+    proxy_crowdsec=$(cat << 'CROWDPROXY'
+
+    ${C_B}CrowdSec Dashboard:${C_R}
+    ┌────────────────────────────────────────┐
+    │ Domain Names:    crowdsec.${DOMAIN}           │
+    │ Scheme:          http                         │
+    │ Forward Host:    crowdsec-dashboard           │
+    │ Forward Port:    3000                         │
+    │ Block Exploits:  ON                           │
+    │ Access List:     Publicly Accessible          │
+    └─────────────────────────────────────────┘
+    Save → SSL tab → Request cert → Force SSL ON
+    → Dashboard is read-only — no Authelia 2FA needed
+CROWDPROXY
+)
+  elif [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" != "x86_64" ]]; then
+    dns_crowdsec="  A  crowdsec.${DOMAIN}   → ${ip}  (not used — CLI-only)"
+    proxy_crowdsec=$(cat << 'CROWDSECCLI'
+
+    ${C_B}CrowdSec (CLI-only, ARM):${C_R}
+    ┌─────────────────────────────────────────┐
+    │ No dashboard — manage CrowdSec via CLI         │
+    │ Check alerts:   cscli alerts list              │
+    │ Check bouncers: cscli bouncers list            │
+    │ Check metrics:  cscli metrics                  │
+    │ Decisions:      cscli decisions list           │
+    │ Logs:           sudo journalctl -u crowdsec -f │
+    └────────────────────────────────────────┘
+CROWDSECCLI
+)
+  else
+    dns_crowdsec="  A  crowdsec.${DOMAIN}   → ${ip}  (not used with Fail2Ban)"
+    proxy_crowdsec=$(cat << 'FAIL2BANPROXY'
+
+    ${C_B}Fail2Ban (ARM):${C_R}
+    ┌─────────────────────────────────────────┐
+    │ No proxy host needed — Fail2Ban runs on host   │
+    │ Manage with: fail2ban-client status nginx-proxy-manager
+    │ Ban IP: fail2ban-client set nginx-proxy-manager banip <IP>
+    │ Unban IP: fail2ban-client set nginx-proxy-manager unbanip <IP>
+    └────────────────────────────────────────┘
+FAIL2BANPROXY
+)
+  fi
 
   cat << EOF
 
 ${C_B}Stack Directory${C_R}    ${STACK_DIR}
+
+${C_B}${C_GRN}── NPM Proxy Forwarding ──────────────────────────────────────${C_R}
+${C_B}Domain${C_R}                     ${C_B}Forward to${C_R}
+${C_DIM}──────────────────────────  ──────────────────────────${C_R}
+dockhand.${DOMAIN}           → dockhand:3000
+$(if [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]]; then echo "crowdsec.${DOMAIN}         → crowdsec-dashboard:3000"; fi)
+$(if [[ "$CROWDSEC_CHOICE" == "fail2ban" ]]; then echo "# Fail2Ban active — no proxy host needed"; fi)
 
 ${C_B}Nginx Proxy Manager${C_R}
   Admin:   http://${ip}:81
@@ -858,37 +962,33 @@ ${C_B}Nginx Proxy Manager${C_R}
 
 ${C_B}Dockhand${C_R}
   URL:      https://dockhand.${DOMAIN}
-  Direct:   http://${ip}:3000
+  Direct:   https://dockhand.${DOMAIN}
   Container: dockhand
   Network:   proxy
   Data:      ${DOCKHAND_DATA_DIR}
   Auth:      Built-in SSO, MFA, user management (setup wizard on first visit)
   Host Files: FULL READ/WRITE access under /host
 
-${C_B}CrowdSec${C_R}
-  Dashboard: https://crowdsec.${DOMAIN}  (if amd64)
-  Collections: sshd, nginx-proxy-manager, linux
+${proxy_crowdsec}
 ${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
 
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
-${C_B}Containers${C_R}  npm, dockhand, crowdsec (+ dashboard on amd64)
+${C_B}Containers${C_R}  npm, dockhand, ${CROWDSEC_CHOICE}
 ${C_B}Network${C_R}   proxy (bridge)
 
 ${C_B}${C_YEL}Next Steps (already done automatically):${C_R}
-  ✅ Proxy hosts for Dockhand & CrowdSec created
-  ✅ Let's Encrypt SSL certificates requested (may take a moment to issue)
-  ✅ NPM admin password securely changed
-  ✅ Dockhand has full read/write access to the host filesystem
+  ? Proxy hosts for Dockhand created
+  ? Let's Encrypt SSL certificates requested (may take a moment to issue)
+  ? NPM admin password securely changed
+  ? Dockhand has full read/write access to the host filesystem
 
 ${C_B}Access:${C_R}
   - Dockhand:   https://dockhand.${DOMAIN}
-  - CrowdSec:   https://crowdsec.${DOMAIN}
   - NPM Admin:  http://${ip}:81   (use password above)
 
 ${C_B}Troubleshooting:${C_R}
-  Logs:    docker logs -f npm    docker logs -f dockhand    docker logs -f crowdsec
+  Logs:    docker logs -f npm    docker logs -f dockhand
   Restart: cd ${STACK_DIR} && docker compose -f docker-compose.*.yml restart
-  CS-CLI:  docker exec crowdsec cscli metrics    docker exec crowdsec cscli decisions list
   FW:      ${fw_cmd}
   Log:     ${LOG_FILE}
 EOF
@@ -908,11 +1008,24 @@ main() {
   setup_dockhand
   setup_stack
   setup_firewall
-  setup_crowdsec
+  if [[ "$DOCKER_ARCH" == "amd64" ]]; then
+    setup_crowdsec
+  else
+    printf "\n${C_YEL}ARM architecture detected -- CrowdSec dashboard not available.${C_R}\n"
+    printf "${C_B}Options:${C_R}\n"
+    printf "  ${C_CYN}1)${C_R} CrowdSec (CLI-only, no dashboard)\n"
+    printf "  ${C_CYN}2)${C_R} Fail2Ban (traditional, no dashboard needed)\n"
+    printf "${C_B}Choice [1/2]:${C_R} "
+    read -r arm_choice
+    case "$arm_choice" in
+      2) setup_fail2ban; CROWDSEC_CHOICE="fail2ban" ;;
+      *) setup_crowdsec ;;
+    esac
+  fi
   setup_logrotate
   automate_npm
   DEPLOY_STATUS="success"
-  DEPLOYED_SERVICES="npm,dockhand,crowdsec,firewall,ssl"
+  DEPLOYED_SERVICES="npm,dockhand,${CROWDSEC_CHOICE},firewall"
   print_summary
 }
 
