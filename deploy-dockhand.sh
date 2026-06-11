@@ -85,6 +85,9 @@ _on_exit() {
     [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]] && printf "${C_B}�  %-72s  �${C_R}\n" "CrowdSec:  http://crowdsec.${DOMAIN}"
     [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" != "x86_64" ]] && printf "${C_B}�  ${C_YEL}%-72s${C_R}${C_B}  �${C_R}\n" "ARM: CrowdSec CLI-only — see guide below"
     [[ "$CROWDSEC_CHOICE" == "fail2ban" ]] && printf "${C_B}�  ${C_YEL}%-72s${C_R}${C_B}  �${C_R}\n" "Fail2Ban:  Active (ARM) — manage with fail2ban-client"
+    printf "${C_B}�  %-72s  �${C_R}\n" "NPM Proxy Forwarding:"
+    printf "${C_B}�  %-72s  �${C_R}\n" "  dockhand.${DOMAIN}           -> dockhand:3000"
+    [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]] && printf "${C_B}�  %-72s  �${C_R}\n" "  crowdsec.${DOMAIN}          -> crowdsec-dashboard:3000"
     printf "${C_B}�  %-72s  �${C_R}\n" ""
     printf "${C_B}�  ${C_GRN}%-72s${C_R}${C_B}  �${C_R}\n" "Dockhand has full read/write host file access."
   fi
@@ -410,7 +413,7 @@ COMPOSE_NPM
       echo '    environment:'
       echo '      - CROWDSEC_API_URL=http://crowdsec:8080'
       echo '      - MB_DB_FILE=/data/crowdsec.db'
-      echo '      - DISABLE_LOGIN=true'
+      echo '      - MB_SITE_LOCATION=https://crowdsec.'"${DOMAIN}"''
       echo '    volumes:'
       echo '      - ./crowdsec/dashboard-data:/data'
       echo '      - ./crowdsec/data:/var/lib/crowdsec/data:ro'

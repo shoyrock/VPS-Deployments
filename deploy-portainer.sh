@@ -93,6 +93,11 @@ _on_exit() {
     [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]] && printf "${C_B}║  %-72s  ║${C_R}\n" "CrowdSec:  http://crowdsec.${DOMAIN}"
     [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" != "x86_64" ]] && printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "ARM: CrowdSec CLI-only — see guide below"
     [[ "$CROWDSEC_CHOICE" == "fail2ban" ]] && printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "Fail2Ban:  Active (ARM) — manage with fail2ban-client"
+    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    printf "${C_B}║  %-72s  ║${C_R}\n" "NPM Proxy Forwarding:"
+    printf "${C_B}║  %-72s  ║${C_R}\n" "  authelia.${DOMAIN}          → authelia:9091"
+    printf "${C_B}║  %-72s  ║${C_R}\n" "  portainer.${DOMAIN}         → portainer:9000"
+    [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]] && printf "${C_B}║  %-72s  ║${C_R}\n" "  crowdsec.${DOMAIN}          → crowdsec-dashboard:3000"
     printf "${C_B}║  %-72s  ║${C_R}\n" ""
     printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "Authelia Username: admin"
     printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "Authelia Password: $exit_pass"
@@ -652,7 +657,7 @@ COMPOSE_CROWDSEC
     environment:
       - CROWDSEC_API_URL=http://crowdsec:8080
       - MB_DB_FILE=/data/crowdsec.db
-      - DISABLE_LOGIN=true
+      - MB_SITE_LOCATION=https://crowdsec.${DOMAIN}
     volumes:
       - ./crowdsec/dashboard-data:/data
       - ./crowdsec/data:/var/lib/crowdsec/data:ro
