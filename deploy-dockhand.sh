@@ -1,15 +1,15 @@
-#!/usr/bin/env bash
+#!/usr/bin/#!/usr/bin/env bash
 # Auto-elevate to root if not already running as root
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     exec sudo bash "$0" "$@"
 fi
-# deploy-dockhand.sh -- Docker + NPM + Dockhand + CrowdSec (v4.0.0-crowdsec)
+# deploy-dockhand.sh -- Docker + NPM + Dockhand + CrowdSec (v4.0.0-crowdsec-fixed)
 # Idempotent VPS deployment. Usage: sudo ./deploy-dockhand.sh
 # Dockhand: built-in SSO, MFA, user management (NO Authelia needed)
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.0.0-crowdsec"
+readonly SCRIPT_VERSION="4.0.0-crowdsec-fixed"
 readonly SCRIPT_NAME="deploy-dockhand.sh"
 readonly START_TIME=$(date +%s)
 readonly STACK_DIR="/opt/dockhand-stack"
@@ -17,6 +17,7 @@ readonly NPM_DATA_DIR="${STACK_DIR}/data"
 readonly NPM_LE_DIR="${STACK_DIR}/letsencrypt"
 readonly NPM_LOGS_DIR="${NPM_DATA_DIR}/logs"
 readonly CROWDSEC_DIR="${STACK_DIR}/crowdsec"
+readonly DOCKHAND_DATA_DIR="${STACK_DIR}/dockhand-data"
 readonly DOMAIN_PERSIST_FILE="/etc/vps-deploy-domain"
 readonly LOG_FILE="/var/log/vps-deploy.log"
 
@@ -79,7 +80,7 @@ _on_exit() {
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
     printf "${C_B}║  %-72s  ║${C_R}\n" "Dockhand:  http://dockhand.${DOMAIN}"
     printf "${C_B}║  %-72s  ║${C_R}\n" "           http://${ip}:3000 (direct)"
-    printf "${C_B}║  %-72s  ║${C_R}\n" "CrowdSec:  http://crowdsec.${DOMAIN}"
+    [[ "$(uname -m)" == "x86_64" ]] && printf "${C_B}║  %-72s  ║${C_R}\n" "CrowdSec:  http://crowdsec.${DOMAIN}"
     printf "${C_B}║  %-72s  ║${C_R}\n" ""
     printf "${C_B}║  ${C_GRN}%-72s${C_R}${C_B}  ║${C_R}\n" "Dockhand has built-in SSO & MFA — no Authelia needed."
   fi
@@ -199,6 +200,12 @@ idempotent_cleanup() {
     snap disable docker 2>/dev/null || true
     snap remove docker 2>/dev/null || true
   fi
+
+  # ═════════════════════════════════════════════════════════════════
+  # FIX: Immediately recreate the stack directory after cleaning
+  mkdir -p "$STACK_DIR" "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR" "$DOCKHAND_DATA_DIR"
+  success "Stack directory recreated: $STACK_DIR"
+  # ═════════════════════════════════════════════════════════════════
 }
 
 system_update() {
@@ -316,7 +323,8 @@ setup_dockhand() {
   step "Dockhand (standalone)"
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
 
-  mkdir -p "${STACK_DIR}"
+  # Ensure Dockhand data directory exists (bind mount)
+  mkdir -p "${DOCKHAND_DATA_DIR}"
 
   cat > "${STACK_DIR}/docker-compose.dockhand.yml" << 'COMPOSE_DOCKHAND'
 services:
@@ -329,11 +337,9 @@ services:
       - 3000:3000
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - dockhand_data:/app/data
+      - ./dockhand-data:/app/data          # FIX: bind mount instead of named volume
     networks:
       - proxy
-volumes:
-  dockhand_data:
 networks:
   proxy:
     external: true
@@ -405,18 +411,24 @@ services:
       - TZ=UTC
     networks:
       - proxy
+networks:
+  proxy:
+    external: true
+COMPOSE_CROWDSEC
+
+  if [[ "$DOCKER_ARCH" == "amd64" ]]; then
+    cat >> "${STACK_DIR}/docker-compose.crowdsec.yml" << 'DASHBOARD'
   crowdsec-dashboard:
     image: partitio/crowdsec-dashboard:latest
     container_name: crowdsec-dashboard
     restart: unless-stopped
     environment:
       - CROWDSEC_API_URL=http://crowdsec:8080
+      - DISABLE_LOGIN=true              # FIX: allow access without API key
     networks:
       - proxy
-networks:
-  proxy:
-    external: true
-COMPOSE_CROWDSEC
+DASHBOARD
+  fi
 
   info "Pulling Docker images — this may take a few minutes, please wait..."
   docker compose -f "${STACK_DIR}/docker-compose.npm.yml" pull
@@ -485,6 +497,25 @@ COMPOSE_CROWDSEC
 
   info "Starting CrowdSec..."
   docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d
+  info "Waiting for CrowdSec container to be ready..."
+  for i in $(seq 1 30); do
+    docker ps --format '{{.Names}}' | grep -qx "crowdsec" && { success "CrowdSec container running"; break; }
+    printf "${C_DIM}  Waiting for CrowdSec container... (%d/30)${C_R}\r" "$i"
+    [[ $i -eq 30 ]] && warn "CrowdSec container not found"
+    sleep 2
+  done
+  printf "\n"
+
+  if [[ "$DOCKER_ARCH" == "amd64" ]]; then
+    info "Waiting for CrowdSec Dashboard to be ready..."
+    for i in $(seq 1 30); do
+      docker ps --format '{{.Names}}' | grep -qx "crowdsec-dashboard" && { success "CrowdSec Dashboard ready"; break; }
+      printf "${C_DIM}  Waiting for CrowdSec Dashboard... (%d/30)${C_R}\r" "$i"
+      [[ $i -eq 30 ]] && warn "CrowdSec Dashboard timeout"
+      sleep 2
+    done
+    printf "\n"
+  fi
 
   success "NPM: http://${ip}:81"
   success "Dockhand: http://${ip}:3000"
@@ -591,15 +622,6 @@ setup_crowdsec() {
     return
   fi
   success "CrowdSec container running"
-
-  info "Waiting for CrowdSec Dashboard to be ready..."
-  for i in $(seq 1 30); do
-    docker ps --format '{{.Names}}' | grep -qx "crowdsec-dashboard" && { success "CrowdSec Dashboard ready"; break; }
-    printf "${C_DIM}  Waiting for CrowdSec Dashboard... (%d/30)${C_R}\r" "$i"
-    [[ $i -eq 30 ]] && warn "CrowdSec Dashboard timeout"
-    sleep 2
-  done
-  printf "\n"
 
   info "Verifying collections..."
   docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/sshd" && success "sshd collection" || warn "sshd collection not found"
@@ -724,6 +746,7 @@ ${C_B}Dockhand${C_R}
   Container: dockhand
   Port:      3000 (direct host port)
   Network:   proxy
+  Data:      ${DOCKHAND_DATA_DIR}
   Auth:      Built-in SSO, MFA, user management
   URL:       http://dockhand.${DOMAIN} (after NPM proxy host)
 
@@ -747,9 +770,20 @@ ${C_B}${C_YEL}Step 2 — Add Dockhand Proxy Host in NPM${C_R}
   │ Forward Host:    dockhand            │
   │ Forward Port:    3000                │
   │ Block Exploits:  ON                  │
-  │ Websockets:      ON                  │
-  └──────────────────────────────────────┘
-  Click Save
+   │ Websockets:      ON                  │
+   └──────────────────────────────────────┘
+   Click Save
+
+${C_B}CrowdSec Dashboard (amd64 only):${C_R}
+   ┌──────────────────────────────────────────────┐
+   │ Domain Names:    crowdsec.${DOMAIN}           │
+   │ Scheme:          http                         │
+   │ Forward Host:    crowdsec-dashboard           │
+   │ Forward Port:    3000                         │
+   │ Block Exploits:  ON                           │
+   │ Access List:     Publicly Accessible          │
+   └──────────────────────────────────────────────┘
+   Save → SSL tab → Request cert → Force SSL ON
 
 ${C_B}${C_YEL}Step 3 — SSL Certificates${C_R}
   On each proxy host → SSL tab
