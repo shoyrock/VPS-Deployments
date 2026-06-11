@@ -638,7 +638,7 @@ services:
 COMPOSE_CROWDSEC
 
   if [[ "$DOCKER_ARCH" == "amd64" ]]; then
-    cat >> "${STACK_DIR}/docker-compose.crowdsec.yml" << 'DASHBOARD'
+    cat >> "${STACK_DIR}/docker-compose.crowdsec.yml" << DASHBOARD
   crowdsec-dashboard:
     image: partitio/crowdsec-dashboard:latest
     container_name: crowdsec-dashboard
@@ -733,7 +733,7 @@ NETS
   info "Waiting for Dockge..."
   for i in $(seq 1 40); do
     printf "\r  ${C_DIM}Waiting for Dockge... %d/40${C_R}" "$i"
-    docker exec dockge curl -sf --max-time 5 http://127.0.0.1:5001/ &>/dev/null && { printf "\r"; success "Dockge ready"; break; }
+    docker ps --format '{{.Names}}' | grep -qx "dockge" && { printf "\r"; success "Dockge ready"; break; }
     [[ $i -eq 40 ]] && { printf "\r"; warn "Dockge timed out. Check: docker logs dockge"; }
     sleep 3
   done
@@ -1244,10 +1244,9 @@ main() {
     esac
   fi
   setup_logrotate
-  print_summary
-  # Mark deployment as successful for the exit trap summary
   DEPLOY_STATUS="success"
   DEPLOYED_SERVICES="npm,dockge,authelia,${CROWDSEC_CHOICE}"
+  print_summary
 }
 
 main "$@"

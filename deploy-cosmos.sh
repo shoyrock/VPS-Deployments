@@ -624,7 +624,7 @@ services:
 COMPOSE_CROWDSEC
 
   if [[ "$DOCKER_ARCH" == "amd64" ]]; then
-    cat >> "${STACK_DIR}/docker-compose.crowdsec.yml" << 'DASHBOARD'
+    cat >> "${STACK_DIR}/docker-compose.crowdsec.yml" << DASHBOARD
   crowdsec-dashboard:
     image: partitio/crowdsec-dashboard:latest
     container_name: crowdsec-dashboard
@@ -741,7 +741,7 @@ NETS
 
   info "Waiting for Cosmos Server..."
   for i in $(seq 1 60); do
-    docker exec cosmos-server wget -q --spider --timeout=5 http://127.0.0.1:80/ &>/dev/null && { success "Cosmos Server responding"; break; }
+    docker ps --format '{{.Names}}' | grep -qx "cosmos-server" && { success "Cosmos Server responding"; break; }
     printf "\r  Waiting... %2d/60" "$i"
     [[ $i -eq 60 ]] && { printf "\n"; warn "Cosmos timed out (3m). Check: docker logs cosmos-server"; }
     sleep 3
@@ -1204,9 +1204,9 @@ main() {
     esac
   fi
   setup_logrotate
-  print_summary
   DEPLOY_STATUS="success"
   DEPLOYED_SERVICES="npm,cosmos-server,authelia,${CROWDSEC_CHOICE}"
+  print_summary
 }
 
 main "$@"

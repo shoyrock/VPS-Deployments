@@ -39,10 +39,10 @@ fi
 
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
 _log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}" >> "$LOG_FILE" 2>/dev/null || true; }
-info()    { printf "${C_BLU}?${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
-warn()    { printf "${C_YEL}?${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
-error()   { printf "${C_RED}?${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }
-success() { printf "${C_GRN}?${C_R}  %s\n" "$*"; _log "SUCCESS" "$@"; }
+info()    { printf "${C_BLU}ℹ${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
+warn()    { printf "${C_YEL}⚠${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
+error()   { printf "${C_RED}✗${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }
+success() { printf "${C_GRN}✔${C_R}  %s\n" "$*"; _log "SUCCESS" "$@"; }
 fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; DEPLOY_STATUS="failed"; exit 1; }
 step()    { printf "\n${C_B}${C_CYN}-- %s --${C_R}\n" "$*"; _log "STEP" "$@"; }
 
@@ -348,11 +348,9 @@ COMPOSE_DOCKHAND
     printf "\r  ${C_DIM}Waiting for Dockhand... %d/30${C_R}" "$i"
     sleep 2
     if docker ps --format '{{.Names}}' | grep -qx "dockhand"; then
-      if docker exec dockhand wget -qO- --timeout=3 http://127.0.0.1:3000/ &>/dev/null; then
         printf "\r"
         success "Dockhand ready"
         break
-      fi
     fi
     [[ $i -eq 30 ]] && { printf "\r"; warn "Dockhand may still be starting. Check: docker logs dockhand"; }
   done

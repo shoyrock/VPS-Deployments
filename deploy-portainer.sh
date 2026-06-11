@@ -649,7 +649,7 @@ services:
 COMPOSE_CROWDSEC
 
   if [[ "$DOCKER_ARCH" == "amd64" ]]; then
-    cat >> "${STACK_DIR}/docker-compose.crowdsec.yml" << 'DASHBOARD'
+    cat >> "${STACK_DIR}/docker-compose.crowdsec.yml" << DASHBOARD
   crowdsec-dashboard:
     image: partitio/crowdsec-dashboard:latest
     container_name: crowdsec-dashboard
@@ -1144,7 +1144,7 @@ ${C_B}CONTAINER  ${C_R}  ${C_B}HOSTNAME     ${C_R}  ${C_B}PORTS              ${C
 ${C_DIM}──────────  ────────────  ─────────────────  ───────────────────────${C_R}
 npm         npm          80, 443, 81        ${ip}:81 (admin)
 authelia    authelia     9091               authelia.${DOMAIN}
-${crowsec_display}
+${crowdsec_display}
 portainer   portainer    9000               portainer.${DOMAIN}
 
 ${C_B}${C_GRN}── NPM Proxy Forwarding ──────────────────────────────────────${C_R}
