@@ -3,13 +3,13 @@
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     exec sudo bash "$0" "$@"
 fi
-# deploy-dockhand.sh -- Docker + NPM + Dockhand + CrowdSec (v4.0.0-crowdsec-fixed)
-# Idempotent VPS deployment. Usage: sudo ./deploy-dockhand.sh
-# Dockhand: built-in SSO, MFA, user management (NO Authelia needed)
+# deploy-dockhand.sh -- Docker + NPM + Dockhand + CrowdSec (v4.1.0-oneclick)
+# One‑click VPS deployment. Usage: sudo ./deploy-dockhand.sh
+# Dockhand: built-in SSO, MFA, user management + stack file visibility (NO Authelia needed)
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.0.0-crowdsec-fixed"
+readonly SCRIPT_VERSION="4.1.0-oneclick"
 readonly SCRIPT_NAME="deploy-dockhand.sh"
 readonly START_TIME=$(date +%s)
 readonly STACK_DIR="/opt/dockhand-stack"
@@ -337,7 +337,8 @@ services:
       - 3000:3000
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./dockhand-data:/app/data          # FIX: bind mount instead of named volume
+      - ./dockhand-data:/app/data
+      - /opt/dockhand-stack:/host/opt/dockhand-stack:ro    # <-- Make stack files visible in Dockhand
     networks:
       - proxy
 networks:
@@ -881,6 +882,7 @@ ${C_B}Dockhand${C_R}
   Network:   proxy
   Data:      ${DOCKHAND_DATA_DIR}
   Auth:      Built-in SSO, MFA, user management (setup wizard on first visit)
+  Files:     Stack files visible under /host/opt/dockhand-stack
 
 ${C_B}CrowdSec${C_R}
   Dashboard: https://crowdsec.${DOMAIN}  (if amd64)
@@ -895,6 +897,7 @@ ${C_B}${C_YEL}Next Steps (already done automatically):${C_R}
   ✅ Proxy hosts for Dockhand & CrowdSec created
   ✅ Let's Encrypt SSL certificates requested (may take a moment to issue)
   ✅ NPM admin password securely changed
+  ✅ Stack files visible in Dockhand's file browser
 
 ${C_B}Access:${C_R}
   - Dockhand:   https://dockhand.${DOMAIN}
