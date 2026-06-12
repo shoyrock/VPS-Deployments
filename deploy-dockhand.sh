@@ -30,7 +30,6 @@ DOMAIN=""  # Set at runtime via user prompt
 
 # Deployment status tracking for guaranteed completion summary
 DEPLOY_STATUS="in_progress"
-DEPLOYED_SERVICES=""
 CROWDSEC_CHOICE="crowdsec"    # crowdsec | fail2ban
 
 # Colors (TTY only)
@@ -66,6 +65,8 @@ _on_exit() {
   local ip ext_ip
   ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<internal_ip>")
   ext_ip=$(get_external_ip)
+  local exit_pass="<unknown>"
+  [[ -f "${AUTHELIA_DIR}/.default_password" ]] && exit_pass=$(tr -d '\n' < "${AUTHELIA_DIR}/.default_password" 2>/dev/null || echo "<unknown>")
 
   printf "\n"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
@@ -94,6 +95,14 @@ _on_exit() {
     printf "${C_B}�  %-72s  �${C_R}\n" "  dockhand.${DOMAIN}           -> dockhand:3000"
     printf "${C_B}�  %-72s  �${C_R}\n" "  authelia.${DOMAIN}           -> authelia:9091"
     [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]] && printf "${C_B}�  %-72s  �${C_R}\n" "  crowdsec.${DOMAIN}          -> crowdsec-dashboard:3000"
+    printf "${C_B}�  %-72s  �${C_R}\n" ""
+    printf "${C_B}�  %-72s  �${C_R}\n" "Authelia:   admin / $exit_pass (CHANGE IMMEDIATELY!)"
+    printf "${C_B}�  %-72s  �${C_R}\n" ""
+    printf "${C_B}�  ${C_YEL}%-72s${C_R}${C_B}  �${C_R}\n" "-- Verification Codes --"
+    printf "${C_B}�  %-72s  �${C_R}\n" "Authelia requires a code to change password or add 2FA."
+    printf "${C_B}�  %-72s  �${C_R}\n" "The code appears AFTER you request it in the Authelia UI."
+    printf "${C_B}�  %-72s  �${C_R}\n" "Then run:"
+    printf "${C_B}�  ${C_CYN}%-72s${C_R}${C_B}  �${C_R}\n" "sudo docker exec authelia cat /config/notifications.txt"
     printf "${C_B}�  %-72s  �${C_R}\n" ""
     printf "${C_B}�  ${C_GRN}%-72s${C_R}${C_B}  �${C_R}\n" "Dockhand has full read/write host file access."
   fi
@@ -688,7 +697,7 @@ setup_authelia_secrets() {
   printf '%s' "$jwt_session" > "${AUTHELIA_SECRETS_DIR}/jwt_session"
   printf '%s' "$storage_encryption" > "${AUTHELIA_SECRETS_DIR}/storage_encryption"
   printf '%s' "$session" > "${AUTHELIA_SECRETS_DIR}/session"
-  chmod 644 "${AUTHELIA_SECRETS_DIR}/"*
+  chmod 600 "${AUTHELIA_SECRETS_DIR}/"*
   chown -R 1001:1001 "$AUTHELIA_SECRETS_DIR" 2>/dev/null || true
   success "Authelia secrets generated: $AUTHELIA_SECRETS_DIR"
 }
@@ -696,7 +705,7 @@ setup_authelia_secrets() {
 setup_authelia_config() {
   step "Authelia Configuration"
   mkdir -p "$AUTHELIA_CONFIG_DIR"
-  cat > "${AUTHELIA_CONFIG_DIR}/configuration.yml" << 'AUTHELIA_CONF'
+  cat > "${AUTHELIA_CONFIG_DIR}/configuration.yml" << AUTHELIA_CONF
 ###############################################################
 #                       Authelia configuration                #
 #       https://www.authelia.com/configuration/               #
@@ -751,17 +760,12 @@ setup_authelia_snippets() {
 
   cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" << 'SNIPPET'
 location /authelia {
-    internal;
-    set $upstream_authelia http://authelia:9091;
-    proxy_pass $upstream_authelia/api/verify;
-    proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+    proxy_pass http://authelia:9091;
+    proxy_set_header Host $host;
     proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-Method $request_method;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header X-Forwarded-Host $http_host;
-    proxy_set_header X-Forwarded-Uri $request_uri;
-    proxy_set_header Content-Length "";
-    proxy_pass_request_body off;
 }
 SNIPPET
 
@@ -769,7 +773,9 @@ SNIPPET
 auth_request /authelia;
 auth_request_set \$target_url \$scheme://\$http_host\$request_uri;
 auth_request_set \$user \$upstream_http_remote_user;
+auth_request_set \$groups \$upstream_http_remote_groups;
 proxy_set_header Remote-User \$user;
+proxy_set_header Remote-Groups \$groups;
 error_page 401 =302 https://authelia.${DOMAIN}/?rd=\$target_url;
 SNIPPET1
 
@@ -795,6 +801,7 @@ users:
     groups:
       - admins
 USERS" 2>/dev/null || true
+  echo "$default_pass" > "${AUTHELIA_DIR}/.default_password" 2>/dev/null || true
   success "Default user created. Login: ${USER:-admin} / ${default_pass} (CHANGE IMMEDIATELY!)"
 }
 
@@ -962,7 +969,7 @@ JAIL
   systemctl enable fail2ban
   systemctl restart fail2ban
   success "Fail2Ban installed with NPM jail"
-  DEPLOYED_SERVICES+=",fail2ban"
+
 }
 
 setup_crowdsec() {
@@ -1082,6 +1089,8 @@ print_summary() {
   if [[ -f "${STACK_DIR}/.npm_admin_password" ]]; then
     npm_password=$(cat "${STACK_DIR}/.npm_admin_password")
   fi
+  local authelia_pass="authelia"
+  [[ -f "${AUTHELIA_DIR}/.default_password" ]] && authelia_pass=$(tr -d '\n' < "${AUTHELIA_DIR}/.default_password" 2>/dev/null || echo "authelia")
 
   printf "\n"
   printf "${C_B}${C_GRN}+------------------------------------------------------------------------------+${C_R}\n"
@@ -1091,8 +1100,6 @@ print_summary() {
   printf "${C_B}�  Elapsed: ${C_CYN}%dm %ds${C_R}${C_B}                                                     �${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
   printf "${C_B}+------------------------------------------------------------------------------+${C_R}\n"
 
-  local crowdsec_display="crowdsec    crowdsec     8080 (LAPI)        crowdsec.${DOMAIN} (amd64 only)"
-  [[ "$CROWDSEC_CHOICE" == "fail2ban" ]] && crowdsec_display="fail2ban   fail2ban   —                  (internal, no proxy needed)"
   local dns_crowdsec=""
   local proxy_crowdsec=""
   if [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]]; then
@@ -1179,7 +1186,7 @@ ${C_B}Authelia${C_R}
   Container: authelia
   Network:   proxy
   Config:    ${AUTHELIA_CONFIG_DIR}
-  Login:     ${USER:-admin} / authelia (CHANGE IMMEDIATELY!)
+  Login:     ${USER:-admin} / ${authelia_pass} (CHANGE IMMEDIATELY! — default password)
   Info:      Check notifications: sudo docker exec authelia cat /config/notifications.txt
   Note:      Dockhand is protected with 2FA via Authelia
 
@@ -1243,7 +1250,6 @@ main() {
   automate_npm
   register_dockhand_stacks
   DEPLOY_STATUS="success"
-  DEPLOYED_SERVICES="npm,dockhand,authelia,${CROWDSEC_CHOICE},firewall"
   print_summary
 }
 

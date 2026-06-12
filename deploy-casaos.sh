@@ -10,14 +10,16 @@ set -euo pipefail
 readonly SCRIPT_VERSION="3.0.0-crowdsec"
 readonly SCRIPT_NAME="deploy-casaos.sh"
 readonly START_TIME=$(date +%s)
-readonly CASAOS_DATA_DIR="/var/lib/casaos"
-readonly CASAOS_CONF_DIR="/etc/casaos"
-readonly CASAOS_SHARE_DIR="/usr/share/casaos"
+
 readonly NPM_DIR="/opt/npm"
 readonly NPM_DATA_DIR="${NPM_DIR}/data"
 readonly NPM_LE_DIR="${NPM_DIR}/letsencrypt"
 readonly NPM_LOGS_DIR="${NPM_DATA_DIR}/logs"
 readonly CROWDSEC_DIR="${NPM_DIR}/crowdsec"
+readonly AUTHELIA_DIR="${NPM_DIR}/authelia"
+readonly AUTHELIA_CONFIG_DIR="${AUTHELIA_DIR}/config"
+readonly AUTHELIA_SECRETS_DIR="${AUTHELIA_DIR}/secrets"
+readonly AUTHELIA_SNIPPETS_DIR="${AUTHELIA_DIR}/snippets"
 readonly LOG_FILE="/var/log/vps-deploy.log"
 
 # Colors (TTY only)
@@ -29,8 +31,8 @@ else
 fi
 
 DEPLOY_STATUS="in_progress"
-DEPLOYED_SERVICES=""
-DOMAIN="yourdomain.com"
+DOMAIN=""
+CROWDSEC_CHOICE="crowdsec"
 
 get_external_ip() {
   curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
@@ -63,6 +65,7 @@ _on_exit() {
     printf "${C_B}║  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "${ip}:81"
     if [[ "$DEPLOY_STATUS" == "success" ]]; then
       printf "${C_B}║  ${C_YEL}%s${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "Casaos" "casaos.${DOMAIN:-yourdomain.com} (via NPM)"
+      printf "${C_B}║  ${C_YEL}%s${C_R}${C_B}:  https://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "Authelia" "authelia.${DOMAIN:-yourdomain.com} (via NPM)"
     fi
     printf "${C_B}║  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}80 (HTTP), 443 (HTTPS), 81 (NPM Admin)          ${C_R}${C_B}║${C_R}\n"
     printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
@@ -296,6 +299,30 @@ networks:
     external: true
 COMPOSE_NPM
 
+  cat > "${NPM_DIR}/docker-compose.authelia.yml" << 'COMPOSE_AUTHELIA'
+services:
+  authelia:
+    image: authelia/authelia:latest
+    container_name: authelia
+    hostname: authelia
+    restart: always
+    user: "0:0"
+    volumes:
+      - ./authelia/config:/config
+      - ./authelia/secrets:/config/secrets:ro
+    environment:
+      - AUTHELIA_JWT_SECRET_FILE=/config/secrets/jwt_session
+      - AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE=/config/secrets/storage_encryption
+      - AUTHELIA_SESSION_SECRET_FILE=/config/secrets/session
+      - AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE=/config/secrets/jwt_session
+      - TZ=America/New_York
+    networks:
+      - proxy
+networks:
+  proxy:
+    external: true
+COMPOSE_AUTHELIA
+
   cat > "${NPM_DIR}/docker-compose.crowdsec.yml" << 'COMPOSE_CROWDSEC'
 services:
   crowdsec:
@@ -321,6 +348,7 @@ networks:
 COMPOSE_CROWDSEC
 
   docker compose -f "${NPM_DIR}/docker-compose.npm.yml" pull
+  docker compose -f "${NPM_DIR}/docker-compose.authelia.yml" pull
   docker compose -f "${NPM_DIR}/docker-compose.crowdsec.yml" pull
 
   info "Starting NPM..."
@@ -360,6 +388,23 @@ COMPOSE_CROWDSEC
     sleep 2
   done
 
+  info "Deploying Authelia..."
+  mkdir -p "$AUTHELIA_DIR" "$AUTHELIA_CONFIG_DIR" "$AUTHELIA_SECRETS_DIR" "$AUTHELIA_SNIPPETS_DIR"
+  setup_authelia_secrets
+  setup_authelia_config
+  setup_authelia_snippets
+  docker compose -f "${NPM_DIR}/docker-compose.authelia.yml" pull
+  docker compose -f "${NPM_DIR}/docker-compose.authelia.yml" up -d
+  info "Waiting for Authelia..."
+  for i in $(seq 1 30); do
+    docker ps --format '{{.Names}}' | grep -qx "authelia" && { success "Authelia ready"; break; }
+    printf "${C_DIM}  Waiting for Authelia container... (%d/30)${C_R}\r" "$i"
+    [[ $i -eq 30 ]] && warn "Authelia container not found"
+    sleep 2
+  done
+  printf "\n"
+  setup_authelia_users
+
   info "Waiting for NPM admin UI (port 81), please wait..."
   for i in $(seq 1 60); do
     curl -sf --max-time 5 http://127.0.0.1:81/ &>/dev/null && { success "NPM admin UI responding"; break; }
@@ -390,6 +435,125 @@ COMPOSE_CROWDSEC
 
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
   success "NPM deployed: http://${ip}:81"
+}
+
+# -------------------------------------------------------------------------------
+# Authelia SSO/MFA setup
+# -------------------------------------------------------------------------------
+setup_authelia_secrets() {
+  step "Authelia Secrets"
+  mkdir -p "$AUTHELIA_SECRETS_DIR"
+  local jwt_session storage_encryption session
+  jwt_session=$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")
+  storage_encryption=$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")
+  session=$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")
+  printf '%s' "$jwt_session" > "${AUTHELIA_SECRETS_DIR}/jwt_session"
+  printf '%s' "$storage_encryption" > "${AUTHELIA_SECRETS_DIR}/storage_encryption"
+  printf '%s' "$session" > "${AUTHELIA_SECRETS_DIR}/session"
+  chmod 644 "${AUTHELIA_SECRETS_DIR}/"*
+  chown -R 1001:1001 "$AUTHELIA_SECRETS_DIR" 2>/dev/null || true
+  success "Authelia secrets generated: $AUTHELIA_SECRETS_DIR"
+}
+
+setup_authelia_config() {
+  step "Authelia Configuration"
+  mkdir -p "$AUTHELIA_CONFIG_DIR"
+  cat > "${AUTHELIA_CONFIG_DIR}/configuration.yml" << AUTHELIA_CONF
+###############################################################
+#                       Authelia configuration                #
+#       https://www.authelia.com/configuration/               #
+###############################################################
+host: 0.0.0.0
+port: 9091
+log_level: info
+jwt_secret: "${AUTHELIA_SECRETS_DIR}/jwt_session"
+default_redirection_url: https://authelia.${DOMAIN}
+totp:
+  issuer: authelia.${DOMAIN}
+authentication_backend:
+  file:
+    path: /config/users.yml
+access_control:
+  default_policy: deny
+  rules:
+    - domain: "authelia.${DOMAIN}"
+      policy: bypass
+    - domain: "casaos.${DOMAIN}"
+      policy: two_factor
+session:
+  name: authelia_session
+  secret: "${AUTHELIA_SECRETS_DIR}/session"
+  expiration: 1h
+  inactivity: 5m
+  remember_me_duration: 1M
+  cookies:
+    - domain: "${DOMAIN}"
+      authelia_url: "https://authelia.${DOMAIN}"
+regulation:
+  max_retries: 5
+  find_time: 2m
+  ban_time: 5m
+storage:
+  local:
+    path: /config/db.sqlite3
+notifier:
+  filesystem:
+    filename: /config/notifications.yml
+AUTHELIA_CONF
+  info "users.yml will be created after authelia container starts"
+  chown -R 1001:1001 "$AUTHELIA_CONFIG_DIR" 2>/dev/null || true
+  success "Authelia configuration created"
+}
+
+setup_authelia_snippets() {
+  step "Authelia NPM Snippets"
+  mkdir -p "$AUTHELIA_SNIPPETS_DIR"
+  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" << 'SNIPPET'
+location /authelia {
+    internal;
+    set $upstream_authelia http://authelia:9091;
+    proxy_pass $upstream_authelia;
+    proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-Method $request_method;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Uri $request_uri;
+    proxy_set_header Content-Length "";
+    proxy_pass_request_body off;
+}
+SNIPPET
+  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" << SNIPPET1
+auth_request /authelia;
+auth_request_set \$target_url \$scheme://\$http_host\$request_uri;
+auth_request_set \$user \$upstream_http_remote_user;
+auth_request_set \$groups \$upstream_http_remote_groups;
+proxy_set_header Remote-User \$user;
+proxy_set_header Remote-Groups \$groups;
+error_page 401 =302 https://authelia.${DOMAIN}/?rd=\$target_url;
+SNIPPET1
+  success "Authelia NPM snippets created"
+}
+
+setup_authelia_users() {
+  step "Authelia Users"
+  info "Setting up default user..."
+  local default_pass="authelia"
+  local hash
+  hash=$(docker exec authelia authelia crypto hash generate --password "$default_pass" 2>/dev/null | grep -i "digest" | awk '{print $NF}' || echo "")
+  if [[ -z "$hash" ]]; then
+    hash='$argon2id$v=19$m=65536,t=3,p=2$c29tZXNhbHQ$RZ9Dy5fB6y0W6WxW0L6g5Q' 2>/dev/null || true
+  fi
+  docker exec authelia sh -c "cat > /config/users.yml << 'USERS'
+users:
+  ${USER:-admin}:
+    displayname: \"Admin User\"
+    password: \"${hash}\"
+    email: admin@${DOMAIN}
+    groups:
+      - admins
+USERS" 2>/dev/null || true
+  success "Default user created. Login: ${USER:-admin} / ${default_pass} (CHANGE IMMEDIATELY!)"
 }
 
 setup_casaos() {
@@ -653,8 +817,15 @@ ${C_B}CasaOS${C_R}
   Port:      8080 (internal, no host port)
   Network:   proxy
 
+${C_B}Authelia${C_R}
+  URL:      https://authelia.${DOMAIN}
+  Container: authelia
+  Network:   proxy
+  Config:    ${AUTHELIA_CONFIG_DIR}
+  Login:     ${USER:-admin} / authelia (CHANGE IMMEDIATELY!)
+
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
-${C_B}Containers${C_R}  npm, crowdsec, casaos-gateway (separate compose files)
+${C_B}Containers${C_R}  npm, authelia, crowdsec, casaos-gateway (separate compose files)
 ${C_B}Network${C_R}   proxy (bridge)
 
 ${C_B}CrowdSec${C_R}  Collections: sshd, nginx-proxy-manager, linux
@@ -688,14 +859,7 @@ ${C_B}${C_YEL}Step 3 — SSL Certificate${C_R}
   Click Save
 
 ${C_B}${C_YEL}Step 4 — Secure Admin Port${C_R}
-  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "  ufw delete allow 81/tcp && ufw reload"; else echo "  firewall-cmd --permanent --remove-port=81/tcp && firewall-cmd --reload"; fi)${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
-${C_B}Containers${C_R}  npm, crowdsec, casaos-gateway (separate compose files)
-${C_B}Network${C_R}   proxy (bridge)
-
-${C_B}CrowdSec${C_R}
-  Status:    cscli metrics    cscli decisions list
-
-${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
+  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "  ufw delete allow 81/tcp && ufw reload"; else echo "  firewall-cmd --permanent --remove-port=81/tcp && firewall-cmd --reload"; fi)
 
 ${C_B}${C_YEL}-- INITIAL SETUP --${C_R}
 
@@ -845,8 +1009,15 @@ BOUNCER
 }
 
 main() {
-  printf "\n${C_B}${C_CYN}VPS Deployment — Docker + NPM + CasaOS + CrowdSec${C_R}\n"
+  printf "\n${C_B}${C_CYN}VPS Deployment — Docker + NPM + CasaOS + Authelia + CrowdSec${C_R}\n"
   printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
+
+  step "Domain Configuration"
+  printf "\n${C_B}Enter your root domain${C_R} (e.g., example.com): "
+  read -r DOMAIN
+  [[ -z "$DOMAIN" ]] && DOMAIN="yourdomain.com"
+  DOMAIN=$(echo "$DOMAIN" | sed 's|https\?://||' | sed 's|/.*||' | tr -d ' ')
+
   preflight_checks
   idempotent_cleanup
   system_update
@@ -855,12 +1026,23 @@ main() {
   setup_docker_network
   setup_casaos
   setup_nginx_proxy_manager
-  setup_crowdsec
+  if [[ "$DOCKER_ARCH" == "amd64" ]]; then
+    setup_crowdsec
+  else
+    printf "\n${C_YEL}ARM architecture detected -- CrowdSec dashboard not available.${C_R}\n"
+    printf "${C_B}Options:${C_R}\n"
+    printf "  ${C_CYN}1)${C_R} CrowdSec (CLI-only, no dashboard)\n"
+    printf "  ${C_CYN}2)${C_R} Fail2Ban (traditional, no dashboard needed)\n"
+    read -rp "Choice [1/2]: " arm_choice
+    case "$arm_choice" in
+      2) setup_fail2ban; CROWDSEC_CHOICE="fail2ban" ;;
+      *) setup_crowdsec ;;
+    esac
+  fi
   setup_firewall
   setup_logrotate
-  print_summary
-  DEPLOYED_SERVICES="NPM, CasaOS, CrowdSec"
   DEPLOY_STATUS="success"
+  print_summary
 }
 
 main "$@"

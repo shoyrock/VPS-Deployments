@@ -27,7 +27,6 @@ DOMAIN=""  # Set at runtime via user prompt
 
 # Deployment status tracking for guaranteed completion summary
 DEPLOY_STATUS="in_progress"
-DEPLOYED_SERVICES=""
 CROWDSEC_CHOICE="crowdsec"    # crowdsec | fail2ban
 
 # Colors (TTY only)
@@ -421,7 +420,7 @@ EOF
   success "Authelia configuration written to ${AUTHELIA_CONFIG_DIR}/"
 }
 
-create_nginx_snippets() {
+setup_authelia_snippets() {
   step "NGINX Snippets for Authelia"
   mkdir -p "$AUTHELIA_SNIPPETS_DIR"
 
@@ -452,15 +451,12 @@ SNIPPET
 
   cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" << SNIPPET
 location /authelia {
-    internal;
-    proxy_pass http://authelia:9091/api/verify;
-    proxy_set_header X-Original-URL \\\$scheme://\\\$http_host\\\$request_uri;
-    proxy_set_header X-Real-IP \\\$remote_addr;
-    proxy_set_header X-Forwarded-Method \\\$request_method;
-    proxy_pass_request_body off;
-    proxy_pass_request_headers on;
-    proxy_set_header Content-Length "";
-    proxy_set_header Connection "";
+    proxy_pass http://authelia:9091;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header X-Forwarded-Host \$http_host;
 }
 SNIPPET
 
@@ -1114,7 +1110,7 @@ JAIL
   systemctl enable fail2ban
   systemctl restart fail2ban
   success "Fail2Ban installed with NPM jail"
-  DEPLOYED_SERVICES+=",fail2ban"
+
 }
 
 setup_crowdsec() {
@@ -1267,7 +1263,7 @@ main() {
   get_user_domain
   setup_authelia_secrets
   setup_authelia_config
-  create_nginx_snippets
+  setup_authelia_snippets
   setup_stack
   setup_authelia_users
   setup_firewall
@@ -1288,7 +1284,6 @@ main() {
   setup_logrotate
   register_dockge_stacks
   DEPLOY_STATUS="success"
-  DEPLOYED_SERVICES="npm,dockge,authelia,${CROWDSEC_CHOICE}"
   print_summary
 }
 

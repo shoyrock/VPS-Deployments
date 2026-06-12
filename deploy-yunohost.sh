@@ -8,7 +8,7 @@ fi
 #
 # YunoHost ONLY supports Debian 12 (Bookworm) or newer.
 # CrowdSec provides intrusion prevention for YunoHost.
-set -euo pipefail
+set -eo pipefail
 IFS=$'\n\t'
 
 readonly SCRIPT_VERSION="3.0.0-crowdsec"
@@ -19,6 +19,10 @@ readonly NPM_DATA_DIR="${NPM_DIR}/data"
 readonly NPM_LE_DIR="${NPM_DIR}/letsencrypt"
 readonly NPM_LOGS_DIR="${NPM_DATA_DIR}/logs"
 readonly CROWDSEC_DIR="${NPM_DIR}/crowdsec"
+readonly AUTHELIA_DIR="${NPM_DIR}/authelia"
+readonly AUTHELIA_CONFIG_DIR="${AUTHELIA_DIR}/config"
+readonly AUTHELIA_SECRETS_DIR="${AUTHELIA_DIR}/secrets"
+readonly AUTHELIA_SNIPPETS_DIR="${AUTHELIA_DIR}/snippets"
 readonly LOG_FILE="/var/log/vps-deploy.log"
 
 # Colors (TTY only)
@@ -41,7 +45,7 @@ step()    { printf "\n${C_B}${C_CYN}── %s ──${C_R}\n" "$*"; _log "STEP" 
 readonly TOOL_LABEL="YunoHost"
 
 DEPLOY_STATUS="in_progress"
-DEPLOYED_SERVICES=""
+CROWDSEC_CHOICE="crowdsec"
 
 get_external_ip() {
   curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
@@ -74,6 +78,7 @@ _on_exit() {
     printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
     printf "${C_B}║  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "${ip}:81"
     printf "${C_B}║  ${C_YEL}%-9s${C_R}${C_B}:  ${C_CYN}%-63s${C_R}${C_B}║${C_R}\n" "${TOOL_LABEL}" "${ip}:80/443 (own proxy, NPM on 81)"
+    printf "${C_B}║  ${C_YEL}Authelia ${C_R}${C_B}:  ${C_CYN}%-63s${C_R}${C_B}║${C_R}\n" "${ip}:9091"
     printf "${C_B}║  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}22 (SSH), 80 (HTTP), 443 (HTTPS), 81 (NPM)    ${C_R}${C_B}║${C_R}\n"
     printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
     printf "${C_B}║  Log file: ${C_CYN}%-66s${C_R}${C_B}║${C_R}\n" "$LOG_FILE"
@@ -278,6 +283,30 @@ networks:
     external: true
 COMPOSE_NPM
 
+  cat > "${NPM_DIR}/docker-compose.authelia.yml" << 'COMPOSE_AUTHELIA'
+services:
+  authelia:
+    image: authelia/authelia:latest
+    container_name: authelia
+    hostname: authelia
+    restart: always
+    user: "0:0"
+    volumes:
+      - ./authelia/config:/config
+      - ./authelia/secrets:/config/secrets:ro
+    environment:
+      - AUTHELIA_JWT_SECRET_FILE=/config/secrets/jwt_session
+      - AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE=/config/secrets/storage_encryption
+      - AUTHELIA_SESSION_SECRET_FILE=/config/secrets/session
+      - AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE=/config/secrets/jwt_session
+      - TZ=America/New_York
+    networks:
+      - proxy
+networks:
+  proxy:
+    external: true
+COMPOSE_AUTHELIA
+
   cat > "${NPM_DIR}/docker-compose.crowdsec.yml" << 'COMPOSE_CROWDSEC'
 services:
   crowdsec:
@@ -304,6 +333,7 @@ COMPOSE_CROWDSEC
 
   docker compose -f "${NPM_DIR}/docker-compose.npm.yml" pull
   docker compose -f "${NPM_DIR}/docker-compose.crowdsec.yml" pull
+  docker compose -f "${NPM_DIR}/docker-compose.authelia.yml" pull
 
   info "Starting NPM..."
   docker compose -f "${NPM_DIR}/docker-compose.npm.yml" up -d
@@ -357,6 +387,22 @@ COMPOSE_CROWDSEC
     sleep 2
   done
 
+  info "Deploying Authelia..."
+  mkdir -p "$AUTHELIA_DIR" "$AUTHELIA_CONFIG_DIR" "$AUTHELIA_SECRETS_DIR" "$AUTHELIA_SNIPPETS_DIR"
+  setup_authelia_secrets
+  setup_authelia_config
+  setup_authelia_snippets
+  docker compose -f "${NPM_DIR}/docker-compose.authelia.yml" up -d
+  info "Waiting for Authelia..."
+  for i in $(seq 1 30); do
+    docker ps --format '{{.Names}}' | grep -qx "authelia" && { success "Authelia ready"; break; }
+    printf "${C_DIM}  Waiting for Authelia container... (%d/30)${C_R}\r" "$i"
+    [[ $i -eq 30 ]] && warn "Authelia container not found"
+    sleep 2
+  done
+  printf "\n"
+  setup_authelia_users
+
   info "Starting CrowdSec..."
   docker compose -f "${NPM_DIR}/docker-compose.crowdsec.yml" up -d
 
@@ -364,7 +410,113 @@ COMPOSE_CROWDSEC
   success "NPM deployed: http://${ip}:81"
 }
 
-## CROWDSEC
+## AUTHELIA
+
+setup_authelia_secrets() {
+  step "Authelia Secrets"
+  mkdir -p "$AUTHELIA_SECRETS_DIR"
+  for s in jwt_session storage_encryption session; do
+    openssl rand -hex 32 2>/dev/null | tr -d '\n' > "${AUTHELIA_SECRETS_DIR}/${s}"
+  done
+  chmod 600 "$AUTHELIA_SECRETS_DIR"/*
+  success "Authelia secrets generated"
+}
+
+setup_authelia_config() {
+  step "Authelia Configuration"
+  mkdir -p "$AUTHELIA_CONFIG_DIR"
+  cat > "${AUTHELIA_CONFIG_DIR}/configuration.yml" << AUTHELIA_CONFIG
+theme: dark
+default_redirection_url: https://${DOMAIN:-example.com}
+server:
+  host: 0.0.0.0
+  port: 9091
+log:
+  level: info
+totp:
+  issuer: authelia.com
+authentication_backend:
+  file:
+    path: /config/users.yml
+access_control:
+  default_policy: deny
+  rules:
+    - domain: "${DOMAIN:-example.com}"
+      policy: two_factor
+session:
+  name: authelia_session
+  expiration: 1h
+  inactivity: 5m
+  remember_me_duration: 1M
+regulation:
+  max_retries: 5
+  find_time: 2m
+  ban_time: 5m
+storage:
+  local:
+    path: /config/db.sqlite3
+notifier:
+  filesystem:
+    filename: /config/notifications.yml
+AUTHELIA_CONFIG
+  success "Authelia configuration created"
+}
+
+setup_authelia_snippets() {
+  step "Authelia NPM Snippets"
+  mkdir -p "$AUTHELIA_SNIPPETS_DIR"
+  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" << SNIPPET1
+auth_request /authelia;
+auth_request_set \$target_url \$scheme://\$http_host\$request_uri;
+auth_request_set \$user \$upstream_http_remote_user;
+auth_request_set \$groups \$upstream_http_remote_groups;
+proxy_set_header Remote-User \$user;
+proxy_set_header Remote-Groups \$groups;
+error_page 401 =302 https://authelia.${DOMAIN:-example.com}/?rd=\$target_url;
+
+set \$upstream_authelia http://authelia:9091;
+location /authelia {
+    internal;
+    proxy_pass \$upstream_authelia/api/authz/forward-auth;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
+    proxy_set_header X-Original-URL \$scheme://\$http_host\$request_uri;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header X-Forwarded-Host \$http_host;
+    proxy_set_header X-Forwarded-Uri \$request_uri;
+    proxy_cache_bypass \$cookie_session;
+    proxy_no_cache \$cookie_session;
+    proxy_http_version 1.1;
+}
+SNIPPET1
+  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" << 'SNIPPET2'
+location /authelia {
+    proxy_pass http://authelia:9091;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $http_host;
+}
+SNIPPET2
+  success "Authelia NPM snippets created"
+}
+
+setup_authelia_users() {
+  step "Authelia Users"
+  cat > "${AUTHELIA_CONFIG_DIR}/users.yml" << 'AUTHELIA_USERS'
+users:
+  admin:
+    password: "$5$rounds=500000$..."
+    email: admin@example.com
+    groups:
+      - admins
+AUTHELIA_USERS
+  warn "Update ${AUTHELIA_CONFIG_DIR}/users.yml password hash"
+  info "Generate: docker run authelia/authelia:latest authelia crypto hash generate --password 'yourpassword'"
+}
 
 ## LOG ROTATION
 setup_logrotate() {
@@ -418,6 +570,18 @@ setup_yunohost_firewall_npm() {
   success "Port 81 opened for NPM admin UI"
 }
 
+setup_fail2ban() {
+  step "Fail2Ban Installation"
+  info "Installing Fail2Ban..."
+  if [[ "$OS_FAMILY" == "debian" ]]; then
+    sudo apt-get update -qq 2>/dev/null
+    sudo apt-get install -y -qq fail2ban 2>/dev/null
+  else
+    sudo dnf install -y -q fail2ban 2>/dev/null || sudo yum install -y -q fail2ban 2>/dev/null
+  fi
+  _log "INFO" "fail2ban: installed"
+}
+
 ## SUMMARY
 print_summary() {
   local elapsed=$(( $(date +%s) - START_TIME ))
@@ -437,7 +601,7 @@ ${C_B}${C_CYN}── YUNOHOST ──${C_R}
       --username admin --password 'YourSecurePassword123'
   Admin:    https://your-domain.com/yunohost/admin
   CLI:      yunohost --help
-  Services: nginx, dnsmasq, nftables (YunoHost-managed), CrowdSec, postfix, dovecot
+  Services: nginx, dnsmasq, nftables (YunoHost-managed), CrowdSec, Authelia, postfix, dovecot
 
 ${C_B}${C_CYN}── NGINX PROXY MANAGER ──${C_R}
   Admin:    http://${ip}:81  (admin@example.com / changeme)
@@ -450,6 +614,11 @@ ${C_B}${C_CYN}── NGINX PROXY MANAGER ──${C_R}
 ${C_B}${C_CYN}── CROWDSEC ──${C_R}
   Status:   cscli metrics    cscli decisions list
   Config:   /etc/crowdsec/
+
+${C_B}${C_CYN}── AUTHELIA ──${C_R}
+  Admin:    http://${ip}:9091
+  Config:   ${AUTHELIA_CONFIG_DIR}
+  Secrets:  ${AUTHELIA_SECRETS_DIR}
 
 ${C_B}${C_CYN}── PORTS ──${C_R}
   22   SSH         Server access
@@ -593,8 +762,15 @@ BOUNCER
 }
 
 main() {
-  printf "\n${C_B}${C_CYN}VPS Deployment — YunoHost + NPM${C_R}\n"
+  printf "\n${C_B}${C_CYN}VPS Deployment — YunoHost + NPM + Authelia${C_R}\n"
   printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
+
+  step "Domain Configuration"
+  printf "\n${C_B}Enter your root domain${C_R} (e.g., example.com): "
+  read -r DOMAIN
+  [[ -z "$DOMAIN" ]] && DOMAIN="yourdomain.com"
+  DOMAIN=$(echo "$DOMAIN" | sed 's|https\?://||' | sed 's|/.*||' | tr -d ' ')
+  set -u
 
   preflight_checks
   idempotent_cleanup
@@ -605,12 +781,23 @@ main() {
   install_docker
   setup_docker_network
   setup_nginx_proxy_manager
-  setup_crowdsec
+  if [[ "$DOCKER_ARCH" == "amd64" ]]; then
+    setup_crowdsec
+  else
+    printf "\n${C_YEL}ARM architecture detected -- CrowdSec dashboard not available.${C_R}\n"
+    printf "${C_B}Options:${C_R}\n"
+    printf "  ${C_CYN}1)${C_R} CrowdSec (CLI-only, no dashboard)\n"
+    printf "  ${C_CYN}2)${C_R} Fail2Ban (traditional, no dashboard needed)\n"
+    read -rp "Choice [1/2]: " arm_choice
+    case "$arm_choice" in
+      2) setup_fail2ban; CROWDSEC_CHOICE="fail2ban" ;;
+      *) setup_crowdsec ;;
+    esac
+  fi
   setup_yunohost_firewall_npm
   setup_logrotate
 
   DEPLOY_STATUS="success"
-  DEPLOYED_SERVICES="YunoHost,NPM,CrowdSec"
 
   print_summary
 }

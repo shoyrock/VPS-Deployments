@@ -31,7 +31,6 @@ DOMAIN=""  # Set at runtime via user prompt
 
 # -- Deployment state --
 DEPLOY_STATUS="in_progress"
-DEPLOYED_SERVICES=""
 CROWDSEC_CHOICE="crowdsec"    # crowdsec | fail2ban
 
 if [[ -t 1 ]]; then
@@ -118,6 +117,7 @@ _on_exit() {
   else
     printf "${C_B}${C_YEL}Deployment failed.${C_R} Check: ${C_CYN}cat $LOG_FILE${C_R}\n\n"
   fi
+  _log "INFO" "=== Script exited (code $exit_code, status: $DEPLOY_STATUS, elapsed: ${elapsed}s) ===" 2>/dev/null || true
   exit $exit_code
 }
 
@@ -139,17 +139,17 @@ preflight_checks() {
   fi
 
   case "$OS_ID" in
-    ubuntu|debian|linuxmint|pop|kali) readonly OS_FAMILY_F="debian" ;;
-    centos|rhel|rocky|almalinux|fedora|ol|oraclelinux|amzn) readonly OS_FAMILY_F="rhel" ;;
+    ubuntu|debian|linuxmint|pop|kali) readonly OS_FAMILY="debian" ;;
+    centos|rhel|rocky|almalinux|fedora|ol|oraclelinux|amzn) readonly OS_FAMILY="rhel" ;;
     *)
-      if [[ "$OS_LIKE" == *"debian"* ]]; then readonly OS_FAMILY_F="debian"
-      elif [[ "$OS_LIKE" == *"rhel"* ]] || [[ "$OS_LIKE" == *"fedora"* ]] || [[ "$OS_LIKE" == *"centos"* ]]; then readonly OS_FAMILY_F="rhel"
+      if [[ "$OS_LIKE" == *"debian"* ]]; then readonly OS_FAMILY="debian"
+      elif [[ "$OS_LIKE" == *"rhel"* ]] || [[ "$OS_LIKE" == *"fedora"* ]] || [[ "$OS_LIKE" == *"centos"* ]]; then readonly OS_FAMILY="rhel"
       else fatal "Unsupported: ${OS_NAME} (${OS_ID}). Need Ubuntu 20.04+, Debian 11+, Rocky/Alma 8+, Fedora 35+, Amazon Linux 2023"; fi
       ;;
   esac
-  success "OS: ${OS_NAME} ${OS_VERSION_ID} (${OS_FAMILY_F})"
+  success "OS: ${OS_NAME} ${OS_VERSION_ID} (${OS_FAMILY})"
 
-  if [[ "$OS_FAMILY_F" == "debian" ]]; then
+  if [[ "$OS_FAMILY" == "debian" ]]; then
     local major_ver="${OS_VERSION_ID%%.*}"
     if [[ "$OS_ID" == "ubuntu" && "$major_ver" -lt 20 ]]; then fatal "Ubuntu ${OS_VERSION_ID} too old (min 20.04)."; fi
     if [[ "$OS_ID" == "debian" && "$major_ver" -lt 11 ]]; then fatal "Debian ${OS_VERSION_ID} too old (min 11)."; fi
@@ -176,7 +176,7 @@ preflight_checks() {
 
   mkdir -p "$(dirname "$LOG_FILE")"
   _log "INFO" "=== ${SCRIPT_NAME} v${SCRIPT_VERSION} started ==="
-  _log "INFO" "OS: ${OS_NAME} ${OS_VERSION_ID}, Family: ${OS_FAMILY_F}, Arch: ${ARCH}"
+  _log "INFO" "OS: ${OS_NAME} ${OS_VERSION_ID}, Family: ${OS_FAMILY}, Arch: ${ARCH}"
 }
 
 idempotent_cleanup() {
@@ -206,7 +206,7 @@ idempotent_cleanup() {
   rm -f /etc/crowdsec/crowdsec-firewall-bouncer.yaml 2>/dev/null || true
   rm -rf /etc/crowdsec 2>/dev/null || true
 
-  if [[ "$OS_FAMILY_F" == "debian" ]]; then
+  if [[ "$OS_FAMILY" == "debian" ]]; then
     apt-get remove -y -qq crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables 2>/dev/null || true
     apt-get autoremove -y -qq 2>/dev/null || true
   else
@@ -224,7 +224,7 @@ system_update() {
   step "System Update"
   info "Updating packages — this may take a few minutes..."
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-  if [[ "$OS_FAMILY_F" == "debian" ]]; then
+  if [[ "$OS_FAMILY" == "debian" ]]; then
     apt-get update -qq && apt-get upgrade -y -qq && apt-get autoremove -y -qq && apt-get autoclean -qq
   else
     if command -v dnf &>/dev/null; then dnf update -y -q && dnf autoremove -y -q 2>/dev/null || true
@@ -236,7 +236,7 @@ system_update() {
 install_dependencies() {
   step "Dependencies"
   info "Installing required packages..."
-  if [[ "$OS_FAMILY_F" == "debian" ]]; then
+  if [[ "$OS_FAMILY" == "debian" ]]; then
     apt-get install -y -qq ca-certificates curl gnupg lsb-release \
       software-properties-common apt-transport-https jq cron logrotate
   else
@@ -253,7 +253,7 @@ install_docker() {
     success "Docker already installed: $(docker --version)"; return 0
   fi
   info "Installing Docker CE — this may take a few minutes..."
-  if [[ "$OS_FAMILY_F" == "debian" ]]; then
+  if [[ "$OS_FAMILY" == "debian" ]]; then
     install -m 0755 -d /etc/apt/keyrings
     curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" -o /etc/apt/keyrings/docker.asc 2>/dev/null || \
       curl -fsSL "https://download.docker.com/linux/ubuntu/gpg" -o /etc/apt/keyrings/docker.asc
@@ -438,15 +438,12 @@ PROXY
   # -- authelia-location.conf (unquoted SNIPPET for \$ escaping) --
   cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" << SNIPPET
 location /authelia {
-    internal;
-    proxy_pass http://authelia:9091/api/verify;
-    proxy_set_header X-Original-URL \$scheme://\$http_host\$request_uri;
+    proxy_pass http://authelia:9091;
+    proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-Method \$request_method;
-    proxy_pass_request_body off;
-    proxy_pass_request_headers on;
-    proxy_set_header Content-Length "";
-    proxy_set_header Connection "";
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_set_header X-Forwarded-Host \$http_host;
 }
 SNIPPET
 
@@ -628,6 +625,7 @@ services:
       - proxy
 COMPOSE_CROWDSEC
 
+  if [[ "$DOCKER_ARCH" == "amd64" ]]; then
     cat >> "${STACK_DIR}/docker-compose.crowdsec.yml" << DASHBOARD
   crowdsec-dashboard:
     image: partitio/crowdsec-dashboard:latest
@@ -643,6 +641,7 @@ COMPOSE_CROWDSEC
     networks:
       - proxy
 DASHBOARD
+  fi
 
   cat >> "${STACK_DIR}/docker-compose.crowdsec.yml" << 'NETS'
 networks:
@@ -762,15 +761,6 @@ NETS
   done
   printf "\n"
 
-  info "Waiting for Authelia..."
-  for i in $(seq 1 30); do
-    docker ps --format '{{.Names}}' | grep -qx "authelia" && { success "Authelia ready"; break; }
-    printf "\r  Waiting... %2d/30" "$i"
-    [[ $i -eq 30 ]] && { printf "\n"; warn "Authelia start timed out"; }
-    sleep 2
-  done
-  printf "\n"
-
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
   success "Stack deployed: NPM at http://${ip}:81, Cosmos proxied via http://cosmos-server:80, Authelia at http://authelia:9091"
 }
@@ -779,7 +769,7 @@ NETS
 setup_firewall() {
   step "Firewall Configuration"
   info "Configuring firewall..."
-  [[ "$OS_FAMILY_F" == "debian" ]] && setup_firewall_debian || setup_firewall_rhel
+  [[ "$OS_FAMILY" == "debian" ]] && setup_firewall_debian || setup_firewall_rhel
 }
 
 setup_firewall_debian() {
@@ -846,7 +836,7 @@ print_summary() {
   local elapsed=$(( $(date +%s) - START_TIME ))
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
   local ext_ip; ext_ip=$(get_external_ip)
-  local fw_cmd; [[ "$OS_FAMILY_F" == "debian" ]] && fw_cmd="ufw status verbose" || fw_cmd="firewall-cmd --list-all"
+  local fw_cmd; [[ "$OS_FAMILY" == "debian" ]] && fw_cmd="ufw status verbose" || fw_cmd="firewall-cmd --list-all"
 
   local crowdsec_display="crowdsec    crowdsec     8080 (LAPI)        crowdsec.${DOMAIN} (amd64 only)"
   [[ "$CROWDSEC_CHOICE" == "fail2ban" ]] && crowdsec_display="fail2ban   fail2ban   —                  (internal, no proxy needed)"
@@ -958,7 +948,7 @@ $(if [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]]; 
 $(if [[ "$CROWDSEC_CHOICE" == "fail2ban" ]]; then echo "# Fail2Ban active — no proxy host needed"; fi)
 
 ${C_B}${CROWDSEC_CHOICE^^}${C_R}  Collections: sshd, nginx-proxy-manager, linux
-${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY_F" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
+${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
 
 ${C_B}${C_YEL}Step 1 -- NPM Admin${C_R}
   Open:   http://${ip}:81
@@ -1023,7 +1013,7 @@ ${C_B}${C_YEL}Step 6 -- Register TOTP Device${C_R}
   Follow prompts to register your authenticator app
 
 ${C_B}${C_YEL}Step 7 -- Secure Admin Port${C_R}
-  $(if [[ "$OS_FAMILY_F" == "debian" ]]; then echo "  ufw delete allow 81/tcp && ufw reload"; else echo "  firewall-cmd --permanent --remove-port=81/tcp && firewall-cmd --reload"; fi)
+  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "  ufw delete allow 81/tcp && ufw reload"; else echo "  firewall-cmd --permanent --remove-port=81/tcp && firewall-cmd --reload"; fi)
 
 ${C_B}${C_YEL}Step 8 -- Change Default Password${C_R}
   ${C_RED}IMPORTANT:${C_R} Change the default Authelia password immediately:
@@ -1048,8 +1038,14 @@ EOF
 
 
 setup_fail2ban() {
+  step "Fail2Ban Installation"
   info "Installing Fail2Ban..."
-  apt-get install -y fail2ban
+  if [[ "$OS_FAMILY" == "debian" ]]; then
+    apt-get install -y fail2ban
+  else
+    local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
+    $pkg install -y fail2ban
+  fi
   mkdir -p /etc/fail2ban/jail.d /etc/fail2ban/filter.d
 
   cat > /etc/fail2ban/filter.d/nginx-proxy-manager.conf << 'FILTER'
@@ -1072,7 +1068,7 @@ JAIL
   systemctl enable fail2ban
   systemctl restart fail2ban
   success "Fail2Ban installed with NPM jail"
-  DEPLOYED_SERVICES+=",fail2ban"
+
 }
 
 setup_crowdsec() {
@@ -1244,7 +1240,6 @@ main() {
   setup_logrotate
   register_cosmos_stacks
   DEPLOY_STATUS="success"
-  DEPLOYED_SERVICES="npm,cosmos-server,authelia,${CROWDSEC_CHOICE}"
   print_summary
 }
 

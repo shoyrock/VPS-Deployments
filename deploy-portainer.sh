@@ -32,7 +32,6 @@ DOMAIN=""
 
 # Deployment status tracking for guaranteed completion summary
 DEPLOY_STATUS="in_progress"   # in_progress | success | failed
-DEPLOYED_SERVICES=""          # Track what was successfully deployed
 CROWDSEC_CHOICE="crowdsec"    # crowdsec | fail2ban
 
 # Colors (TTY only)
@@ -1388,7 +1387,6 @@ main() {
   setup_logrotate
   register_portainer_stacks
   DEPLOY_STATUS="success"
-  DEPLOYED_SERVICES="npm,portainer,authelia,${CROWDSEC_CHOICE},firewall"
   print_summary
 }
 
