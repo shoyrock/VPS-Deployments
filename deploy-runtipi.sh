@@ -453,10 +453,6 @@ log:
 
 theme: dark
 
-jwt_secret: file:///config/secrets/jwt_session
-
-default_redirection_url: https://runtipi.${DOMAIN}
-
 totp:
   issuer: authelia.com
   period: 30
@@ -473,10 +469,14 @@ access_control:
       policy: two_factor
 
 session:
-  secret: file:///config/secrets/session
+  name: authelia_session
   expiration: 1h
   inactivity: 5m
   remember_me_duration: 1M
+  cookies:
+    - domain: "${DOMAIN}"
+      authelia_url: 'https://authelia.${DOMAIN}'
+      default_redirection_url: 'https://runtipi.${DOMAIN}'
 
 regulation:
   max_retries: 5

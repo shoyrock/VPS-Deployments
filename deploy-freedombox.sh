@@ -446,9 +446,6 @@ setup_authelia_config() {
 host: 0.0.0.0
 port: 9091
 log_level: info
-jwt_secret: file:///config/secrets/jwt_session
-default_redirection_url: https://${DOMAIN:-example.com}/
-
 totp:
   issuer: authelia.com
   period: 30
@@ -466,10 +463,13 @@ access_control:
 
 session:
   name: authelia_session
-  secret: file:///config/secrets/session
   expiration: 3600
   inactivity: 300
   remember_me_duration: 1M
+  cookies:
+    - domain: "${DOMAIN:-example.com}"
+      authelia_url: 'https://authelia.${DOMAIN:-example.com}'
+      default_redirection_url: 'https://${DOMAIN:-example.com}/'
 
 regulation:
   max_retries: 5

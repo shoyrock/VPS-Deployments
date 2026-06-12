@@ -427,7 +427,6 @@ setup_authelia_config() {
   mkdir -p "$AUTHELIA_CONFIG_DIR"
   cat > "${AUTHELIA_CONFIG_DIR}/configuration.yml" << AUTHELIA_CONFIG
 theme: dark
-default_redirection_url: https://${DOMAIN:-example.com}
 server:
   host: 0.0.0.0
   port: 9091
@@ -448,6 +447,10 @@ session:
   expiration: 1h
   inactivity: 5m
   remember_me_duration: 1M
+  cookies:
+    - domain: "${DOMAIN:-example.com}"
+      authelia_url: 'https://authelia.${DOMAIN:-example.com}'
+      default_redirection_url: 'https://${DOMAIN:-example.com}'
 regulation:
   max_retries: 5
   find_time: 2m

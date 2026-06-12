@@ -500,9 +500,6 @@ log:
 
 theme: auto
 
-jwt_secret: file:///config/secrets/jwt_session
-default_redirection_url: https://coolify.${DOMAIN}
-
 totp:
   issuer: authelia.com
   period: 30
@@ -520,10 +517,12 @@ access_control:
 
 session:
   name: authelia_session
-  secret: file:///config/secrets/session
   expiration: 1h
   inactivity: 5m
-  domain: "${DOMAIN}"
+  cookies:
+    - domain: "${DOMAIN}"
+      authelia_url: 'https://authelia.${DOMAIN}'
+      default_redirection_url: 'https://coolify.${DOMAIN}'
 
 regulation:
   max_retries: 5

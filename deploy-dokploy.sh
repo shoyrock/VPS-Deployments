@@ -445,7 +445,6 @@ setup_authelia_config() {
 #                   Authelia configuration                    #
 ###############################################################
 theme: dark
-default_redirection_url: https://auth.${DOMAIN}
 server:
   host: 0.0.0.0
   port: 9091
@@ -467,7 +466,10 @@ session:
   name: authelia_session
   expiration: 3600
   inactivity: 300
-  domain: "${DOMAIN}"
+  cookies:
+    - domain: "${DOMAIN}"
+      authelia_url: 'https://authelia.${DOMAIN}'
+      default_redirection_url: 'https://auth.${DOMAIN}'
 regulation:
   max_retries: 5
   find_time: 2m

@@ -710,11 +710,11 @@ setup_authelia_config() {
 #                       Authelia configuration                #
 #       https://www.authelia.com/configuration/               #
 ###############################################################
-host: 0.0.0.0
-port: 9091
-log_level: info
-jwt_secret: "${AUTHELIA_SECRETS_DIR}/jwt_secret"
-default_redirection_url: https://authelia.${DOMAIN}
+server:
+  host: 0.0.0.0
+  port: 9091
+log:
+  level: info
 totp:
   issuer: authelia.${DOMAIN}
 authentication_backend:
@@ -731,13 +731,13 @@ access_control:
       policy: bypass
 session:
   name: authelia_session
-  secret: "${AUTHELIA_SECRETS_DIR}/session"
   expiration: 1h
   inactivity: 5m
-  remember_me_duration: 1M
+  remember_me: 1M
   cookies:
     - domain: "${DOMAIN}"
       authelia_url: "https://authelia.${DOMAIN}"
+      default_redirection_url: "https://authelia.${DOMAIN}"
 regulation:
   max_retries: 5
   find_time: 2m
