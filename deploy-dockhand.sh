@@ -767,9 +767,9 @@ SNIPPET
 
   cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" << SNIPPET1
 auth_request /authelia;
-auth_request_set $target_url $scheme://$http_host$request_uri;
-auth_request_set $user $upstream_http_remote_user;
-proxy_set_header Remote-User $user;
+auth_request_set \$target_url \$scheme://\$http_host\$request_uri;
+auth_request_set \$user \$upstream_http_remote_user;
+proxy_set_header Remote-User \$user;
 error_page 401 =302 https://authelia.${DOMAIN}/?rd=\$target_url;
 SNIPPET1
 
