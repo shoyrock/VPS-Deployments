@@ -8,7 +8,7 @@ fi
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.0.0-crowdsec"
+readonly SCRIPT_VERSION="4.4.0-hardened"
 readonly SCRIPT_NAME="deploy-portainer.sh"
 readonly START_TIME=$(date +%s)
 readonly STACK_DIR="/opt/portainer-stack"
@@ -43,17 +43,18 @@ else
 fi
 
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
-_log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}" >> "$LOG_FILE" 2>/dev/null || true; }
-info()    { printf "${C_BLU}ℹ${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
-warn()    { printf "${C_YEL}⚠${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
-error()   { printf "${C_RED}✖${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }
-success() { printf "${C_GRN}✔${C_R}  %s\n" "$*"; _log "SUCCESS" "$@"; }
+_log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}
+_read_cred() { [[ -f "$1" ]] && tr -d '\\n' < "$1" 2>/dev/null || echo <unknown>; }" >> "$LOG_FILE" 2>/dev/null || true; }
+info()    { printf "${C_BLU}?${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
+warn()    { printf "${C_YEL}?${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
+error()   { printf "${C_RED}?${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }
+success() { printf "${C_GRN}?${C_R}  %s\n" "$*"; _log "SUCCESS" "$@"; }
 fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; DEPLOY_STATUS="failed"; exit 1; }
-step()    { printf "\n${C_B}${C_CYN}── %s ──${C_R}\n" "$*"; _log "STEP" "$@"; }
+step()    { printf "\n${C_B}${C_CYN}-- %s --${C_R}\n" "$*"; _log "STEP" "$@"; }
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# GUARANTEED COMPLETION SUMMARY — runs on exit regardless of success/failure
-# ═══════════════════════════════════════════════════════════════════════════════
+# -------------------------------------------------------------------------------
+# GUARANTEED COMPLETION SUMMARY ? runs on exit regardless of success/failure
+# -------------------------------------------------------------------------------
 get_external_ip() {
   curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
   curl -s -4 --max-time 10 https://ifconfig.me 2>/dev/null || \
@@ -67,54 +68,61 @@ _on_exit() {
   local ip ext_ip
   ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<internal_ip>")
   ext_ip=$(get_external_ip)
+  local authelia_pass npm_pass mb_pass
+  authelia_pass=$(_read_cred "${AUTHELIA_DIR}/.default_password")
+  npm_pass=$(_read_cred "${STACK_DIR}/.npm_admin_password")
+  mb_pass=$(_read_cred "${STACK_DIR}/.metabase_password")
   local exit_pass="<unknown>"
   [[ -f "${AUTHELIA_DIR}/.default_password" ]] && exit_pass=$(tr -d '\n' < "${AUTHELIA_DIR}/.default_password" 2>/dev/null || echo "<unknown>")
 
   printf "\n"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
-    printf "${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
-    printf "${C_B}${C_GRN}║                    ✅  DEPLOYMENT COMPLETED SUCCESSFULLY                      ║${C_R}\n"
-    printf "${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    printf "${C_B}${C_GRN}+------------------------------------------------------------------------------+${C_R}\n"
+    printf "${C_B}${C_GRN}?                    ?  DEPLOYMENT COMPLETED SUCCESSFULLY                      ?${C_R}\n"
+    printf "${C_B}${C_GRN}?------------------------------------------------------------------------------?${C_R}\n"
   else
-    printf "${C_B}${C_RED}╔══════════════════════════════════════════════════════════════════════════════╗${C_R}\n"
-    printf "${C_B}${C_RED}║                     ❌  DEPLOYMENT DID NOT COMPLETE                           ║${C_R}\n"
-    printf "${C_B}${C_RED}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
+    printf "${C_B}${C_RED}+------------------------------------------------------------------------------+${C_R}\n"
+    printf "${C_B}${C_RED}?                     ?  DEPLOYMENT DID NOT COMPLETE                           ?${C_R}\n"
+    printf "${C_B}${C_RED}?------------------------------------------------------------------------------?${C_R}\n"
   fi
-  printf "${C_B}║  %-72s  ║${C_R}\n" "Elapsed:  ${elapsed}s"
-  printf "${C_B}║  %-72s  ║${C_R}\n" "VPS IP:   $ip"
-  printf "${C_B}║  %-72s  ║${C_R}\n" "External: $ext_ip"
-  printf "${C_B}║  %-72s  ║${C_R}\n" "Domain:   ${DOMAIN:-<not set>}"
-  printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
-  printf "${C_B}║  %-72s  ║${C_R}\n" "NPM Admin: http://${ip}:81"
+  printf "${C_B}?  %-72s  ?${C_R}\n" "Elapsed:  ${elapsed}s"
+  printf "${C_B}?  %-72s  ?${C_R}\n" "VPS IP:   $ip"
+  printf "${C_B}?  %-72s  ?${C_R}\n" "External: $ext_ip"
+  printf "${C_B}?  %-72s  ?${C_R}\n" "Domain:   ${DOMAIN:-<not set>}"
+  printf "${C_B}?------------------------------------------------------------------------------?${C_R}\n"
+  printf "${C_B}?  %-72s  ?${C_R}\n" "NPM Admin: http://${ip}:81"
+  printf "${C_B}?  %-72s  ?${C_R}\n" "NPM Login: admin@example.com / changeme"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
-    printf "${C_B}║  %-72s  ║${C_R}\n" "Portainer: http://portainer.${DOMAIN}"
-    printf "${C_B}║  %-72s  ║${C_R}\n" "Authelia:  https://authelia.${DOMAIN}"
-    [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && printf "${C_B}║  %-72s  ║${C_R}\n" "CrowdSec:  https://crowdsec.${DOMAIN}"
-    printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
-    printf "${C_B}║  %-72s  ║${C_R}\n" "NPM Proxy Forwarding:"
-    printf "${C_B}║  %-72s  ║${C_R}\n" "  authelia.${DOMAIN}          → authelia:9091"
-    printf "${C_B}║  %-72s  ║${C_R}\n" "  portainer.${DOMAIN}         → portainer:9000"
-    [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && printf "${C_B}║  %-72s  ║${C_R}\n" "  crowdsec.${DOMAIN}          → crowdsec-dashboard:3000"
-    printf "${C_B}║  %-72s  ║${C_R}\n" ""
-    printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "Authelia Username: admin"
-    printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "Authelia Password: $exit_pass"
-    printf "${C_B}║  ${C_RED}%-72s${C_R}${C_B}  ║${C_R}\n" "Change this password immediately after first login!"
-    printf "${C_B}║  %-72s  ║${C_R}\n" "Also: ${AUTHELIA_DIR}/password.txt"
-    printf "${C_B}║  %-72s  ║${C_R}\n" ""
-    printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "-- Verification Codes --"
-    printf "${C_B}║  %-72s  ║${C_R}\n" "Authelia requires a code to change password or add 2FA."
-    printf "${C_B}║  %-72s  ║${C_R}\n" "The code appears AFTER you request it in the Authelia UI."
-    printf "${C_B}║  %-72s  ║${C_R}\n" "Then run:"
-    printf "${C_B}║  ${C_CYN}%-72s${C_R}${C_B}  ║${C_R}\n" "sudo docker exec authelia cat /config/notifications.txt"
-    printf "${C_B}║  %-72s  ║${C_R}\n" ""
+    printf "${C_B}?  %-72s  ?${C_R}\n" "Portainer: http://portainer.${DOMAIN}"
+    printf "${C_B}?  %-72s  ?${C_R}\n" "Authelia:  https://authelia.${DOMAIN}"
+    printf "${C_B}?  %-72s  ?${C_R}\n" "CrowdSec:  https://crowdsec.${DOMAIN}"
+    printf "${C_B}?  %-72s  ?${C_R}\n" "  Login:   crowdsec@crowdsec.net"
+    printf "${C_B}?  %-72s  ?${C_R}\n" "  Pass:    !!Cr0wdS3c_M3t4b4s3??"
+    printf "${C_B}?------------------------------------------------------------------------------?${C_R}\n"
+    printf "${C_B}?  %-72s  ?${C_R}\n" "NPM Proxy Forwarding:"
+    printf "${C_B}?  %-72s  ?${C_R}\n" "  authelia.${DOMAIN}          ? authelia:9091"
+    printf "${C_B}?  %-72s  ?${C_R}\n" "  portainer.${DOMAIN}         ? portainer:9000"
+    printf "${C_B}?  %-72s  ?${C_R}\n" "  crowdsec.${DOMAIN}          ? crowdsec-dashboard:3000"
+    printf "${C_B}?  %-72s  ?${C_R}\n" ""
+    printf "${C_B}?  ${C_YEL}%-72s${C_R}${C_B}  ?${C_R}\n" "Authelia Username: admin"
+    printf "${C_B}?  ${C_YEL}%-72s${C_R}${C_B}  ?${C_R}\n" "Authelia Password: $exit_pass"
+    printf "${C_B}?  ${C_RED}%-72s${C_R}${C_B}  ?${C_R}\n" "Change this password immediately after first login!"
+    printf "${C_B}?  %-72s  ?${C_R}\n" "Also: ${AUTHELIA_DIR}/password.txt"
+    printf "${C_B}?  %-72s  ?${C_R}\n" ""
+    printf "${C_B}?  ${C_YEL}%-72s${C_R}${C_B}  ?${C_R}\n" "-- Verification Codes --"
+    printf "${C_B}?  %-72s  ?${C_R}\n" "Authelia requires a code to change password or add 2FA."
+    printf "${C_B}?  %-72s  ?${C_R}\n" "The code appears AFTER you request it in the Authelia UI."
+    printf "${C_B}?  %-72s  ?${C_R}\n" "Then run:"
+    printf "${C_B}?  ${C_CYN}%-72s${C_R}${C_B}  ?${C_R}\n" "sudo docker exec authelia cat /config/notifications.txt"
+    printf "${C_B}?  %-72s  ?${C_R}\n" ""
   fi
-  printf "${C_B}║  %-72s  ║${C_R}\n" "Ports: 80 (HTTP), 443 (HTTPS), 81 (NPM Admin)"
-  printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
-  printf "${C_B}║  %-72s  ║${C_R}\n" "Log: $LOG_FILE"
-  printf "${C_B}╚══════════════════════════════════════════════════════════════════════════════╝${C_R}\n"
+  printf "${C_B}?  %-72s  ?${C_R}\n" "Ports: 80 (HTTP), 443 (HTTPS), 81 (NPM Admin)"
+  printf "${C_B}?------------------------------------------------------------------------------?${C_R}\n"
+  printf "${C_B}?  %-72s  ?${C_R}\n" "Log: $LOG_FILE"
+  printf "${C_B}+------------------------------------------------------------------------------+${C_R}\n"
   printf "\n"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
-    printf "${C_B}${C_GRN}Your VPS is ready!${C_R} Set up DNS → ${C_CYN}${ext_ip}${C_R} and configure NPM.\n\n"
+    printf "${C_B}${C_GRN}Your VPS is ready!${C_R} Set up DNS ? ${C_CYN}${ext_ip}${C_R} and configure NPM.\n\n"
   else
     printf "${C_B}${C_YEL}Deployment failed.${C_R} Check: ${C_CYN}cat $LOG_FILE${C_R}\n\n"
   fi
@@ -228,7 +236,7 @@ idempotent_cleanup() {
 
 system_update() {
   step "System Update"
-  info "Updating packages — this may take a few minutes..."
+  info "Updating packages ? this may take a few minutes..."
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
   if [[ "$OS_FAMILY" == "debian" ]]; then
     apt-get update -qq && apt-get upgrade -y -qq && apt-get autoremove -y -qq && apt-get autoclean -qq
@@ -258,7 +266,7 @@ install_docker() {
   if command -v docker &>/dev/null && docker version &>/dev/null; then
     success "Docker already installed: $(docker --version)"; return 0
   fi
-  info "Installing Docker CE — this may take a few minutes..."
+  info "Installing Docker CE ? this may take a few minutes..."
   if [[ "$OS_FAMILY" == "debian" ]]; then
     install -m 0755 -d /etc/apt/keyrings
     curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" -o /etc/apt/keyrings/docker.asc 2>/dev/null || \
@@ -310,7 +318,7 @@ get_user_domain() {
     local existing_domain
     existing_domain=$(tr -d '\n' < "${DOMAIN_PERSIST_FILE}")
     if [[ -n "$existing_domain" ]]; then
-      printf "\n${C_YEL}⚠️  Previous deployment detected with domain: ${C_B}${existing_domain}${C_R}\n"
+      printf "\n${C_YEL}??  Previous deployment detected with domain: ${C_B}${existing_domain}${C_R}\n"
       printf "${C_YEL}   Press ${C_B}Y${C_R}${C_YEL} + Enter to REUSE this domain${C_R}\n"
       printf "${C_YEL}   Press ${C_B}N${C_R}${C_YEL} + Enter to enter a NEW domain${C_R}\n\n"
       read -rp "Reuse '${existing_domain}'? [Y/n]: " use_existing
@@ -357,11 +365,11 @@ setup_authelia_config() {
 ---
 # Authelia Configuration -- auto-generated
 server:
-  address: tcp://0.0.0.0:9091
+  address: "tcp://0.0.0.0:9091"
   endpoints:
     authz:
-      forward-auth:
-        implementation: 'ForwardAuth'
+      auth-request:
+        implementation: "AuthRequest"
 log:
   level: info
   format: text
@@ -419,49 +427,31 @@ create_nginx_snippets() {
   chmod 644 "${AUTHELIA_CONFIG_DIR}"/*.yml "${AUTHELIA_CONFIG_DIR}"/*.txt 2>/dev/null || true
   chmod 600 "${AUTHELIA_SECRETS_DIR}"/* 2>/dev/null || true
 
-  # snippet 1: authelia-authrequest.conf
+  # -- authelia-authrequest.conf --
   cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" << SNIPPET1
-## Paste this into NPM Advanced tab for each protected proxy host
-## NOTE: proxy_set_header Remote-User/Groups below work at server block level.
-## NPM's generated location / block has its own proxy_set_header directives,
-## which OVERRIDES all server-level ones (nginx inheritance rule).
-## For apps that need SSO identity headers, add them via NPM's Custom Locations.
-auth_request /authelia;
-auth_request_set \$target_url \$scheme://\$http_host\$request_uri;
-error_page 401 =302 https://authelia.${DOMAIN}/?rd=\$target_url;
+auth_request /internal/authelia/authz;
 auth_request_set \$user \$upstream_http_remote_user;
 auth_request_set \$groups \$upstream_http_remote_groups;
+auth_request_set \$name \$upstream_http_remote_name;
+auth_request_set \$email \$upstream_http_remote_email;
 proxy_set_header Remote-User \$user;
 proxy_set_header Remote-Groups \$groups;
-
-set \$upstream_authelia http://authelia:9091;
-location /authelia {
-    internal;
-    proxy_pass \$upstream_authelia/api/authz/forward-auth;
-    proxy_pass_request_body off;
-    proxy_set_header Content-Length "";
-    proxy_set_header X-Original-URL \$scheme://\$http_host\$request_uri;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto \$scheme;
-    proxy_set_header X-Forwarded-Host \$http_host;
-    proxy_set_header X-Forwarded-Uri \$request_uri;
-    proxy_cache_bypass \$cookie_session;
-    proxy_no_cache \$cookie_session;
-    proxy_http_version 1.1;
-}
+proxy_set_header Remote-Name \$name;
+proxy_set_header Remote-Email \$email;
+auth_request_set \$redirection_url \$upstream_http_location;
+error_page 401 =302 \$redirection_url;
 SNIPPET1
 
-  # snippet 2: authelia-location.conf
-  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" << 'SNIPPET2'
-## Authelia - Location header for redirection
-location /authelia {
-    proxy_pass http://authelia:9091;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-Host $http_host;
+  # -- authelia-location.conf --
+  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" << SNIPPET2
+location /internal/authelia/authz {
+    internal;
+    proxy_pass http://authelia:9091/api/authz/auth-request;
+    proxy_set_header X-Original-Method \$request_method;
+    proxy_set_header X-Original-URL \$scheme://\$http_host\$request_uri;
+    proxy_set_header X-Forwarded-For \$remote_addr;
+    proxy_set_header Content-Length "";
+    proxy_pass_request_body off;
 }
 SNIPPET2
 
@@ -489,56 +479,36 @@ proxy_send_timeout 86400;
 proxy_connect_timeout 86400;
 send_timeout 86400;
 SNIPPET3
-
+  local npm_custom_dir="${NPM_DATA_DIR}/nginx/custom"
+  mkdir -p "$npm_custom_dir"
+  cp "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" "$npm_custom_dir/"
+  cp "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" "$npm_custom_dir/"
   success "NGINX snippets created in ${AUTHELIA_SNIPPETS_DIR}"
   info "Mount these snippets in NPM via docker volume or copy into NPM data"
 }
 
 setup_authelia_users() {
-  step "Creating Authelia User Account"
-
-  # Always create fresh users.yml (old one may have stale password)
-
-  # Use the official Authelia lite bundle pre-hashed password.
-  # Password is "authelia" — change immediately after first login.
-  # Hash source: https://github.com/authelia/authelia/blob/master/examples/compose/lite/authelia/users_database.yml
-  local default_pass="authelia"
-  local pass_hash='$argon2id$v=19$m=65536,t=3,p=4$qOKNq+u5lZHOTnsJY1Sp3g$s6zT9EKncfkmIJmykzZProUigRRJ26hlTl1WC+mG2do'
-
-  # Store password for display
-  printf '%s' "$default_pass" > "${AUTHELIA_DIR}/.default_password"
-  chmod 600 "${AUTHELIA_DIR}/.default_password"
-  printf '%s' "$default_pass" > "${AUTHELIA_DIR}/password.txt"
-  chmod 600 "${AUTHELIA_DIR}/password.txt"
-
-  # Write users.yml — single-quoted YAML (matches official lite bundle format)
-  cat > "${AUTHELIA_CONFIG_DIR}/users.yml" << USEREOF
----
+  step "Authelia Users"
+  local default_pass hash
+  default_pass=$(rand_password 16)
+  info "Generating argon2 hash for default admin user..."
+  hash=$(docker run --rm authelia/authelia:latest \
+           authelia crypto hash generate argon2 --password "$default_pass" 2>/dev/null \
+         | awk -F': ' '/Digest/ {print $2}')
+  [[ -n "$hash" ]] || fatal "Failed to generate Authelia password hash"
+  cat > "${AUTHELIA_CONFIG_DIR}/users.yml" << USERS
 users:
   admin:
-    disabled: false
-    displayname: 'Administrator'
-    password: '${pass_hash}'
-    email: 'admin@${DOMAIN}'
+    displayname: "Admin User"
+    password: "${hash}"
+    email: admin@${DOMAIN}
     groups:
       - admins
-      - users
-USEREOF
-
-  success "Authelia user 'admin' created"
-  info "Default password: ${default_pass} (change after first login)"
-
-  info "Starting Authelia..."
-  docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" up -d
-
-  # Wait for authelia to come up
-  for i in $(seq 1 30); do
-    docker ps --format '{{.Names}}' | grep -qx "authelia" && { success "Authelia ready"; break; }
-    printf "${C_DIM}  Waiting for Authelia to start... (%d/30)${C_R}\r" "$i"
-    [[ $i -eq 30 ]] && warn "Authelia start timed out"
-    sleep 2
-  done
-  printf "\n"
+USERS
+  chmod 600 "${AUTHELIA_CONFIG_DIR}/users.yml"
+  printf '%s' "$default_pass" > "${AUTHELIA_DIR}/.default_password"
+  chmod 600 "${AUTHELIA_DIR}/.default_password"
+  success "Default user created. Login: admin / (see ${AUTHELIA_DIR}/.default_password) - change after first login"
 }
 
 setup_portainer_standalone() {
@@ -578,10 +548,7 @@ COMPOSE_PORTAINER
 setup_stack() {
   step "Deploying NPM, Authelia, CrowdSec (separate compose files)"
   mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR" "$AUTHELIA_CONFIG_DIR" "$AUTHELIA_SECRETS_DIR"
-  # Generate CrowdSec LAPI credentials for dashboard (used in both compose and machine registration)
-  local CROWDSEC_LOGIN CROWDSEC_PASSWORD BETTER_AUTH_SECRET
-  CROWDSEC_LOGIN="dashboard-user-$(openssl rand -hex 4 2>/dev/null || echo "a1b2c3d4")"
-  CROWDSEC_PASSWORD="$(openssl rand -base64 24 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 32)")"
+  local BETTER_AUTH_SECRET
   BETTER_AUTH_SECRET="$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")"
 
   cat > "${STACK_DIR}/docker-compose.npm.yml" << 'COMPOSE_NPM'
@@ -652,11 +619,15 @@ COMPOSE_CROWDSEC
 
     cat >> "${STACK_DIR}/docker-compose.crowdsec.yml" << DASHBOARD
   crowdsec-dashboard:
-    image: apollof/crowdsec_metabase:latest
+    image: metabase/metabase:latest
     container_name: crowdsec-dashboard
     restart: unless-stopped
     volumes:
-      - ./crowdsec/data:/metabase-data:ro
+      - ./crowdsec/data/crowdsec.db:/metabase-data/crowdsec.db:ro
+      - ./crowdsec/metabase.db.mv.db:/app/metabase.db.mv.db
+    environment:
+      - MB_ADMIN_EMAIL=crowdsec@crowdsec.net
+      - MB_ADMIN_PASSWORD=!!Cr0wdS3c_M3t4b4s3??
     networks:
       - proxy
 DASHBOARD
@@ -668,7 +639,20 @@ networks:
     external: true
 NETS
 
-  info "Pulling Docker images (NPM, Authelia, CrowdSec) — this may take a few minutes..."
+  if command -v curl &>/dev/null; then
+    DL_CMD="curl -sL -o"
+  elif command -v wget &>/dev/null; then
+    DL_CMD="wget -qO"
+  fi
+  if [ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ] && [ -n "$DL_CMD" ]; then
+    $DL_CMD /tmp/metabase_sqlite.zip https://crowdsec-statics-assets.s3-eu-west-1.amazonaws.com/metabase_sqlite.zip
+    command -v unzip &>/dev/null && unzip -o /tmp/metabase_sqlite.zip -d "$CROWDSEC_DIR" && rm -f /tmp/metabase_sqlite.zip
+    chown 1000:1000 "$CROWDSEC_DIR/metabase.db.mv.db" 2>/dev/null || true
+  else
+    [ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ] && warn "Metabase template not found ? dashboard may not have pre-loaded collections"
+  fi
+
+  info "Pulling Docker images (NPM, Authelia, CrowdSec) ? this may take a few minutes..."
   docker compose -f "${STACK_DIR}/docker-compose.npm.yml" pull
   docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" pull
   docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" pull
@@ -794,7 +778,7 @@ setup_crowdsec() {
 filenames:
   - /npm-logs/*.log
 labels:
-  type: nginx
+  type: nginx-proxy-manager
 NPM_ACQUIS
   if docker exec crowdsec cat /etc/crowdsec/acquis.d/npm.yaml &>/dev/null; then
     success "NPM acquisition configured"
@@ -803,12 +787,18 @@ NPM_ACQUIS
 filenames:
   - /npm-logs/*.log
 labels:
-  type: nginx
+  type: nginx-proxy-manager
 EOF
     warn "NPM acquisition written (via docker exec)"
   fi
 
-  docker exec crowdsec kill -HUP 1 2>/dev/null || docker restart crowdsec &>/dev/null || true
+  info "Restarting CrowdSec to apply acquisition config..."
+  docker restart crowdsec &>/dev/null || true
+  for i in $(seq 1 30); do
+    docker exec crowdsec cscli metrics &>/dev/null && { success "CrowdSec back up"; break; }
+    [[ $i -eq 30 ]] && warn "CrowdSec slow to restart - check: docker logs crowdsec"
+    sleep 2
+  done
 
   info "Installing firewall bouncer..."
   local bouncer_version
@@ -854,7 +844,11 @@ BOUNCER_SERVICE
 
   docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
   local api_key
-   api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer 2>/dev/null | grep -oE '[a-f0-9]{32,}' | head -1 || true)
+  api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer -o raw 2>/dev/null | tr -d '[:space:]' || true)
+  if [[ -z "$api_key" ]]; then
+    docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
+    api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer 2>/dev/null | grep -oE '[A-Za-z0-9+/=_-]{30,}' | head -1 || true)
+  fi
   if [[ -n "$api_key" ]]; then
     mkdir -p /etc/crowdsec
     local fw_mode="iptables"
@@ -867,10 +861,26 @@ deny_action: DROP
 update_frequency: 10s
 BOUNCER
     systemctl daemon-reload 2>/dev/null || true
-    systemctl enable --now crowdsec-firewall-bouncer 2>/dev/null || true
-    success "Firewall bouncer registered"
+    systemctl unmask crowdsec-firewall-bouncer >>"$LOG_FILE" 2>&1 || true
+    if ! /usr/local/bin/crowdsec-firewall-bouncer -c /etc/crowdsec/crowdsec-firewall-bouncer.yaml -t >>"$LOG_FILE" 2>&1; then
+      warn "Bouncer config self-test failed - details in ${LOG_FILE}"
+    fi
+    systemctl enable crowdsec-firewall-bouncer >>"$LOG_FILE" 2>&1 || warn "systemctl enable failed for bouncer"
+    systemctl restart crowdsec-firewall-bouncer >>"$LOG_FILE" 2>&1 || true
+    local bouncer_ok=false
+    for i in $(seq 1 10); do
+      if systemctl is-active --quiet crowdsec-firewall-bouncer; then bouncer_ok=true; break; fi
+      sleep 2
+      [[ $i -eq 5 ]] && systemctl restart crowdsec-firewall-bouncer >>"$LOG_FILE" 2>&1 || true
+    done
+    if $bouncer_ok; then
+      success "Firewall bouncer registered and ACTIVE"
+    else
+      journalctl -u crowdsec-firewall-bouncer -n 30 --no-pager >>"$LOG_FILE" 2>&1 || true
+      error "Firewall bouncer is NOT running - bans are not enforced. Journal saved to ${LOG_FILE}. Debug: journalctl -u crowdsec-firewall-bouncer -n 30"
+    fi
   else
-    warn "Could not register firewall bouncer -- run manually: docker exec crowdsec cscli bouncers add my-bouncer"
+    error "Could not obtain bouncer API key - config NOT written, bans will not be enforced. Fix manually: docker exec crowdsec cscli bouncers add npm-bouncer -o raw"
   fi
 }
 
@@ -915,11 +925,11 @@ FILTER
 }
 
 crowdsec_cli_guide() {
-  step "CrowdSec CLI Quick Reference (ARM — no Dashboard)"
+  step "CrowdSec CLI Quick Reference (ARM ? no Dashboard)"
 
   cat << CLIEOF
 
-${C_B}${C_CYN}── CrowdSec CLI Management ──${C_R}
+${C_B}${C_CYN}-- CrowdSec CLI Management --${C_R}
 
 ${C_B}Monitor & Alerts:${C_R}
   ${C_CYN}docker exec crowdsec cscli metrics${C_R}
@@ -1062,10 +1072,76 @@ EOF
   success "Log rotation: ${NPM_LOGS_DIR}/*.log (14 days)"
 }
 
+
+verify_deployment() {
+  step "Post-Deploy Verification"
+  local fails=0
+
+  _check() {
+    local label="$1"; shift
+    if "$@" &>/dev/null; then success "VERIFY: ${label}"
+    else warn "VERIFY FAILED: ${label}"; fails=$((fails+1)); fi
+  }
+
+  # Containers
+  local want="npm authelia"
+  [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && want="$want crowdsec crowdsec-dashboard"
+  local c
+  for c in $want; do
+    _check "container '$c' running" bash -c "docker ps --format '{{.Names}}' | grep -qx '$c'"
+  done
+
+  # Core service health
+  _check "NPM API responding"        curl -sf --max-time 5 http://127.0.0.1:81/api/
+  _check "NPM default creds REJECTED (password was changed)" bash -c \
+    "! curl -s --max-time 5 -X POST http://127.0.0.1:81/api/tokens -H 'Content-Type: application/json' -d '{\"identity\":\"admin@example.com\",\"secret\":\"changeme\"}' | grep -q token"
+  _check "Authelia health endpoint OK" bash -c \
+    "docker exec authelia wget -q -O- http://127.0.0.1:9091/api/health 2>/dev/null | grep -q OK"
+  _check "nginx config valid inside NPM" docker exec npm nginx -t
+  _check "Authelia snippets present in NPM custom dir" bash -c \
+    "test -f '${NPM_DATA_DIR}/nginx/custom/authelia-location.conf' && test -f '${NPM_DATA_DIR}/nginx/custom/authelia-authrequest.conf'"
+
+  if [[ "$CROWDSEC_CHOICE" == "crowdsec" ]]; then
+    _check "CrowdSec LAPI responding"   docker exec crowdsec cscli metrics
+    _check "acquisition label is nginx-proxy-manager" bash -c \
+      "docker exec crowdsec cat /etc/crowdsec/acquis.d/npm.yaml 2>/dev/null | grep -q 'type: nginx-proxy-manager'"
+    _check "nginx-proxy-manager collection installed" bash -c \
+      "docker exec crowdsec cscli collections list 2>/dev/null | grep -q crowdsecurity/nginx-proxy-manager"
+    _check "bouncer registered in LAPI" bash -c \
+      "docker exec crowdsec cscli bouncers list 2>/dev/null | grep -q npm-bouncer"
+    _check "firewall bouncer service ACTIVE" systemctl is-active --quiet crowdsec-firewall-bouncer
+    if systemctl is-active --quiet crowdsec-firewall-bouncer; then
+      info "Running live ban round-trip test (192.0.2.1, reserved test IP)..."
+      docker exec crowdsec cscli decisions add --ip 192.0.2.1 --duration 2m --reason "deploy-verify" &>/dev/null || true
+      sleep 15
+      local banned=false
+      if command -v nft &>/dev/null && nft list ruleset 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=true; fi
+      if ! $banned && iptables -S 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=true; fi
+      if ! $banned && ipset list 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=true; fi
+      docker exec crowdsec cscli decisions delete --ip 192.0.2.1 &>/dev/null || true
+      if $banned; then success "VERIFY: end-to-end ban enforcement works"
+      else warn "VERIFY FAILED: test ban did not appear in firewall rules"; fails=$((fails+1)); fi
+    fi
+  else
+    _check "fail2ban service ACTIVE" systemctl is-active --quiet fail2ban
+  fi
+
+  if [[ $fails -eq 0 ]]; then
+    success "All verification checks passed"
+  else
+    warn "${fails} verification check(s) failed - review warnings above and ${LOG_FILE}"
+  fi
+}
+
+
 print_summary() {
   local elapsed=$(( $(date +%s) - START_TIME ))
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
   local ext_ip; ext_ip=$(get_external_ip)
+  local authelia_pass npm_pass mb_pass
+  authelia_pass=$(_read_cred "${AUTHELIA_DIR}/.default_password")
+  npm_pass=$(_read_cred "${STACK_DIR}/.npm_admin_password")
+  mb_pass=$(_read_cred "${STACK_DIR}/.metabase_password")
   local fw_cmd; [[ "$OS_FAMILY" == "debian" ]] && fw_cmd="ufw status verbose" || fw_cmd="firewall-cmd --list-all"
 
   # Read Authelia password from file (generated at deploy time)
@@ -1079,59 +1155,61 @@ print_summary() {
   local dns_crowdsec=""
   local proxy_crowdsec=""
   if [[ "$CROWDSEC_CHOICE" == "crowdsec" ]]; then
-    dns_crowdsec="  A  crowdsec.${DOMAIN}   → ${ip}  (CrowdSec Dashboard)"
+    dns_crowdsec="  A  crowdsec.${DOMAIN}   ? ${ip}  (CrowdSec Dashboard)"
     proxy_crowdsec=$(cat << 'CROWDPROXY'
 
   ${C_B}CrowdSec Dashboard:${C_R}
-  ┌──────────────────────────────────────────────┐
-  │ Domain Names:    crowdsec.${DOMAIN}           │
-  │ Scheme:          http                         │
-  │ Forward Host:    crowdsec-dashboard           │
-  │ Forward Port:    3000                         │
-  │ Block Exploits:  ON                           │
-  │ Access List:     Publicly Accessible          │
-  └──────────────────────────────────────────────┘
-  Save → SSL tab → Request cert → Force SSL ON
-  → Dashboard is read-only — no Authelia 2FA needed
+  +----------------------------------------------+
+  ? Domain Names:    crowdsec.${DOMAIN}           ?
+  ? Scheme:          http                         ?
+  ? Forward Host:    crowdsec-dashboard           ?
+  ? Forward Port:    3000                         ?
+  ? Login:           crowdsec@crowdsec.net        ?
+  ? Password:        !!Cr0wdS3c_M3t4b4s3??       ?
+  ? Block Exploits:  ON                           ?
+  ? Access List:     Publicly Accessible          ?
+  +----------------------------------------------+
+  Save ? SSL tab ? Request cert ? Force SSL ON
+  ? Dashboard is read-only ? no Authelia 2FA needed
 CROWDPROXY
 )
   else
-    dns_crowdsec="  A  crowdsec.${DOMAIN}   → ${ip}  (not used with Fail2Ban)"
+    dns_crowdsec="  A  crowdsec.${DOMAIN}   ? ${ip}  (not used with Fail2Ban)"
     proxy_crowdsec=$(cat << 'FAIL2BANPROXY'
 
   ${C_B}Fail2Ban (ARM):${C_R}
-  ┌────────────────────────────────────────────────┐
-  │ No proxy host needed — Fail2Ban runs on host   │
-  │ Manage with: fail2ban-client status nginx-proxy-manager
-  │ Ban IP: fail2ban-client set nginx-proxy-manager banip <IP>
-  │ Unban IP: fail2ban-client set nginx-proxy-manager unbanip <IP>
-  └────────────────────────────────────────────────┘
+  +------------------------------------------------+
+  ? No proxy host needed ? Fail2Ban runs on host   ?
+  ? Manage with: fail2ban-client status nginx-proxy-manager
+  ? Ban IP: fail2ban-client set nginx-proxy-manager banip <IP>
+  ? Unban IP: fail2ban-client set nginx-proxy-manager unbanip <IP>
+  +------------------------------------------------+
 FAIL2BANPROXY
 )
   fi
 
   cat << EOF
 
-${C_B}${C_GRN}╔══════════════════════════════════════════════════════════════════════╗${C_R}
-${C_B}${C_GRN}║                    🚀 YOUR VPS IS READY!                             ║${C_R}
-${C_B}${C_GRN}╠══════════════════════════════════════════════════════════════════════╣${C_R}
-${C_B}${C_GRN}║  Deployment Complete  ${C_R}${C_B}(${SCRIPT_NAME} v${SCRIPT_VERSION})  ${C_CYN}$(( elapsed / 60 ))m $(( elapsed % 60 ))s${C_R}${C_B}   ║${C_R}
-${C_B}${C_GRN}╚══════════════════════════════════════════════════════════════════════╝${C_R}
+${C_B}${C_GRN}+----------------------------------------------------------------------+${C_R}
+${C_B}${C_GRN}?                    ?? YOUR VPS IS READY!                             ?${C_R}
+${C_B}${C_GRN}?----------------------------------------------------------------------?${C_R}
+${C_B}${C_GRN}?  Deployment Complete  ${C_R}${C_B}(${SCRIPT_NAME} v${SCRIPT_VERSION})  ${C_CYN}$(( elapsed / 60 ))m $(( elapsed % 60 ))s${C_R}${C_B}   ?${C_R}
+${C_B}${C_GRN}+----------------------------------------------------------------------+${C_R}
 
-${C_B}${C_YEL}── Container Summary ────────────────────────────────────────────────${C_R}
+${C_B}${C_YEL}-- Container Summary ------------------------------------------------${C_R}
 ${C_B}CONTAINER  ${C_R}  ${C_B}HOSTNAME     ${C_R}  ${C_B}PORTS              ${C_R}  ${C_B}NPM DOMAIN             ${C_R}
-${C_DIM}──────────  ────────────  ─────────────────  ───────────────────────${C_R}
+${C_DIM}----------  ------------  -----------------  -----------------------${C_R}
 npm         npm          80, 443, 81        ${ip}:81 (admin)
 authelia    authelia     9091               authelia.${DOMAIN}
 ${crowdsec_display}
 portainer   portainer    9000               portainer.${DOMAIN}
 
-${C_B}${C_GRN}── NPM Proxy Forwarding ──────────────────────────────────────${C_R}
+${C_B}${C_GRN}-- NPM Proxy Forwarding --------------------------------------${C_R}
 ${C_B}Domain${C_R}                     ${C_B}Forward to${C_R}
-${C_DIM}──────────────────────────  ──────────────────────────${C_R}
-authelia.${DOMAIN}          → authelia:9091
-portainer.${DOMAIN}         → portainer:9000
-$(if [[ "$CROWDSEC_CHOICE" == "crowdsec" ]]; then echo "crowdsec.${DOMAIN}         → crowdsec-dashboard:3000"; fi)
+${C_DIM}--------------------------  --------------------------${C_R}
+authelia.${DOMAIN}          ? authelia:9091
+portainer.${DOMAIN}         ? portainer:9000
+$(if [[ "$CROWDSEC_CHOICE" == "crowdsec" ]]; then echo "crowdsec.${DOMAIN}         ? crowdsec-dashboard:3000"; fi)
 
 
 ${C_B}Nginx Proxy Manager${C_R}
@@ -1147,19 +1225,19 @@ ${C_B}Portainer CE (standalone)${C_R}
   URL:      https://portainer.${DOMAIN}  (via NPM proxy)
   Data:     portainer_data (Docker volume)
 
-${C_B}${C_YEL}════════════════════════════════════════════════════════════════${C_R}
-${C_B}${C_YEL}  🔐  AUTHELIA LOGIN CREDENTIALS (SAVE THESE)${C_R}
-${C_B}${C_YEL}════════════════════════════════════════════════════════════════${C_R}
+${C_B}${C_YEL}----------------------------------------------------------------${C_R}
+${C_B}${C_YEL}  ??  AUTHELIA LOGIN CREDENTIALS (SAVE THESE)${C_R}
+${C_B}${C_YEL}----------------------------------------------------------------${C_R}
 
   ${C_B}URL:${C_R}       https://authelia.${DOMAIN}
   ${C_B}Username:${C_R}  ${C_CYN}admin${C_R}
   ${C_B}Password:${C_R}  ${C_CYN}${default_pass_msg}${C_R}
 
-  ${C_RED}⚠️  Change this password immediately after first login!${C_R}
+  ${C_RED}??  Change this password immediately after first login!${C_R}
 
-${C_B}${C_YEL}════════════════════════════════════════════════════════════════${C_R}
+${C_B}${C_YEL}----------------------------------------------------------------${C_R}
 ${C_B}${C_YEL}  Authelia Configuration${C_R}
-${C_B}${C_YEL}════════════════════════════════════════════════════════════════${C_R}
+${C_B}${C_YEL}----------------------------------------------------------------${C_R}
 
   Config:    ${AUTHELIA_CONFIG_DIR}
   Users:     ${AUTHELIA_CONFIG_DIR}/users.yml
@@ -1178,49 +1256,49 @@ ${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else
 ${C_B}${C_YEL}Step 1 -- NPM Admin${C_R}
   Open:   http://${ip}:81
   Login:  admin@example.com / changeme
-  ${C_RED}→ Change password immediately${C_R}
+  ${C_RED}? Change password immediately${C_R}
 
 ${C_B}${C_YEL}Step 2 -- Add DNS Records${C_R}
-  A  authelia.${DOMAIN}   → ${ip}
-  A  portainer.${DOMAIN}  → ${ip}
+  A  authelia.${DOMAIN}   ? ${ip}
+  A  portainer.${DOMAIN}  ? ${ip}
   ${dns_crowdsec}
-  A  *.${DOMAIN}          → ${ip}  (wildcard for other services)
+  A  *.${DOMAIN}          ? ${ip}  (wildcard for other services)
 
 ${C_B}${C_YEL}Step 3 -- Add Proxy Hosts in NPM${C_R}
-  Dashboards → Proxy Hosts → Add Proxy Host
+  Dashboards ? Proxy Hosts ? Add Proxy Host
 
   ${C_B}Authelia Portal:${C_R}
-  ┌──────────────────────────────────────┐
-  │ Domain Names:    authelia.${DOMAIN}   │
-  │ Scheme:          http                │
-  │ Forward Host:    authelia            │
-  │ Forward Port:    9091                │
-  │ Block Exploits:  ON                  │
-  └──────────────────────────────────────┘
-  Save → SSL tab → Request cert → Force SSL ON
+  +--------------------------------------+
+  ? Domain Names:    authelia.${DOMAIN}   ?
+  ? Scheme:          http                ?
+  ? Forward Host:    authelia            ?
+  ? Forward Port:    9091                ?
+  ? Block Exploits:  ON                  ?
+  +--------------------------------------+
+  Save ? SSL tab ? Request cert ? Force SSL ON
 
   ${C_B}Portainer Dashboard:${C_R}
-  ┌──────────────────────────────────────┐
-  │ Domain Names:    portainer.${DOMAIN}  │
-  │ Scheme:          http                │
-  │ Forward Host:    portainer           │
-  │ Forward Port:    9000                │
-  │ Block Exploits:  ON                  │
-  └──────────────────────────────────────┘
-  Save → SSL tab → Request cert → Force SSL ON
-  → Advanced tab: paste contents of authelia-authrequest.conf snippet
+  +--------------------------------------+
+  ? Domain Names:    portainer.${DOMAIN}  ?
+  ? Scheme:          http                ?
+  ? Forward Host:    portainer           ?
+  ? Forward Port:    9000                ?
+  ? Block Exploits:  ON                  ?
+  +--------------------------------------+
+  Save ? SSL tab ? Request cert ? Force SSL ON
+  ? Advanced tab: paste contents of authelia-authrequest.conf snippet
 
   ${proxy_crowdsec}
 
 ${C_B}${C_YEL}Step 4 -- Authelia Setup${C_R}
   Open:   https://authelia.${DOMAIN}
   Login:  admin / ${default_pass_msg}
-  ${C_RED}→ Change password via "Settings" → "Password" immediately${C_R}
-  → Register TOTP device (scan QR code with authenticator app)
+  ${C_RED}? Change password via "Settings" ? "Password" immediately${C_R}
+  ? Register TOTP device (scan QR code with authenticator app)
 
 ${C_B}${C_YEL}Step 5 -- Enable 2FA on Proxy Hosts${C_R}
   In NPM, edit each protected proxy host:
-  Advanced tab → paste contents of authelia-authrequest.conf
+  Advanced tab ? paste contents of authelia-authrequest.conf
   This forces Authelia 2FA before granting access.
 
 ${C_B}${C_YEL}Step 6 -- Secure Admin Port${C_R}
@@ -1281,7 +1359,7 @@ register_portainer_stacks() {
     cp "${STACK_DIR}/docker-compose.npm.yml" "${comp_dir}/npm.yml" 2>/dev/null || true
     cp "${STACK_DIR}/docker-compose.authelia.yml" "${comp_dir}/authelia.yml" 2>/dev/null || true
     cp "${STACK_DIR}/docker-compose.crowdsec.yml" "${comp_dir}/crowdsec.yml" 2>/dev/null || true
-    info "Compose files saved to ${comp_dir} — import manually via Portainer UI -> Stacks -> Add Stack -> Upload"
+    info "Compose files saved to ${comp_dir} ? import manually via Portainer UI -> Stacks -> Add Stack -> Upload"
     return
   fi
 
@@ -1315,7 +1393,7 @@ register_portainer_stacks() {
     fi
   done
   echo "$portainer_pass" > "${STACK_DIR}/.portainer_admin_password"
-  success "Portainer stacks registered — edit them in Portainer UI -> Stacks"
+  success "Portainer stacks registered ? edit them in Portainer UI -> Stacks"
 }
 
 main() {
@@ -1338,6 +1416,7 @@ main() {
   setup_crowdsec
   setup_logrotate
   register_portainer_stacks
+  verify_deployment
   DEPLOY_STATUS="success"
   print_summary
 }
