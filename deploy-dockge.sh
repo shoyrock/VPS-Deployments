@@ -1229,6 +1229,32 @@ BOUNCER
   fi
 }
 
+register_dockge_stacks() {
+  step "Registering editable stacks in Dockge"
+  local stacks_dir="${STACK_DIR}"
+
+  for stack in npm authelia crowdsec; do
+    local compose_file="${STACK_DIR}/docker-compose.${stack}.yml"
+    [[ ! -f "$compose_file" ]] && continue
+
+    # Wrap the compose content so each service is under the same stack file
+    local stack_path="${stacks_dir}/${stack}"
+    mkdir -p "$stack_path"
+
+    # Copy the compose file (Dockge reads compose.yml from subdirectories)
+    cp "$compose_file" "${stack_path}/compose.yml" 2>/dev/null || true
+
+    if [[ -f "${stack_path}/compose.yml" ]]; then
+      success "Dockge stack created: ${stack} (${stack_path}/compose.yml)"
+    else
+      warn "Failed to create Dockge stack: ${stack}"
+    fi
+  done
+
+  info "Refresh Dockge UI to see the new stacks"
+  info "Dockge stacks directory: ${stacks_dir}/{npm,authelia,crowdsec}"
+}
+
 main() {
   printf "\n${C_B}${C_CYN}VPS Deployment — Docker + NPM + Dockge + Authelia + CrowdSec${C_R}\n"
   printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
@@ -1260,6 +1286,7 @@ main() {
     esac
   fi
   setup_logrotate
+  register_dockge_stacks
   DEPLOY_STATUS="success"
   DEPLOYED_SERVICES="npm,dockge,authelia,${CROWDSEC_CHOICE}"
   print_summary

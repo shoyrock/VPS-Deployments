@@ -1283,6 +1283,78 @@ EOF
   _log "INFO" "=== Deployment completed in $(( elapsed / 60 ))m $(( elapsed % 60 ))s ==="
 }
 
+register_portainer_stacks() {
+  step "Registering editable stacks in Portainer"
+  local portainer_pass
+  portainer_pass=$(openssl rand -base64 18 2>/dev/null | tr -d '+/=' | head -c 24)
+  local api_base="http://127.0.0.1:9000/api"
+
+  info "Initializing Portainer admin..."
+  local init_resp
+  init_resp=$(curl -s --max-time 10 -X POST "${api_base}/users/admin/init" \
+    -H "Content-Type: application/json" \
+    -d "{\"Username\":\"admin\",\"Password\":\"${portainer_pass}\"}" 2>/dev/null || echo "")
+
+  local token=""
+  if echo "$init_resp" | jq -e '.jwt' &>/dev/null; then
+    token=$(echo "$init_resp" | jq -r '.jwt')
+    echo "$portainer_pass" > "${STACK_DIR}/.portainer_admin_password"
+    success "Portainer admin initialized"
+  else
+    for try_pass in $(cat "${STACK_DIR}/.portainer_admin_password" 2>/dev/null || echo ""); do
+      local login_resp
+      login_resp=$(curl -s --max-time 10 -X POST "${api_base}/auth" \
+        -H "Content-Type: application/json" \
+        -d "{\"Username\":\"admin\",\"Password\":\"${try_pass}\"}" 2>/dev/null || echo "")
+      token=$(echo "$login_resp" | jq -r '.jwt // empty')
+      [[ -n "$token" ]] && { portainer_pass="$try_pass"; break; }
+    done
+  fi
+
+  if [[ -z "$token" ]]; then
+    warn "Could not authenticate with Portainer API"
+    local comp_dir="${STACK_DIR}/portainer-import"
+    mkdir -p "$comp_dir"
+    cp "${STACK_DIR}/docker-compose.npm.yml" "${comp_dir}/npm.yml" 2>/dev/null || true
+    cp "${STACK_DIR}/docker-compose.authelia.yml" "${comp_dir}/authelia.yml" 2>/dev/null || true
+    cp "${STACK_DIR}/docker-compose.crowdsec.yml" "${comp_dir}/crowdsec.yml" 2>/dev/null || true
+    info "Compose files saved to ${comp_dir} — import manually via Portainer UI -> Stacks -> Add Stack -> Upload"
+    return
+  fi
+
+  for stack in npm authelia crowdsec; do
+    local compose_file="${STACK_DIR}/docker-compose.${stack}.yml"
+    [[ ! -f "$compose_file" ]] && continue
+    local content; content=$(cat "$compose_file")
+    local existing
+    existing=$(curl -s --max-time 10 "${api_base}/stacks" \
+      -H "Authorization: Bearer ${token}" | jq -r ".[] | select(.Name==\"${stack}\") | .Id" 2>/dev/null || echo "")
+    if [[ -n "$existing" ]]; then
+      local esc; esc=$(echo "$content" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" 2>/dev/null || echo "\"$content\"")
+      curl -s --max-time 10 -X PUT "${api_base}/stacks/${existing}" \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" \
+        -d "{\"StackFileContent\":${esc}}" >/dev/null 2>&1
+      success "Updated Portainer stack: ${stack}"
+    else
+      local esc; esc=$(echo "$content" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" 2>/dev/null || echo "\"$content\"")
+      local resp
+      resp=$(curl -s --max-time 10 -X POST "${api_base}/stacks" \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" \
+        -d "{\"Name\":\"${stack}\",\"StackFileContent\":${esc},\"SwarmID\":\"\",\"EndpointID\":1}" 2>/dev/null)
+      local stack_id; stack_id=$(echo "$resp" | jq -r '.Id // empty')
+      if [[ -n "$stack_id" ]]; then
+        success "Created Portainer stack: ${stack} (ID: ${stack_id})"
+      else
+        warn "Failed to create Portainer stack: ${stack}"
+      fi
+    fi
+  done
+  echo "$portainer_pass" > "${STACK_DIR}/.portainer_admin_password"
+  success "Portainer stacks registered — edit them in Portainer UI -> Stacks"
+}
+
 main() {
   printf "\n${C_B}${C_CYN}VPS Deployment -- Docker + NPM + Portainer + Authelia + CrowdSec${C_R}\n"
   printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
@@ -1314,6 +1386,7 @@ main() {
     esac
   fi
   setup_logrotate
+  register_portainer_stacks
   DEPLOY_STATUS="success"
   DEPLOYED_SERVICES="npm,portainer,authelia,${CROWDSEC_CHOICE},firewall"
   print_summary

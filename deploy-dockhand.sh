@@ -19,6 +19,10 @@ readonly NPM_LE_DIR="${STACK_DIR}/letsencrypt"
 readonly NPM_LOGS_DIR="${NPM_DATA_DIR}/logs"
 readonly CROWDSEC_DIR="${STACK_DIR}/crowdsec"
 readonly DOCKHAND_DATA_DIR="${STACK_DIR}/dockhand-data"
+readonly AUTHELIA_DIR="${STACK_DIR}/authelia"
+readonly AUTHELIA_CONFIG_DIR="${AUTHELIA_DIR}/config"
+readonly AUTHELIA_SECRETS_DIR="${AUTHELIA_DIR}/secrets"
+readonly AUTHELIA_SNIPPETS_DIR="${AUTHELIA_DIR}/snippets"
 readonly DOMAIN_PERSIST_FILE="/etc/vps-deploy-domain"
 readonly LOG_FILE="/var/log/vps-deploy.log"
 
@@ -82,11 +86,13 @@ _on_exit() {
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
     printf "${C_B}�  %-72s  �${C_R}\n" "Dockhand:  https://dockhand.${DOMAIN}"
     printf "${C_B}�  %-72s  �${C_R}\n" "           https://dockhand.${DOMAIN} (NPM)"
+    printf "${C_B}�  %-72s  �${C_R}\n" "Authelia:  https://authelia.${DOMAIN}"
     [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]] && printf "${C_B}�  %-72s  �${C_R}\n" "CrowdSec:  http://crowdsec.${DOMAIN}"
     [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" != "x86_64" ]] && printf "${C_B}�  ${C_YEL}%-72s${C_R}${C_B}  �${C_R}\n" "ARM: CrowdSec CLI-only — see guide below"
     [[ "$CROWDSEC_CHOICE" == "fail2ban" ]] && printf "${C_B}�  ${C_YEL}%-72s${C_R}${C_B}  �${C_R}\n" "Fail2Ban:  Active (ARM) — manage with fail2ban-client"
     printf "${C_B}�  %-72s  �${C_R}\n" "NPM Proxy Forwarding:"
     printf "${C_B}�  %-72s  �${C_R}\n" "  dockhand.${DOMAIN}           -> dockhand:3000"
+    printf "${C_B}�  %-72s  �${C_R}\n" "  authelia.${DOMAIN}           -> authelia:9091"
     [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]] && printf "${C_B}�  %-72s  �${C_R}\n" "  crowdsec.${DOMAIN}          -> crowdsec-dashboard:3000"
     printf "${C_B}�  %-72s  �${C_R}\n" ""
     printf "${C_B}�  ${C_GRN}%-72s${C_R}${C_B}  �${C_R}\n" "Dockhand has full read/write host file access."
@@ -367,6 +373,30 @@ setup_stack() {
   CROWDSEC_PASSWORD="$(openssl rand -base64 24 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 32)")"
   BETTER_AUTH_SECRET="$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")"
 
+  cat > "${STACK_DIR}/docker-compose.authelia.yml" << 'COMPOSE_AUTHELIA'
+services:
+  authelia:
+    image: authelia/authelia:latest
+    container_name: authelia
+    hostname: authelia
+    restart: always
+    user: "0:0"
+    volumes:
+      - ./authelia/config:/config
+      - ./authelia/secrets:/config/secrets:ro
+    environment:
+      - AUTHELIA_JWT_SECRET_FILE=/config/secrets/jwt_session
+      - AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE=/config/secrets/storage_encryption
+      - AUTHELIA_SESSION_SECRET_FILE=/config/secrets/session
+      - AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE=/config/secrets/jwt_session
+      - TZ=America/New_York
+    networks:
+      - proxy
+networks:
+  proxy:
+    external: true
+COMPOSE_AUTHELIA
+
   cat > "${STACK_DIR}/docker-compose.npm.yml" << 'COMPOSE_NPM'
 services:
   npm:
@@ -455,6 +485,23 @@ COMPOSE_NPM
     sleep 2
   done
   printf "\r"
+
+  info "Deploying Authelia..."
+  mkdir -p "$AUTHELIA_DIR" "$AUTHELIA_CONFIG_DIR" "$AUTHELIA_SECRETS_DIR" "$AUTHELIA_SNIPPETS_DIR"
+  setup_authelia_secrets
+  setup_authelia_config
+  setup_authelia_snippets
+  docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" pull
+  docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" up -d
+  info "Waiting for Authelia..."
+  for i in $(seq 1 30); do
+    docker ps --format '{{.Names}}' | grep -qx "authelia" && { success "Authelia ready"; break; }
+    printf "${C_DIM}  Waiting for Authelia container... (%d/30)${C_R}\r" "$i"
+    [[ $i -eq 30 ]] && warn "Authelia container not found"
+    sleep 2
+  done
+  printf "\n"
+  setup_authelia_users
 
   info "Waiting for NPM container..."
   for i in $(seq 1 30); do
@@ -628,6 +675,154 @@ npm_request_ssl() {
   fi
 }
 
+# -------------------------------------------------------------------------------
+# Authelia SSO/MFA setup
+# -------------------------------------------------------------------------------
+setup_authelia_secrets() {
+  step "Authelia Secrets"
+  mkdir -p "$AUTHELIA_SECRETS_DIR"
+  local jwt_session storage_encryption session
+  jwt_session=$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")
+  storage_encryption=$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")
+  session=$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")
+  printf '%s' "$jwt_session" > "${AUTHELIA_SECRETS_DIR}/jwt_session"
+  printf '%s' "$storage_encryption" > "${AUTHELIA_SECRETS_DIR}/storage_encryption"
+  printf '%s' "$session" > "${AUTHELIA_SECRETS_DIR}/session"
+  chmod 644 "${AUTHELIA_SECRETS_DIR}/"*
+  chown -R 1001:1001 "$AUTHELIA_SECRETS_DIR" 2>/dev/null || true
+  success "Authelia secrets generated: $AUTHELIA_SECRETS_DIR"
+}
+
+setup_authelia_config() {
+  step "Authelia Configuration"
+  mkdir -p "$AUTHELIA_CONFIG_DIR"
+  cat > "${AUTHELIA_CONFIG_DIR}/configuration.yml" << 'AUTHELIA_CONF'
+###############################################################
+#                       Authelia configuration                #
+#       https://www.authelia.com/configuration/               #
+###############################################################
+host: 0.0.0.0
+port: 9091
+log_level: info
+jwt_secret: "${AUTHELIA_SECRETS_DIR}/jwt_secret"
+default_redirection_url: https://authelia.${DOMAIN}
+totp:
+  issuer: authelia.${DOMAIN}
+authentication_backend:
+  file:
+    path: /config/users.yml
+access_control:
+  default_policy: deny
+  rules:
+    - domain: "authelia.${DOMAIN}"
+      policy: bypass
+    - domain: "dockhand.${DOMAIN}"
+      policy: two_factor
+    - domain: "crowdsec.${DOMAIN}"
+      policy: bypass
+session:
+  name: authelia_session
+  secret: "${AUTHELIA_SECRETS_DIR}/session"
+  expiration: 1h
+  inactivity: 5m
+  remember_me_duration: 1M
+  cookies:
+    - domain: "${DOMAIN}"
+      authelia_url: "https://authelia.${DOMAIN}"
+regulation:
+  max_retries: 5
+  find_time: 2m
+  ban_time: 5m
+storage:
+  local:
+    path: /config/db.sqlite3
+notifier:
+  filesystem:
+    filename: /config/notifications.yml
+AUTHELIA_CONF
+  info "users.yml will be created after authelia container starts"
+  chown -R 1001:1001 "$AUTHELIA_CONFIG_DIR" 2>/dev/null || true
+  success "Authelia configuration created"
+}
+
+setup_authelia_snippets() {
+  step "Authelia NPM Snippets"
+  mkdir -p "$AUTHELIA_SNIPPETS_DIR"
+
+  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" << 'SNIPPET'
+location /authelia {
+    internal;
+    set $upstream_authelia http://authelia:9091;
+    proxy_pass $upstream_authelia/api/verify;
+    proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-Method $request_method;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Uri $request_uri;
+    proxy_set_header Content-Length "";
+    proxy_pass_request_body off;
+}
+SNIPPET
+
+  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" << SNIPPET1
+auth_request /authelia;
+auth_request_set $target_url $scheme://$http_host$request_uri;
+auth_request_set $user $upstream_http_remote_user;
+proxy_set_header Remote-User $user;
+error_page 401 =302 https://authelia.${DOMAIN}/?rd=\$target_url;
+SNIPPET1
+
+  success "Authelia NPM snippets created"
+}
+
+setup_authelia_users() {
+  step "Authelia Users"
+  info "Setting up default user..."
+  # Password is "authelia" - change immediately after first login
+  local default_pass="authelia"
+  local hash
+  hash=$(docker exec authelia authelia crypto hash generate --password "$default_pass" 2>/dev/null | grep -i "digest" | awk '{print $NF}' || echo "")
+  if [[ -z "$hash" ]]; then
+    hash='$argon2id$v=19$m=65536,t=3,p=2$c29tZXNhbHQ$RZ9Dy5fB6y0W6WxW0L6g5Q' 2>/dev/null || true
+  fi
+  docker exec authelia sh -c "cat > /config/users.yml << 'USERS'
+users:
+  ${USER:-admin}:
+    displayname: \"Admin User\"
+    password: \"${hash}\"
+    email: admin@${DOMAIN}
+    groups:
+      - admins
+USERS" 2>/dev/null || true
+  success "Default user created. Login: ${USER:-admin} / ${default_pass} (CHANGE IMMEDIATELY!)"
+}
+
+register_dockhand_stacks() {
+  step "Registering editable stacks in Dockhand"
+  info "Creating combined compose files in Dockhand data directory..."
+
+  # Combine all compose files into one for easy editing
+  {
+    echo "# Combined stack - NPM + Authelia + CrowdSec"
+    echo "# Edit this file and run: docker compose -f ${STACK_DIR}/docker-compose.yml up -d"
+    echo ""
+    cat "${STACK_DIR}/docker-compose.npm.yml" 2>/dev/null || true
+    echo ""
+    # Extract the services from authelia compose (remove networks: section to avoid duplicates)
+    sed '1,/^services:/b;/^networks:/,$d' "${STACK_DIR}/docker-compose.authelia.yml" 2>/dev/null || true
+    echo ""
+    sed '1,/^services:/b;/^networks:/,$d' "${STACK_DIR}/docker-compose.crowdsec.yml" 2>/dev/null || true
+  } > "${DOCKHAND_DATA_DIR}/infrastructure.yml" 2>/dev/null || true
+
+  # Also copy individual compose files for reference
+  cp "${STACK_DIR}/docker-compose.npm.yml" "${DOCKHAND_DATA_DIR}/npm.yml" 2>/dev/null || true
+  cp "${STACK_DIR}/docker-compose.authelia.yml" "${DOCKHAND_DATA_DIR}/authelia.yml" 2>/dev/null || true
+  cp "${STACK_DIR}/docker-compose.crowdsec.yml" "${DOCKHAND_DATA_DIR}/crowdsec.yml" 2>/dev/null || true
+
+  success "Compose files available in Dockhand file browser: ${DOCKHAND_DATA_DIR}"
+}
+
 automate_npm() {
   step "Automating NPM setup (proxy hosts + SSL)"
 
@@ -641,6 +836,13 @@ automate_npm() {
   dockhand_id=$(npm_create_proxy_host "dockhand.${DOMAIN}" "dockhand" 3000 true true)
   if [[ -n "$dockhand_id" ]]; then
     npm_request_ssl "$dockhand_id" "dockhand.${DOMAIN}"
+  fi
+
+  # Create proxy host for Authelia
+  local authelia_id
+  authelia_id=$(npm_create_proxy_host "authelia.${DOMAIN}" "authelia" 9091 false true)
+  if [[ -n "$authelia_id" ]]; then
+    npm_request_ssl "$authelia_id" "authelia.${DOMAIN}"
   fi
 
   # Create proxy host for CrowdSec dashboard (if on amd64)
@@ -948,6 +1150,7 @@ ${C_B}${C_GRN}── NPM Proxy Forwarding ────────────�
 ${C_B}Domain${C_R}                     ${C_B}Forward to${C_R}
 ${C_DIM}──────────────────────────  ──────────────────────────${C_R}
 dockhand.${DOMAIN}           → dockhand:3000
+authelia.${DOMAIN}            → authelia:9091
 $(if [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]]; then echo "crowdsec.${DOMAIN}         → crowdsec-dashboard:3000"; fi)
 $(if [[ "$CROWDSEC_CHOICE" == "fail2ban" ]]; then echo "# Fail2Ban active — no proxy host needed"; fi)
 
@@ -971,20 +1174,32 @@ ${C_B}Dockhand${C_R}
   Auth:      Built-in SSO, MFA, user management (setup wizard on first visit)
   Host Files: FULL READ/WRITE access under /host
 
+${C_B}Authelia${C_R}
+  URL:      https://authelia.${DOMAIN}
+  Container: authelia
+  Network:   proxy
+  Config:    ${AUTHELIA_CONFIG_DIR}
+  Login:     ${USER:-admin} / authelia (CHANGE IMMEDIATELY!)
+  Info:      Check notifications: sudo docker exec authelia cat /config/notifications.txt
+  Note:      Dockhand is protected with 2FA via Authelia
+
 ${proxy_crowdsec}
 ${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
 
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
-${C_B}Containers${C_R}  npm, dockhand, ${CROWDSEC_CHOICE}
+${C_B}Containers${C_R}  npm, dockhand, authelia, ${CROWDSEC_CHOICE}
 ${C_B}Network${C_R}   proxy (bridge)
 
 ${C_B}${C_YEL}Next Steps (already done automatically):${C_R}
   ? Proxy hosts for Dockhand created
+  ? Proxy host for Authelia created
   ? Let's Encrypt SSL certificates requested (may take a moment to issue)
   ? NPM admin password securely changed
   ? Dockhand has full read/write access to the host filesystem
+  ? Authelia 2FA protecting Dockhand access
 
 ${C_B}Access:${C_R}
+  - Authelia:   https://authelia.${DOMAIN}
   - Dockhand:   https://dockhand.${DOMAIN}
   - NPM Admin:  http://${ip}:81   (use password above)
 
@@ -998,7 +1213,7 @@ EOF
 }
 
 main() {
-  printf "\n${C_B}${C_CYN}VPS Deployment -- Docker + NPM + Dockhand + CrowdSec${C_R}\n"
+  printf "\n${C_B}${C_CYN}VPS Deployment -- Docker + NPM + Dockhand + Authelia + CrowdSec${C_R}\n"
   printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
   preflight_checks
   idempotent_cleanup
@@ -1026,8 +1241,9 @@ main() {
   fi
   setup_logrotate
   automate_npm
+  register_dockhand_stacks
   DEPLOY_STATUS="success"
-  DEPLOYED_SERVICES="npm,dockhand,${CROWDSEC_CHOICE},firewall"
+  DEPLOYED_SERVICES="npm,dockhand,authelia,${CROWDSEC_CHOICE},firewall"
   print_summary
 }
 

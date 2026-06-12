@@ -1187,6 +1187,30 @@ BOUNCER
   fi
 }
 
+register_cosmos_stacks() {
+  step "Registering editable stacks in Cosmos"
+  local stacks_dir="${COSMOS_DATA_DIR}/imports"
+  mkdir -p "$stacks_dir"
+
+  for stack in npm authelia crowdsec; do
+    local compose_file="${STACK_DIR}/docker-compose.${stack}.yml"
+    [[ ! -f "$compose_file" ]] && continue
+
+    local target="${stacks_dir}/${stack}.yml"
+    cp "$compose_file" "$target" 2>/dev/null || true
+
+    if [[ -f "$target" ]]; then
+      success "Cosmos stack saved: ${stack}"
+    else
+      warn "Failed to save Cosmos stack: ${stack}"
+    fi
+  done
+
+  info "Compose files saved to ${stacks_dir}/"
+  info "Import them via Cosmos UI -> Stacks -> Import"
+  info "Cosmos API import: cosmos-cli stack create --file <path> (if available)"
+}
+
 main() {
   printf "\n${C_B}${C_CYN}VPS Deployment -- Docker + NPM + Cosmos + Authelia + CrowdSec${C_R}\n"
   printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
@@ -1218,6 +1242,7 @@ main() {
     esac
   fi
   setup_logrotate
+  register_cosmos_stacks
   DEPLOY_STATUS="success"
   DEPLOYED_SERVICES="npm,cosmos-server,authelia,${CROWDSEC_CHOICE}"
   print_summary
