@@ -8,7 +8,7 @@ fi
 #
 # YunoHost ONLY supports Debian 12 (Bookworm) or newer.
 # CrowdSec provides intrusion prevention for YunoHost.
-set -eo pipefail
+set -euo pipefail
 IFS=$'\n\t'
 
 readonly SCRIPT_VERSION="3.0.0-crowdsec"
@@ -428,8 +428,7 @@ setup_authelia_config() {
   cat > "${AUTHELIA_CONFIG_DIR}/configuration.yml" << AUTHELIA_CONFIG
 theme: dark
 server:
-  host: 0.0.0.0
-  port: 9091
+  address: 'tcp://:9091/'
 log:
   level: info
 totp:

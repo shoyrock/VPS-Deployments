@@ -446,8 +446,7 @@ setup_authelia_config() {
 ###############################################################
 theme: dark
 server:
-  host: 0.0.0.0
-  port: 9091
+  address: 'tcp://:9091/'
 log:
   level: info
 totp:

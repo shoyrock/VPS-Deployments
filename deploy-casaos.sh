@@ -463,9 +463,10 @@ setup_authelia_config() {
 #                       Authelia configuration                #
 #       https://www.authelia.com/configuration/               #
 ###############################################################
-host: 0.0.0.0
-port: 9091
-log_level: info
+server:
+  address: 'tcp://:9091/'
+log:
+  level: info
 totp:
   issuer: authelia.${DOMAIN}
 authentication_backend:
@@ -486,7 +487,7 @@ session:
   cookies:
     - domain: "${DOMAIN}"
       authelia_url: 'https://authelia.${DOMAIN}'
-      default_redirection_url: 'https://authelia.${DOMAIN}'
+      default_redirection_url: 'https://casaos.${DOMAIN}'
 regulation:
   max_retries: 5
   find_time: 2m

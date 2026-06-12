@@ -711,8 +711,7 @@ setup_authelia_config() {
 #       https://www.authelia.com/configuration/               #
 ###############################################################
 server:
-  host: 0.0.0.0
-  port: 9091
+  address: 'tcp://:9091/'
 log:
   level: info
 totp:
@@ -737,7 +736,7 @@ session:
   cookies:
     - domain: "${DOMAIN}"
       authelia_url: "https://authelia.${DOMAIN}"
-      default_redirection_url: "https://authelia.${DOMAIN}"
+      default_redirection_url: "https://dockhand.${DOMAIN}"
 regulation:
   max_retries: 5
   find_time: 2m

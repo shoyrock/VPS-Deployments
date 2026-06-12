@@ -443,9 +443,10 @@ setup_authelia_config() {
 ###############################################################
 #                      Authelia configuration                #
 ###############################################################
-host: 0.0.0.0
-port: 9091
-log_level: info
+server:
+  address: 'tcp://:9091/'
+log:
+  level: info
 totp:
   issuer: authelia.com
   period: 30
