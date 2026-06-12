@@ -3,7 +3,7 @@
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     exec sudo bash "$0" "$@"
 fi
-# deploy-freedombox.sh � Hardened VPS Deployment for FreedomBox + NPM + CrowdSec
+# deploy-freedombox.sh ? Hardened VPS Deployment for FreedomBox + NPM + CrowdSec
 # v3.0.0-crowdsec | Usage: chmod +x deploy-freedombox.sh && sudo ./deploy-freedombox.sh
 #
 # FreedomBox (Debian Pure Blend) manages its own Apache2 and firewalld.
@@ -12,7 +12,7 @@ fi
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.4.0-hardened"
+readonly SCRIPT_VERSION="4.5.0-hardened"
 readonly SCRIPT_NAME="deploy-freedombox.sh"
 readonly START_TIME=$(date +%s)
 readonly NPM_DIR="/opt/npm"
@@ -35,21 +35,37 @@ else
 fi
 
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
-_log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}
-_read_cred() { [[ -f "$1" ]] && tr -d '\\n' < "$1" 2>/dev/null || echo <unknown>; }" >> "$LOG_FILE" 2>/dev/null || true; }
-info()    { printf "${C_BLU}?${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
-warn()    { printf "${C_YEL}?${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
-error()   { printf "${C_RED}?${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }
-success() { printf "${C_GRN}?${C_R}  %s\n" "$*"; _log "SUCCESS" "$@"; }
+_log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}" >> "$LOG_FILE" 2>/dev/null || true; }
+_read_cred() { [[ -f "$1" ]] && tr -d '\n' < "$1" 2>/dev/null || echo "<unknown>"; }
+info()    { printf "${C_BLU}?${C_R}  %s\n" "$*" >&2; _log "INFO" "$@"; }
+warn()    { printf "${C_YEL}?${C_R}  %s\n" "$*" >&2; _log "WARN" "$@"; }
+error()   { printf "${C_RED}?${C_R}  %s\n" "$*" >&2; _log "ERROR" "$@"; }
+success() { printf "${C_GRN}?${C_R}  %s\n" "$*" >&2; _log "SUCCESS" "$@"; }
 fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; DEPLOY_STATUS="failed"; exit 1; }
-step()    { printf "\n${C_B}${C_CYN}-- %s --${C_R}\n" "$*"; _log "STEP" "$@"; }
+step()    { printf "\n${C_B}${C_CYN}-- %s --${C_R}\n" "$*" >&2; _log "STEP" "$@"; }
+
+rand_secret() {
+  openssl rand -base64 32 2>/dev/null || head -c 32 /dev/urandom | base64
+}
+rand_password() {
+  local len="${1:-24}"
+  (openssl rand -base64 48 2>/dev/null || head -c 48 /dev/urandom | base64) \
+    | tr -d '+/=\n' | head -c "$len"
+}
+
+detect_ssh_port() {
+  local p=""
+  p=$(ss -tlnpH 2>/dev/null | awk '/sshd/ { n=split($4,a,":"); print a[n]; exit }')
+  if [[ -z "$p" ]]; then
+    p=$(awk '/^[Pp]ort[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)
+  fi
+  echo "${p:-22}"
+}
 
 readonly TOOL_LABEL="FreedomBox"
 
 DEPLOY_STATUS="in_progress"
 DOMAIN=""
-CROWDSEC_CHOICE="crowdsec"
-
 get_external_ip() {
   curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
   curl -s -4 --max-time 10 https://ifconfig.me 2>/dev/null || \
@@ -63,35 +79,34 @@ _on_exit() {
   local ip ext_ip
   ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<internal_ip>")
   ext_ip=$(get_external_ip)
-  local authelia_pass npm_pass mb_pass
+  local authelia_pass npm_pass
   authelia_pass=$(_read_cred "${AUTHELIA_DIR}/.default_password")
   npm_pass=$(_read_cred "${STACK_DIR}/.npm_admin_password")
-  mb_pass=$(_read_cred "${STACK_DIR}/.metabase_password")
   if [[ -n "${DEPLOYED_SERVICES:-}" ]] || [[ "$DEPLOY_STATUS" != "in_progress" ]]; then
     printf "\n"
     if [[ "$DEPLOY_STATUS" == "success" ]]; then
       printf "${C_B}${C_GRN}+------------------------------------------------------------------------------+${C_R}\n"
-      printf "${C_B}${C_GRN}�                    ?  DEPLOYMENT COMPLETED SUCCESSFULLY                      �${C_R}\n"
-      printf "${C_B}${C_GRN}�------------------------------------------------------------------------------�${C_R}\n"
+      printf "${C_B}${C_GRN}?                    ?  DEPLOYMENT COMPLETED SUCCESSFULLY                      ?${C_R}\n"
+      printf "${C_B}${C_GRN}?------------------------------------------------------------------------------?${C_R}\n"
     else
       printf "${C_B}${C_RED}+------------------------------------------------------------------------------+${C_R}\n"
-      printf "${C_B}${C_RED}�                     ?  DEPLOYMENT DID NOT COMPLETE                           �${C_R}\n"
-      printf "${C_B}${C_RED}�------------------------------------------------------------------------------�${C_R}\n"
+      printf "${C_B}${C_RED}?                     ?  DEPLOYMENT DID NOT COMPLETE                           ?${C_R}\n"
+      printf "${C_B}${C_RED}?------------------------------------------------------------------------------?${C_R}\n"
     fi
-    printf "${C_B}�  Elapsed:   ${C_CYN}%dm %ds${C_R}${C_B}                                                          �${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
-    printf "${C_B}�  Internal:  ${C_CYN}%-16s${C_R}${C_B}                                                   �${C_R}\n" "$ip"
-    printf "${C_B}�  External:  ${C_CYN}%-16s${C_R}${C_B}                                                   �${C_R}\n" "$ext_ip"
-    printf "${C_B}�  Status:    %-16s${C_B}                                                   �${C_R}\n" "$(if [[ "$DEPLOY_STATUS" == "success" ]]; then printf "${C_GRN}All systems go"; else printf "${C_RED}Check logs"; fi)"
-    printf "${C_B}�------------------------------------------------------------------------------�${C_R}\n"
-    printf "${C_B}�  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}�${C_R}\n" "${ip}:81"
-    printf "${C_B}�  ${C_YEL}NPM Login${C_R}${C_B}:  admin@example.com / changeme                                   �${C_R}\n"
-    printf "${C_B}�  ${C_YEL}%-9s${C_R}${C_B}:  ${C_CYN}%-63s${C_R}${C_B}�${C_R}\n" "${TOOL_LABEL}" "${ip}:80/443 (own proxy, NPM on 81)"
-    printf "${C_B}�  ${C_YEL}Authelia ${C_R}${C_B}:  ${C_CYN}%-63s${C_R}${C_B}�${C_R}\n" "${ip}:9091"
-    printf "${C_B}�  ${C_YEL}Authelia  ${C_R}${C_B}:  admin / authelia (CHANGE IMMEDIATELY!)                        �${C_R}\n"
-    printf "${C_B}�  ${C_YEL}Verify    ${C_R}${C_B}:  sudo docker exec authelia cat /config/notifications.txt       �${C_R}\n"
-    printf "${C_B}�  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}22 (SSH), 80 (HTTP), 443 (HTTPS), 81 (NPM)    ${C_R}${C_B}�${C_R}\n"
-    printf "${C_B}�------------------------------------------------------------------------------�${C_R}\n"
-    printf "${C_B}�  Log file: ${C_CYN}%-66s${C_R}${C_B}�${C_R}\n" "$LOG_FILE"
+    printf "${C_B}?  Elapsed:   ${C_CYN}%dm %ds${C_R}${C_B}                                                          ?${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
+    printf "${C_B}?  Internal:  ${C_CYN}%-16s${C_R}${C_B}                                                   ?${C_R}\n" "$ip"
+    printf "${C_B}?  External:  ${C_CYN}%-16s${C_R}${C_B}                                                   ?${C_R}\n" "$ext_ip"
+    printf "${C_B}?  Status:    %-16s${C_B}                                                   ?${C_R}\n" "$(if [[ "$DEPLOY_STATUS" == "success" ]]; then printf "${C_GRN}All systems go"; else printf "${C_RED}Check logs"; fi)"
+    printf "${C_B}?------------------------------------------------------------------------------?${C_R}\n"
+    printf "${C_B}?  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}?${C_R}\n" "${ip}:81"
+    printf "${C_B}?  ${C_YEL}NPM Login${C_R}${C_B}:  admin@example.com / ${npm_pass}                                   ?${C_R}\n"
+    printf "${C_B}?  ${C_YEL}%-9s${C_R}${C_B}:  ${C_CYN}%-63s${C_R}${C_B}?${C_R}\n" "${TOOL_LABEL}" "${ip}:80/443 (own proxy, NPM on 81)"
+    printf "${C_B}?  ${C_YEL}Authelia ${C_R}${C_B}:  ${C_CYN}%-63s${C_R}${C_B}?${C_R}\n" "${ip}:9091"
+    printf "${C_B}?  ${C_YEL}Authelia  ${C_R}${C_B}:  admin / authelia (CHANGE IMMEDIATELY!)                        ?${C_R}\n"
+    printf "${C_B}?  ${C_YEL}Verify    ${C_R}${C_B}:  sudo docker exec authelia cat /config/notifications.txt       ?${C_R}\n"
+    printf "${C_B}?  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}22 (SSH), 80 (HTTP), 443 (HTTPS), 81 (NPM)    ${C_R}${C_B}?${C_R}\n"
+    printf "${C_B}?------------------------------------------------------------------------------?${C_R}\n"
+    printf "${C_B}?  Log file: ${C_CYN}%-66s${C_R}${C_B}?${C_R}\n" "$LOG_FILE"
     printf "${C_B}+------------------------------------------------------------------------------+${C_R}\n"
     printf "\n"
     if [[ "$DEPLOY_STATUS" == "success" ]]; then
@@ -154,6 +169,15 @@ preflight_checks() {
 ## IDEMPOTENT CLEANUP
 idempotent_cleanup() {
   step "Cleanup"
+  if [[ "${FORCE_CLEANUP:-0}" != "1" ]]; then
+    warn "WARNING: This will STOP and DELETE ALL Docker containers, volumes, and platform data."
+    printf "Continue? [y/N] "
+    read -r _confirm
+    if [[ ! "$_confirm" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+      info "Cleanup skipped. Set FORCE_CLEANUP=1 to bypass this prompt."
+      return 0
+    fi
+  fi
 
   if command -v docker &>/dev/null; then
     info "Removing ALL existing containers and volumes..."
@@ -198,8 +222,6 @@ idempotent_cleanup() {
     snap remove docker 2>/dev/null || true
   fi
 }
-
-
 
 ## SYSTEM UPDATE & DEPENDENCIES
 system_update() {
@@ -274,7 +296,7 @@ install_docker() {
 ## DOCKER NETWORK
 setup_docker_network() {
   step "Docker Network: proxy"
-  # NEVER remove existing proxy network � other containers may depend on it
+  # NEVER remove existing proxy network ? other containers may depend on it
   if ! docker network ls --format '{{.Name}}' | grep -qx "proxy"; then
     docker network create proxy 2>/dev/null || true
   fi
@@ -282,7 +304,7 @@ setup_docker_network() {
   success "Network 'proxy' ready"
 }
 
-## NGINX PROXY MANAGER (port 81 � FreedomBox Apache owns 80/443)
+## NGINX PROXY MANAGER (port 81 ? FreedomBox Apache owns 80/443)
 setup_nginx_proxy_manager() {
   step "Nginx Proxy Manager (supplementary proxy on port 81)"
   mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR"
@@ -317,10 +339,9 @@ services:
       - ./authelia/config:/config
       - ./authelia/secrets:/config/secrets:ro
     environment:
-      - AUTHELIA_JWT_SECRET_FILE=/config/secrets/jwt_session
+      - AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE=/config/secrets/jwt_reset
       - AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE=/config/secrets/storage_encryption
       - AUTHELIA_SESSION_SECRET_FILE=/config/secrets/session
-      - AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE=/config/secrets/jwt_session
       - TZ=America/New_York
     networks:
       - proxy
@@ -376,7 +397,6 @@ COMPOSE_CROWDSEC
     }
     sleep 2
   done
-
 
   info "Waiting for NPM container (please wait)..."
   for i in $(seq 1 30); do
@@ -437,7 +457,7 @@ COMPOSE_CROWDSEC
 setup_authelia_secrets() {
   info "Generating Authelia secrets..."
   mkdir -p "$AUTHELIA_SECRETS_DIR"
-  [[ -f "${AUTHELIA_SECRETS_DIR}/jwt_session" ]] || openssl rand -hex 32 > "${AUTHELIA_SECRETS_DIR}/jwt_session"
+  [[ -f "${AUTHELIA_SECRETS_DIR}/jwt_reset" ]] || openssl rand -hex 32 > "${AUTHELIA_SECRETS_DIR}/jwt_reset"
   [[ -f "${AUTHELIA_SECRETS_DIR}/storage_encryption" ]] || openssl rand -hex 32 > "${AUTHELIA_SECRETS_DIR}/storage_encryption"
   [[ -f "${AUTHELIA_SECRETS_DIR}/session" ]] || openssl rand -hex 32 > "${AUTHELIA_SECRETS_DIR}/session"
   chmod 600 "${AUTHELIA_SECRETS_DIR}"/*
@@ -500,17 +520,21 @@ location /internal/authelia/authz {
     proxy_set_header Content-Length "";
     proxy_pass_request_body off;
 }
-SNIPPET1
-  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" << 'SNIPPET2'
-location /authelia {
-    proxy_pass http://authelia:9091;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-Host $http_host;
-}
 SNIPPET2
+  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" << SNIPPET1
+auth_request /internal/authelia/authz;
+auth_request_set \$user \$upstream_http_remote_user;
+auth_request_set \$groups \$upstream_http_remote_groups;
+auth_request_set \$name \$upstream_http_remote_name;
+auth_request_set \$email \$upstream_http_remote_email;
+proxy_set_header Remote-User \$user;
+proxy_set_header Remote-Groups \$groups;
+proxy_set_header Remote-Name \$name;
+proxy_set_header Remote-Email \$email;
+auth_request_set \$redirection_url \$upstream_http_location;
+error_page 401 =302 \$redirection_url;
+SNIPPET1
+  # Also write to NPM's custom config directory so they're accessible inside the container
   local npm_custom_dir="${NPM_DATA_DIR}/nginx/custom"
   mkdir -p "$npm_custom_dir"
   cp "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" "$npm_custom_dir/"
@@ -699,19 +723,6 @@ verify_installation() {
   fi
 }
 
-## FAIL2BAN FALLBACK
-setup_fail2ban() {
-  step "Fail2Ban Installation"
-  info "Installing Fail2Ban..."
-  if [[ "$OS_FAMILY" == "debian" ]]; then
-    sudo apt-get update -qq 2>/dev/null
-    sudo apt-get install -y -qq fail2ban 2>/dev/null
-  else
-    sudo dnf install -y -q fail2ban 2>/dev/null || sudo yum install -y -q fail2ban 2>/dev/null
-  fi
-  _log "INFO" "fail2ban: installed"
-}
-
 ## SUMMARY
 
 verify_deployment() {
@@ -725,8 +736,7 @@ verify_deployment() {
   }
 
   # Containers
-  local want="npm authelia"
-  [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && want="$want crowdsec crowdsec-dashboard"
+  local want="npm authelia crowdsec crowdsec-dashboard"
   local c
   for c in $want; do
     _check "container '$c' running" bash -c "docker ps --format '{{.Names}}' | grep -qx '$c'"
@@ -742,7 +752,6 @@ verify_deployment() {
   _check "Authelia snippets present in NPM custom dir" bash -c \
     "test -f '${NPM_DATA_DIR}/nginx/custom/authelia-location.conf' && test -f '${NPM_DATA_DIR}/nginx/custom/authelia-authrequest.conf'"
 
-  if [[ "$CROWDSEC_CHOICE" == "crowdsec" ]]; then
     _check "CrowdSec LAPI responding"   docker exec crowdsec cscli metrics
     _check "acquisition label is nginx-proxy-manager" bash -c \
       "docker exec crowdsec cat /etc/crowdsec/acquis.d/npm.yaml 2>/dev/null | grep -q 'type: nginx-proxy-manager'"
@@ -763,9 +772,6 @@ verify_deployment() {
       if $banned; then success "VERIFY: end-to-end ban enforcement works"
       else warn "VERIFY FAILED: test ban did not appear in firewall rules"; fails=$((fails+1)); fi
     fi
-  else
-    _check "fail2ban service ACTIVE" systemctl is-active --quiet fail2ban
-  fi
 
   if [[ $fails -eq 0 ]]; then
     success "All verification checks passed"
@@ -774,16 +780,14 @@ verify_deployment() {
   fi
 }
 
-
 print_summary() {
   local elapsed=$(( $(date +%s) - START_TIME ))
   local ip ext_ip
   ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
   ext_ip=$(get_external_ip)
-  local authelia_pass npm_pass mb_pass
+  local npm_password authelia_pass
+  npm_password=$(_read_cred "${STACK_DIR}/.npm_admin_password")
   authelia_pass=$(_read_cred "${AUTHELIA_DIR}/.default_password")
-  npm_pass=$(_read_cred "${STACK_DIR}/.npm_admin_password")
-  mb_pass=$(_read_cred "${STACK_DIR}/.metabase_password")
   local setup_secret; setup_secret=$(cat /var/lib/plinth/firstboot-wizard-secret 2>/dev/null || echo "<run: sudo cat /var/lib/plinth/firstboot-wizard-secret>")
 
   cat << EOF
@@ -806,7 +810,7 @@ ${C_B}${C_CYN}-- SERVICES --${C_R}
   CrowdSec   (intrusion prevention)
 
 ${C_B}${C_CYN}-- NGINX PROXY MANAGER --${C_R}
-  Admin:    http://${ip}:81  (admin@example.com / changeme)
+  Admin:    http://${ip}:81  (admin@example.com / ${npm_password})
   ${C_RED}? Change password immediately.${C_R}
   Purpose:  Supplementary proxy for Docker-based services
   Data:     ${NPM_DATA_DIR}
@@ -836,7 +840,7 @@ ${C_B}${C_YEL}-- FIRST-BOOT SETUP --${C_R}
      (Current:     ${setup_secret})
   2. Visit:        https://${ip}/freedombox/
   3. Enter secret, create admin account.
-  4. NPM admin:    http://${ip}:81  (admin@example.com / changeme)
+  4. NPM admin:    http://${ip}:81  (admin@example.com / ${npm_password})
   5. Explore apps: BitTorrent, Calendar, File Sharing, Matrix, VPN, etc.
 
 ${C_B}${C_CYN}-- TROUBLESHOOTING --${C_R}
@@ -853,7 +857,7 @@ ${C_B}${C_YEL}-- NOTES --${C_R}
   Firewall is managed by FreedomBox (firewalld). Do NOT install UFW.
   Apache2 is managed by FreedomBox. Do NOT modify vhosts directly.
   SSL certs can be configured via Plinth UI or Let's Encrypt.
-  FreedomBox is a Debian Pure Blend � all packages from Debian repos.
+  FreedomBox is a Debian Pure Blend ? all packages from Debian repos.
   NPM, CrowdSec, and Authelia are deployed as separate Docker Compose services.
   Compose files: ${NPM_DIR}/docker-compose.npm.yml, ${NPM_DIR}/docker-compose.crowdsec.yml, ${NPM_DIR}/docker-compose.authelia.yml
 EOF
@@ -955,12 +959,17 @@ BOUNCER_SERVICE
     success "Firewall bouncer binary installed"
   else
     popd &>/dev/null; rm -rf "$tmpdir"
-    fatal "Firewall bouncer download failed -- check network connectivity"
+    warn "Firewall bouncer download failed -- check network connectivity"
+    return 0
   fi
 
   docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
   local api_key
-  api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer 2>/dev/null | tail -1 || true)
+  api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer -o raw 2>/dev/null | tr -d '[:space:]' || true)
+  if [[ -z "$api_key" ]]; then
+    docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
+    api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer 2>/dev/null | grep -oE '[A-Za-z0-9+/=_-]{30,}' | head -1 || true)
+  fi
   if [[ -n "$api_key" ]]; then
     mkdir -p /etc/crowdsec
     local fw_mode="iptables"
@@ -971,6 +980,10 @@ api_key: ${api_key}
 mode: ${fw_mode}
 deny_action: DROP
 update_frequency: 10s
+iptables_chains:
+  - INPUT
+  - FORWARD
+  - DOCKER-USER
 BOUNCER
     systemctl daemon-reload 2>/dev/null || true
     systemctl unmask crowdsec-firewall-bouncer >>"$LOG_FILE" 2>&1 || true
@@ -997,7 +1010,7 @@ BOUNCER
 }
 
 main() {
-  printf "\n${C_B}${C_CYN}VPS Deployment � FreedomBox + NPM + Authelia${C_R}\n"
+  printf "\n${C_B}${C_CYN}VPS Deployment ? FreedomBox + NPM + Authelia${C_R}\n"
   printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
 
   read -rp "Enter your domain (e.g., example.com) [default: example.com]: " DOMAIN_INPUT

@@ -3,11 +3,11 @@
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     exec sudo bash "$0" "$@"
 fi
-# deploy-runtipi.sh � Docker + NPM + Runtipi + CrowdSec
+# deploy-runtipi.sh ? Docker + NPM + Runtipi + CrowdSec
 # v3.0.0-crowdsec | Usage: sudo ./deploy-runtipi.sh
 set -euo pipefail
 
-readonly SCRIPT_VERSION="4.4.0-hardened"
+readonly SCRIPT_VERSION="4.5.0-hardened"
 readonly SCRIPT_NAME="deploy-runtipi.sh"
 readonly START_TIME=$(date +%s)
 readonly TIPI_DIR="/opt/runtipi"
@@ -31,8 +31,6 @@ fi
 
 DEPLOY_STATUS="in_progress"
 DOMAIN=""
-CROWDSEC_CHOICE="crowdsec"
-
 get_external_ip() {
   curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
   curl -s -4 --max-time 10 https://ifconfig.me 2>/dev/null || \
@@ -46,32 +44,35 @@ _on_exit() {
   local ip ext_ip
   ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<internal_ip>")
   ext_ip=$(get_external_ip)
+  local authelia_pass npm_pass
+  authelia_pass=$(_read_cred "${AUTHELIA_DIR}/.default_password")
+  npm_pass=$(_read_cred "${STACK_DIR}/.npm_admin_password")
   if [[ -n "${DEPLOYED_SERVICES:-}" ]] || [[ "$DEPLOY_STATUS" != "in_progress" ]]; then
     printf "\n"
     if [[ "$DEPLOY_STATUS" == "success" ]]; then
       printf "${C_B}${C_GRN}+------------------------------------------------------------------------------+${C_R}\n"
-      printf "${C_B}${C_GRN}�                     ?  DEPLOYMENT COMPLETED SUCCESSFULLY                       �${C_R}\n"
-      printf "${C_B}${C_GRN}�------------------------------------------------------------------------------�${C_R}\n"
+      printf "${C_B}${C_GRN}?                     ?  DEPLOYMENT COMPLETED SUCCESSFULLY                       ?${C_R}\n"
+      printf "${C_B}${C_GRN}?------------------------------------------------------------------------------?${C_R}\n"
     else
       printf "${C_B}${C_RED}+------------------------------------------------------------------------------+${C_R}\n"
-      printf "${C_B}${C_RED}�                     ?  DEPLOYMENT DID NOT COMPLETE                           �${C_R}\n"
-      printf "${C_B}${C_RED}�------------------------------------------------------------------------------�${C_R}\n"
+      printf "${C_B}${C_RED}?                     ?  DEPLOYMENT DID NOT COMPLETE                           ?${C_R}\n"
+      printf "${C_B}${C_RED}?------------------------------------------------------------------------------?${C_R}\n"
     fi
-    printf "${C_B}�  Elapsed:   ${C_CYN}%dm %ds${C_R}${C_B}                                                          �${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
-    printf "${C_B}�  Internal:  ${C_CYN}%-16s${C_R}${C_B}                                                   �${C_R}\n" "$ip"
-    printf "${C_B}�  External:  ${C_CYN}%-16s${C_R}${C_B}                                                   �${C_R}\n" "$ext_ip"
-    printf "${C_B}�------------------------------------------------------------------------------�${C_R}\n"
-    printf "${C_B}�  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}�${C_R}\n" "${ip}:81"
-    printf "${C_B}�  ${C_YEL}NPM Login${C_R}${C_B}:  admin@example.com / changeme                                   �${C_R}\n"
+    printf "${C_B}?  Elapsed:   ${C_CYN}%dm %ds${C_R}${C_B}                                                          ?${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
+    printf "${C_B}?  Internal:  ${C_CYN}%-16s${C_R}${C_B}                                                   ?${C_R}\n" "$ip"
+    printf "${C_B}?  External:  ${C_CYN}%-16s${C_R}${C_B}                                                   ?${C_R}\n" "$ext_ip"
+    printf "${C_B}?------------------------------------------------------------------------------?${C_R}\n"
+    printf "${C_B}?  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}?${C_R}\n" "${ip}:81"
+    printf "${C_B}?  ${C_YEL}NPM Login${C_R}${C_B}:  admin@example.com / ${npm_pass}                                   ?${C_R}\n"
     if [[ "$DEPLOY_STATUS" == "success" ]]; then
-      printf "${C_B}�  ${C_YEL}%s${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}�${C_R}\n" "Runtipi" "runtipi.${DOMAIN:-yourdomain.com} (via NPM)"
+      printf "${C_B}?  ${C_YEL}%s${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}?${C_R}\n" "Runtipi" "runtipi.${DOMAIN:-yourdomain.com} (via NPM)"
     fi
-    printf "${C_B}�  ${C_YEL}%s${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}�${C_R}\n" "Authelia" "auth.${DOMAIN:-yourdomain.com} (via NPM)"
-    printf "${C_B}�  ${C_YEL}Authelia  ${C_R}${C_B}:  admin / authelia (CHANGE IMMEDIATELY!)                        �${C_R}\n"
-    printf "${C_B}�  ${C_YEL}Verify    ${C_R}${C_B}:  sudo docker exec authelia cat /config/notifications.txt       �${C_R}\n"
-    printf "${C_B}�  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}80 (HTTP), 443 (HTTPS), 81 (NPM Admin)          ${C_R}${C_B}�${C_R}\n"
-    printf "${C_B}�------------------------------------------------------------------------------�${C_R}\n"
-    printf "${C_B}�  Log file: ${C_CYN}%-66s${C_R}${C_B}�${C_R}\n" "$LOG_FILE"
+    printf "${C_B}?  ${C_YEL}%s${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}?${C_R}\n" "Authelia" "auth.${DOMAIN:-yourdomain.com} (via NPM)"
+    printf "${C_B}?  ${C_YEL}Authelia  ${C_R}${C_B}:  admin / authelia (CHANGE IMMEDIATELY!)                        ?${C_R}\n"
+    printf "${C_B}?  ${C_YEL}Verify    ${C_R}${C_B}:  sudo docker exec authelia cat /config/notifications.txt       ?${C_R}\n"
+    printf "${C_B}?  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}80 (HTTP), 443 (HTTPS), 81 (NPM Admin)          ${C_R}${C_B}?${C_R}\n"
+    printf "${C_B}?------------------------------------------------------------------------------?${C_R}\n"
+    printf "${C_B}?  Log file: ${C_CYN}%-66s${C_R}${C_B}?${C_R}\n" "$LOG_FILE"
     printf "${C_B}+------------------------------------------------------------------------------+${C_R}\n"
     printf "\n"
     if [[ "$DEPLOY_STATUS" == "success" ]]; then
@@ -87,12 +88,30 @@ trap _on_exit EXIT
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
 _log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}" >> "$LOG_FILE" 2>/dev/null || true; }
 _read_cred() { [[ -f "$1" ]] && tr -d '\n' < "$1" 2>/dev/null || echo "<unknown>"; }
-info()    { printf "${C_BLU}?${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
-warn()    { printf "${C_YEL}?${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
-error()   { printf "${C_RED}?${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }
-success() { printf "${C_GRN}?${C_R}  %s\n" "$*"; _log "SUCCESS" "$@"; }
+info()    { printf "${C_BLU}?${C_R}  %s\n" "$*" >&2; _log "INFO" "$@"; }
+warn()    { printf "${C_YEL}?${C_R}  %s\n" "$*" >&2; _log "WARN" "$@"; }
+error()   { printf "${C_RED}?${C_R}  %s\n" "$*" >&2; _log "ERROR" "$@"; }
+success() { printf "${C_GRN}?${C_R}  %s\n" "$*" >&2; _log "SUCCESS" "$@"; }
 fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; DEPLOY_STATUS="failed"; exit 1; }
-step()    { printf "\n${C_B}${C_CYN}-- %s --${C_R}\n" "$*"; _log "STEP" "$@"; }
+step()    { printf "\n${C_B}${C_CYN}-- %s --${C_R}\n" "$*" >&2; _log "STEP" "$@"; }
+
+rand_secret() {
+  openssl rand -base64 32 2>/dev/null || head -c 32 /dev/urandom | base64
+}
+rand_password() {
+  local len="${1:-24}"
+  (openssl rand -base64 48 2>/dev/null || head -c 48 /dev/urandom | base64) \
+    | tr -d '+/=\n' | head -c "$len"
+}
+
+detect_ssh_port() {
+  local p=""
+  p=$(ss -tlnpH 2>/dev/null | awk '/sshd/ { n=split($4,a,":"); print a[n]; exit }')
+  if [[ -z "$p" ]]; then
+    p=$(awk '/^[Pp]ort[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)
+  fi
+  echo "${p:-22}"
+}
 
 preflight_checks() {
   step "Pre-flight Checks"
@@ -152,6 +171,15 @@ preflight_checks() {
 
 idempotent_cleanup() {
   step "Cleanup"
+  if [[ "${FORCE_CLEANUP:-0}" != "1" ]]; then
+    warn "WARNING: This will STOP and DELETE ALL Docker containers, volumes, and platform data."
+    printf "Continue? [y/N] "
+    read -r _confirm
+    if [[ ! "$_confirm" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+      info "Cleanup skipped. Set FORCE_CLEANUP=1 to bypass this prompt."
+      return 0
+    fi
+  fi
   if command -v docker &>/dev/null; then
     info "Removing ALL existing containers and volumes..."
     docker ps -aq 2>/dev/null | xargs -r docker stop &>/dev/null || true
@@ -200,8 +228,6 @@ idempotent_cleanup() {
     snap remove docker 2>/dev/null || true
   fi
 }
-
-
 
 system_update() {
   step "System Update"
@@ -270,7 +296,7 @@ install_docker() {
 
 setup_docker_network() {
   step "Docker Network: proxy"
-  # NEVER remove existing proxy network � other containers may depend on it
+  # NEVER remove existing proxy network ? other containers may depend on it
   if ! docker network ls --format '{{.Name}}' | grep -qx "proxy"; then
     docker network create proxy 2>/dev/null || true
   fi
@@ -314,10 +340,9 @@ services:
       - ./authelia/config:/config
       - ./authelia/secrets:/config/secrets:ro
     environment:
-      - AUTHELIA_JWT_SECRET_FILE=/config/secrets/jwt_session
+      - AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE=/config/secrets/jwt_reset
       - AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE=/config/secrets/storage_encryption
       - AUTHELIA_SESSION_SECRET_FILE=/config/secrets/session
-      - AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE=/config/secrets/jwt_session
       - TZ=America/New_York
     networks:
       - proxy
@@ -435,7 +460,7 @@ COMPOSE_CROWDSEC
 setup_authelia_secrets() {
   step "Authelia Secrets"
   mkdir -p "$AUTHELIA_SECRETS_DIR"
-  [[ -f "${AUTHELIA_SECRETS_DIR}/jwt_session" ]] || openssl rand -hex 64 > "${AUTHELIA_SECRETS_DIR}/jwt_session"
+  [[ -f "${AUTHELIA_SECRETS_DIR}/jwt_reset" ]] || openssl rand -hex 64 > "${AUTHELIA_SECRETS_DIR}/jwt_reset"
   [[ -f "${AUTHELIA_SECRETS_DIR}/storage_encryption" ]] || openssl rand -hex 64 > "${AUTHELIA_SECRETS_DIR}/storage_encryption"
   [[ -f "${AUTHELIA_SECRETS_DIR}/session" ]] || openssl rand -hex 64 > "${AUTHELIA_SECRETS_DIR}/session"
   chmod 600 "${AUTHELIA_SECRETS_DIR}"/*
@@ -498,17 +523,21 @@ location /internal/authelia/authz {
     proxy_set_header Content-Length "";
     proxy_pass_request_body off;
 }
-SNIPPET1
-  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" << 'SNIPPET2'
-location /authelia {
-    proxy_pass http://authelia:9091;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-Host $http_host;
-}
 SNIPPET2
+  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" << SNIPPET1
+auth_request /internal/authelia/authz;
+auth_request_set \$user \$upstream_http_remote_user;
+auth_request_set \$groups \$upstream_http_remote_groups;
+auth_request_set \$name \$upstream_http_remote_name;
+auth_request_set \$email \$upstream_http_remote_email;
+proxy_set_header Remote-User \$user;
+proxy_set_header Remote-Groups \$groups;
+proxy_set_header Remote-Name \$name;
+proxy_set_header Remote-Email \$email;
+auth_request_set \$redirection_url \$upstream_http_location;
+error_page 401 =302 \$redirection_url;
+SNIPPET1
+  # Also write to NPM's custom config directory so they're accessible inside the container
   local npm_custom_dir="${NPM_DATA_DIR}/nginx/custom"
   mkdir -p "$npm_custom_dir"
   cp "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" "$npm_custom_dir/"
@@ -572,7 +601,6 @@ setup_runtipi() {
   success "Runtipi deployed: http://${ip}:8080 | https://${ip}:8443 (proxied via NPM)"
 }
 
-
 setup_firewall() {
   step "Firewall Configuration"
   [[ "$OS_FAMILY" == "debian" ]] && setup_firewall_debian || setup_firewall_rhel
@@ -593,8 +621,8 @@ setup_firewall_debian() {
   ufw --force reset
   ufw default deny incoming
   ufw default allow outgoing
-  local ssh_port; ssh_port=$(ss -tlnp 2>/dev/null | grep -m1 ':22 ' | awk '{print $4}' | cut -d: -f2 || echo "22")
-  ufw allow "${ssh_port:-22}/tcp" comment 'SSH'
+  local ssh_port; ssh_port=$(detect_ssh_port)
+  ufw limit "${ssh_port}/tcp"
   ufw allow 80/tcp comment 'HTTP (NPM)'
   ufw allow 443/tcp comment 'HTTPS (NPM)'
   ufw allow 81/tcp comment 'NPM Admin (restrict after setup)'
@@ -637,7 +665,6 @@ EOF
   success "Log rotation: ${NPM_LOGS_DIR}/*.log (14 days)"
 }
 
-
 verify_deployment() {
   step "Post-Deploy Verification"
   local fails=0
@@ -649,8 +676,7 @@ verify_deployment() {
   }
 
   # Containers
-  local want="npm authelia"
-  [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && want="$want crowdsec crowdsec-dashboard"
+  local want="npm authelia crowdsec crowdsec-dashboard"
   local c
   for c in $want; do
     _check "container '$c' running" bash -c "docker ps --format '{{.Names}}' | grep -qx '$c'"
@@ -666,7 +692,6 @@ verify_deployment() {
   _check "Authelia snippets present in NPM custom dir" bash -c \
     "test -f '${NPM_DATA_DIR}/nginx/custom/authelia-location.conf' && test -f '${NPM_DATA_DIR}/nginx/custom/authelia-authrequest.conf'"
 
-  if [[ "$CROWDSEC_CHOICE" == "crowdsec" ]]; then
     _check "CrowdSec LAPI responding"   docker exec crowdsec cscli metrics
     _check "acquisition label is nginx-proxy-manager" bash -c \
       "docker exec crowdsec cat /etc/crowdsec/acquis.d/npm.yaml 2>/dev/null | grep -q 'type: nginx-proxy-manager'"
@@ -687,9 +712,6 @@ verify_deployment() {
       if $banned; then success "VERIFY: end-to-end ban enforcement works"
       else warn "VERIFY FAILED: test ban did not appear in firewall rules"; fails=$((fails+1)); fi
     fi
-  else
-    _check "fail2ban service ACTIVE" systemctl is-active --quiet fail2ban
-  fi
 
   if [[ $fails -eq 0 ]]; then
     success "All verification checks passed"
@@ -698,16 +720,14 @@ verify_deployment() {
   fi
 }
 
-
 print_summary() {
   local elapsed=$(( $(date +%s) - START_TIME ))
   local ip ext_ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
   ext_ip=$(get_external_ip)
-  local fw_cmd; [[ "$OS_FAMILY" == "debian" ]] && fw_cmd="ufw status verbose" || fw_cmd="firewall-cmd --list-all"
-  local npm_password authelia_pass mb_pass
+  local npm_password authelia_pass
   npm_password=$(_read_cred "${STACK_DIR}/.npm_admin_password")
   authelia_pass=$(_read_cred "${AUTHELIA_DIR}/.default_password")
-  mb_pass=$(_read_cred "${STACK_DIR}/.metabase_password")
+  local fw_cmd; [[ "$OS_FAMILY" == "debian" ]] && fw_cmd="ufw status verbose" || fw_cmd="firewall-cmd --list-all"
 
   cat << EOF
 
@@ -746,37 +766,37 @@ ${C_B}Network${C_R}   proxy (bridge)
 ${C_B}CrowdSec${C_R}  Collections: sshd, nginx-proxy-manager, linux
 ${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
 
-${C_B}${C_YEL}Step 1 � NPM Admin${C_R}
+${C_B}${C_YEL}Step 1 ? NPM Admin${C_R}
   Open:   http://${ip}:81
-  Login:  admin@example.com / changeme
+  Login:  admin@example.com / ${npm_password}
   ${C_RED}? Change password immediately${C_R}
 
-${C_B}${C_YEL}Step 2 � Add Proxy Host in NPM${C_R}
+${C_B}${C_YEL}Step 2 ? Add Proxy Host in NPM${C_R}
   Dashboards ? Proxy Hosts ? Add Proxy Host
   +--------------------------------------+
-  � Domain Names:    runtipi.YOURDOMAIN    �
-  � Scheme:          http                �
-  � Forward Host:    runtipi �
-  � Forward Port:    80      �
-  � Block Exploits:  ON                  �
+  ? Domain Names:    runtipi.YOURDOMAIN    ?
+  ? Scheme:          http                ?
+  ? Forward Host:    runtipi ?
+  ? Forward Port:    80      ?
+  ? Block Exploits:  ON                  ?
   +--------------------------------------+
   Click Save
 
-${C_B}${C_YEL}Step 3 � SSL Certificate${C_R}
+${C_B}${C_YEL}Step 3 ? SSL Certificate${C_R}
   On the same proxy host ? SSL tab
   +--------------------------------------+
-  � SSL:             Request a new cert  �
-  � Force SSL:       ON                  �
-  � HTTP/2 Support:  ON                  �
-  � Email:           your-email@domain   �
-  � Agree to TOS:    ON                  �
+  ? SSL:             Request a new cert  ?
+  ? Force SSL:       ON                  ?
+  ? HTTP/2 Support:  ON                  ?
+  ? Email:           your-email@domain   ?
+  ? Agree to TOS:    ON                  ?
   +--------------------------------------+
   Click Save
 
 ${C_B}${C_YEL}-- INITIAL SETUP --${C_R}
 
 1. ${C_B}NPM Admin:${C_R} Open http://${ip}:81
-   Login: admin@example.com / changeme
+   Login: admin@example.com / ${npm_password}
    ${C_RED}? Change password immediately.${C_R}
 
 2. ${C_B}Proxy Runtipi:${C_R} In NPM, add:
@@ -809,7 +829,6 @@ ${C_B}Restart${C_R}
 EOF
   _log "INFO" "=== Deployment completed in $(( elapsed / 60 ))m $(( elapsed % 60 ))s ==="
 }
-
 
 setup_crowdsec() {
   step "CrowdSec (Docker)"
@@ -904,12 +923,17 @@ BOUNCER_SERVICE
     success "Firewall bouncer binary installed"
   else
     popd &>/dev/null; rm -rf "$tmpdir"
-    fatal "Firewall bouncer download failed -- check network connectivity"
+    warn "Firewall bouncer download failed -- check network connectivity"
+    return 0
   fi
 
   docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
   local api_key
-  api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer 2>/dev/null | tail -1 || true)
+  api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer -o raw 2>/dev/null | tr -d '[:space:]' || true)
+  if [[ -z "$api_key" ]]; then
+    docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
+    api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer 2>/dev/null | grep -oE '[A-Za-z0-9+/=_-]{30,}' | head -1 || true)
+  fi
   if [[ -n "$api_key" ]]; then
     mkdir -p /etc/crowdsec
     local fw_mode="iptables"
@@ -920,6 +944,10 @@ api_key: ${api_key}
 mode: ${fw_mode}
 deny_action: DROP
 update_frequency: 10s
+iptables_chains:
+  - INPUT
+  - FORWARD
+  - DOCKER-USER
 BOUNCER
     systemctl daemon-reload 2>/dev/null || true
     systemctl unmask crowdsec-firewall-bouncer >>"$LOG_FILE" 2>&1 || true
@@ -946,7 +974,7 @@ BOUNCER
 }
 
 main() {
-  printf "\n${C_B}${C_CYN}VPS Deployment � Docker + NPM + Runtipi + CrowdSec + Authelia${C_R}\n"
+  printf "\n${C_B}${C_CYN}VPS Deployment ? Docker + NPM + Runtipi + CrowdSec + Authelia${C_R}\n"
   printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
 
   step "Domain Configuration"

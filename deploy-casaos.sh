@@ -3,12 +3,12 @@
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     exec sudo bash "$0" "$@"
 fi
-# deploy-casaos.sh � Docker + NPM + CasaOS + CrowdSec
+# deploy-casaos.sh ? Docker + NPM + CasaOS + CrowdSec
 # v3.0.0-crowdsec | Usage: sudo ./deploy-casaos.sh
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.4.0-hardened"
+readonly SCRIPT_VERSION="4.5.0-hardened"
 readonly SCRIPT_NAME="deploy-casaos.sh"
 readonly START_TIME=$(date +%s)
 
@@ -33,8 +33,6 @@ fi
 
 DEPLOY_STATUS="in_progress"
 DOMAIN=""
-CROWDSEC_CHOICE="crowdsec"
-
 get_external_ip() {
   curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
   curl -s -4 --max-time 10 https://ifconfig.me 2>/dev/null || \
@@ -56,28 +54,28 @@ _on_exit() {
     printf "\n"
     if [[ "$DEPLOY_STATUS" == "success" ]]; then
       printf "${C_B}${C_GRN}+------------------------------------------------------------------------------+${C_R}\n"
-      printf "${C_B}${C_GRN}�                    ?  DEPLOYMENT COMPLETED SUCCESSFULLY                      �${C_R}\n"
-      printf "${C_B}${C_GRN}�------------------------------------------------------------------------------�${C_R}\n"
+      printf "${C_B}${C_GRN}?                    ?  DEPLOYMENT COMPLETED SUCCESSFULLY                      ?${C_R}\n"
+      printf "${C_B}${C_GRN}?------------------------------------------------------------------------------?${C_R}\n"
     else
       printf "${C_B}${C_RED}+------------------------------------------------------------------------------+${C_R}\n"
-      printf "${C_B}${C_RED}�                     ?  DEPLOYMENT DID NOT COMPLETE                           �${C_R}\n"
-      printf "${C_B}${C_RED}�------------------------------------------------------------------------------�${C_R}\n"
+      printf "${C_B}${C_RED}?                     ?  DEPLOYMENT DID NOT COMPLETE                           ?${C_R}\n"
+      printf "${C_B}${C_RED}?------------------------------------------------------------------------------?${C_R}\n"
     fi
-    printf "${C_B}�  Elapsed:   ${C_CYN}%dm %ds${C_R}${C_B}                                                          �${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
-    printf "${C_B}�  Internal:  ${C_CYN}%-16s${C_R}${C_B}                                                   �${C_R}\n" "$ip"
-    printf "${C_B}�  External:  ${C_CYN}%-16s${C_R}${C_B}                                                   �${C_R}\n" "$ext_ip"
-    printf "${C_B}�------------------------------------------------------------------------------�${C_R}\n"
-    printf "${C_B}�  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}�${C_R}\n" "${ip}:81"
-    printf "${C_B}�  ${C_YEL}NPM Login${C_R}${C_B}:  admin@example.com / changeme                                   �${C_R}\n"
+    printf "${C_B}?  Elapsed:   ${C_CYN}%dm %ds${C_R}${C_B}                                                          ?${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
+    printf "${C_B}?  Internal:  ${C_CYN}%-16s${C_R}${C_B}                                                   ?${C_R}\n" "$ip"
+    printf "${C_B}?  External:  ${C_CYN}%-16s${C_R}${C_B}                                                   ?${C_R}\n" "$ext_ip"
+    printf "${C_B}?------------------------------------------------------------------------------?${C_R}\n"
+    printf "${C_B}?  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}?${C_R}\n" "${ip}:81"
+    printf "${C_B}?  ${C_YEL}NPM Login${C_R}${C_B}:  admin@example.com / ${npm_pass}                                   ?${C_R}\n"
     if [[ "$DEPLOY_STATUS" == "success" ]]; then
-      printf "${C_B}�  ${C_YEL}%s${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}�${C_R}\n" "Casaos" "casaos.${DOMAIN:-yourdomain.com} (via NPM)"
-      printf "${C_B}�  ${C_YEL}%s${C_R}${C_B}:  https://${C_CYN}%-56s${C_R}${C_B}�${C_R}\n" "Authelia" "authelia.${DOMAIN:-yourdomain.com} (via NPM)"
-      printf "${C_B}�  ${C_YEL}Authelia  ${C_R}${C_B}:  admin / authelia (CHANGE IMMEDIATELY!)                        �${C_R}\n"
-      printf "${C_B}�  ${C_YEL}Verify    ${C_R}${C_B}:  sudo docker exec authelia cat /config/notifications.txt       �${C_R}\n"
+      printf "${C_B}?  ${C_YEL}%s${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}?${C_R}\n" "Casaos" "casaos.${DOMAIN:-yourdomain.com} (via NPM)"
+      printf "${C_B}?  ${C_YEL}%s${C_R}${C_B}:  https://${C_CYN}%-56s${C_R}${C_B}?${C_R}\n" "Authelia" "authelia.${DOMAIN:-yourdomain.com} (via NPM)"
+      printf "${C_B}?  ${C_YEL}Authelia  ${C_R}${C_B}:  admin / ${authelia_pass} (CHANGE IMMEDIATELY!)                        ?${C_R}\n"
+      printf "${C_B}?  ${C_YEL}Verify    ${C_R}${C_B}:  sudo docker exec authelia cat /config/notifications.txt       ?${C_R}\n"
     fi
-    printf "${C_B}�  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}80 (HTTP), 443 (HTTPS), 81 (NPM Admin)          ${C_R}${C_B}�${C_R}\n"
-    printf "${C_B}�------------------------------------------------------------------------------�${C_R}\n"
-    printf "${C_B}�  Log file: ${C_CYN}%-66s${C_R}${C_B}�${C_R}\n" "$LOG_FILE"
+    printf "${C_B}?  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}80 (HTTP), 443 (HTTPS), 81 (NPM Admin)          ${C_R}${C_B}?${C_R}\n"
+    printf "${C_B}?------------------------------------------------------------------------------?${C_R}\n"
+    printf "${C_B}?  Log file: ${C_CYN}%-66s${C_R}${C_B}?${C_R}\n" "$LOG_FILE"
     printf "${C_B}+------------------------------------------------------------------------------+${C_R}\n"
     printf "\n"
     if [[ "$DEPLOY_STATUS" == "success" ]]; then
@@ -93,12 +91,30 @@ trap _on_exit EXIT
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
 _log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}" >> "$LOG_FILE" 2>/dev/null || true; }
 _read_cred() { [[ -f "$1" ]] && tr -d '\n' < "$1" 2>/dev/null || echo "<unknown>"; }
-info()    { printf "${C_BLU}?${C_R}  %s\n" "$*"; _log "INFO" "$@"; }
-warn()    { printf "${C_YEL}?${C_R}  %s\n" "$*"; _log "WARN" "$@"; }
-error()   { printf "${C_RED}?${C_R}  %s\n" "$*"; _log "ERROR" "$@"; }
-success() { printf "${C_GRN}?${C_R}  %s\n" "$*"; _log "SUCCESS" "$@"; }
+info()    { printf "${C_BLU}?${C_R}  %s\n" "$*" >&2; _log "INFO" "$@"; }
+warn()    { printf "${C_YEL}?${C_R}  %s\n" "$*" >&2; _log "WARN" "$@"; }
+error()   { printf "${C_RED}?${C_R}  %s\n" "$*" >&2; _log "ERROR" "$@"; }
+success() { printf "${C_GRN}?${C_R}  %s\n" "$*" >&2; _log "SUCCESS" "$@"; }
 fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; DEPLOY_STATUS="failed"; exit 1; }
-step()    { printf "\n${C_B}${C_CYN}-- %s --${C_R}\n" "$*"; _log "STEP" "$@"; }
+step()    { printf "\n${C_B}${C_CYN}-- %s --${C_R}\n" "$*" >&2; _log "STEP" "$@"; }
+
+rand_secret() {
+  openssl rand -base64 32 2>/dev/null || head -c 32 /dev/urandom | base64
+}
+rand_password() {
+  local len="${1:-24}"
+  (openssl rand -base64 48 2>/dev/null || head -c 48 /dev/urandom | base64) \
+    | tr -d '+/=\n' | head -c "$len"
+}
+
+detect_ssh_port() {
+  local p=""
+  p=$(ss -tlnpH 2>/dev/null | awk '/sshd/ { n=split($4,a,":"); print a[n]; exit }')
+  if [[ -z "$p" ]]; then
+    p=$(awk '/^[Pp]ort[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)
+  fi
+  echo "${p:-22}"
+}
 
 preflight_checks() {
   step "Pre-flight Checks"
@@ -158,6 +174,15 @@ preflight_checks() {
 
 idempotent_cleanup() {
   step "Cleanup"
+  if [[ "${FORCE_CLEANUP:-0}" != "1" ]]; then
+    warn "WARNING: This will STOP and DELETE ALL Docker containers, volumes, and platform data."
+    printf "Continue? [y/N] "
+    read -r _confirm
+    if [[ ! "$_confirm" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+      info "Cleanup skipped. Set FORCE_CLEANUP=1 to bypass this prompt."
+      return 0
+    fi
+  fi
   if command -v docker &>/dev/null; then
     info "Removing ALL existing containers and volumes..."
     docker ps -aq 2>/dev/null | xargs -r docker stop &>/dev/null || true
@@ -206,8 +231,6 @@ idempotent_cleanup() {
     snap remove docker 2>/dev/null || true
   fi
 }
-
-
 
 system_update() {
   step "System Update"
@@ -276,7 +299,7 @@ install_docker() {
 
 setup_docker_network() {
   step "Docker Network: proxy"
-  # NEVER remove existing proxy network � other containers may depend on it
+  # NEVER remove existing proxy network ? other containers may depend on it
   if ! docker network ls --format '{{.Name}}' | grep -qx "proxy"; then
     docker network create proxy 2>/dev/null || true
   fi
@@ -320,10 +343,9 @@ services:
       - ./authelia/config:/config
       - ./authelia/secrets:/config/secrets:ro
     environment:
-      - AUTHELIA_JWT_SECRET_FILE=/config/secrets/jwt_session
+      - AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE=/config/secrets/jwt_reset
       - AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE=/config/secrets/storage_encryption
       - AUTHELIA_SESSION_SECRET_FILE=/config/secrets/session
-      - AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE=/config/secrets/jwt_session
       - TZ=America/New_York
     networks:
       - proxy
@@ -452,11 +474,11 @@ COMPOSE_CROWDSEC
 setup_authelia_secrets() {
   step "Authelia Secrets"
   mkdir -p "$AUTHELIA_SECRETS_DIR"
-  local jwt_session storage_encryption session
-  jwt_session=$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")
+  local jwt_reset storage_encryption session
+  jwt_reset=$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")
   storage_encryption=$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")
   session=$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")
-  printf '%s' "$jwt_session" > "${AUTHELIA_SECRETS_DIR}/jwt_session"
+  printf '%s' "$jwt_reset" > "${AUTHELIA_SECRETS_DIR}/jwt_reset"
   printf '%s' "$storage_encryption" > "${AUTHELIA_SECRETS_DIR}/storage_encryption"
   printf '%s' "$session" > "${AUTHELIA_SECRETS_DIR}/session"
   chmod 644 "${AUTHELIA_SECRETS_DIR}/"*
@@ -482,10 +504,12 @@ access_control:
   rules:
     - domain: "authelia.${DOMAIN}"
       policy: bypass
-    - domain: "casaos.${DOMAIN}"
-      policy: two_factor
     - domain: "crowdsec.${DOMAIN}"
       policy: bypass
+    - domain: "casaos.${DOMAIN}"
+      policy: two_factor
+    - domain: "*.${DOMAIN}"
+      policy: two_factor   # wildcard protects ALL other subdomains
 session:
   name: authelia_session
   expiration: 1h
@@ -582,7 +606,7 @@ setup_casaos() {
   local health_ok=false
   for i in $(seq 1 60); do
     printf "${C_DIM}  Waiting for CasaOS gateway... (%d/60)${C_R}\r" "$i"
-    # Try multiple health endpoints � CasaOS versions differ
+    # Try multiple health endpoints ? CasaOS versions differ
     for endpoint in "/v1/gateway/health" "/ping" "/health" "/"; do
       if curl -sf --max-time 5 "http://127.0.0.1:80${endpoint}" &>/dev/null; then
         success "CasaOS gateway responding on port 80 (endpoint: ${endpoint})"
@@ -643,7 +667,7 @@ setup_casaos() {
     if grep -q '^\[gateway\]' "$gateway_conf" 2>/dev/null; then
       sed -i '/^\[gateway\]/a port=8080' "$gateway_conf" 2>/dev/null || true
     else
-      # No [gateway] section � append to end
+      # No [gateway] section ? append to end
       echo "port=8080" >> "$gateway_conf"
     fi
 
@@ -679,13 +703,13 @@ setup_casaos() {
     fi
 
     if $port_80_free && $port_8080_active; then
-      success "Port 80 is FREE � CasaOS is on port 8080"
+      success "Port 80 is FREE ? CasaOS is on port 8080"
       break
     fi
     sleep 2
   done
 
-  # 5. HARD FAIL if port 80 is still in use � NPM will break otherwise
+  # 5. HARD FAIL if port 80 is still in use ? NPM will break otherwise
   if ! $port_80_free; then
     echo ""
     fatal "CRITICAL: Port 80 is still in use after CasaOS reconfiguration. NPM cannot start.
@@ -713,7 +737,7 @@ After fixing, run this script again."
 
   # 6. Connect gateway to proxy network
   # SKIPPED: casaos-gateway is a systemd service, not a Docker container
-  info "CasaOS gateway is a systemd service � skipping docker network connect"
+  info "CasaOS gateway is a systemd service ? skipping docker network connect"
   # docker network connect proxy casaos-gateway 2>/dev/null || true
 
   # 7. Verify CasaOS is healthy on 8080
@@ -728,9 +752,8 @@ After fixing, run this script again."
     fi
     sleep 2
   done
-  $health_ok || warn "CasaOS not responding on 8080 � check: systemctl status casaos-gateway"
+  $health_ok || warn "CasaOS not responding on 8080 ? check: systemctl status casaos-gateway"
 }
-
 
 setup_firewall() {
   step "Firewall Configuration"
@@ -755,8 +778,8 @@ setup_firewall_debian() {
   ufw --force reset
   ufw default deny incoming
   ufw default allow outgoing
-  local ssh_port; ssh_port=$(ss -tlnp 2>/dev/null | grep -m1 ':22 ' | awk '{print $4}' | cut -d: -f2 || echo "22")
-  ufw allow "${ssh_port:-22}/tcp" comment 'SSH'
+  local ssh_port; ssh_port=$(detect_ssh_port)
+  ufw limit "${ssh_port}/tcp"
   ufw allow 80/tcp comment 'HTTP (NPM)'
   ufw allow 443/tcp comment 'HTTPS (NPM)'
   ufw allow 81/tcp comment 'NPM Admin (restrict after setup)'
@@ -806,7 +829,6 @@ EOF
   success "Log rotation: ${NPM_LOGS_DIR}/*.log (14 days)"
 }
 
-
 verify_deployment() {
   step "Post-Deploy Verification"
   local fails=0
@@ -818,8 +840,7 @@ verify_deployment() {
   }
 
   # Containers
-  local want="npm authelia"
-  [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && want="$want crowdsec crowdsec-dashboard"
+  local want="npm authelia crowdsec crowdsec-dashboard"
   local c
   for c in $want; do
     _check "container '$c' running" bash -c "docker ps --format '{{.Names}}' | grep -qx '$c'"
@@ -835,7 +856,6 @@ verify_deployment() {
   _check "Authelia snippets present in NPM custom dir" bash -c \
     "test -f '${NPM_DATA_DIR}/nginx/custom/authelia-location.conf' && test -f '${NPM_DATA_DIR}/nginx/custom/authelia-authrequest.conf'"
 
-  if [[ "$CROWDSEC_CHOICE" == "crowdsec" ]]; then
     _check "CrowdSec LAPI responding"   docker exec crowdsec cscli metrics
     _check "acquisition label is nginx-proxy-manager" bash -c \
       "docker exec crowdsec cat /etc/crowdsec/acquis.d/npm.yaml 2>/dev/null | grep -q 'type: nginx-proxy-manager'"
@@ -856,9 +876,6 @@ verify_deployment() {
       if $banned; then success "VERIFY: end-to-end ban enforcement works"
       else warn "VERIFY FAILED: test ban did not appear in firewall rules"; fails=$((fails+1)); fi
     fi
-  else
-    _check "fail2ban service ACTIVE" systemctl is-active --quiet fail2ban
-  fi
 
   if [[ $fails -eq 0 ]]; then
     success "All verification checks passed"
@@ -866,7 +883,6 @@ verify_deployment() {
     warn "${fails} verification check(s) failed - review warnings above and ${LOG_FILE}"
   fi
 }
-
 
 print_summary() {
   local elapsed=$(( $(date +%s) - START_TIME ))
@@ -905,7 +921,7 @@ ${C_B}Authelia${C_R}
   Container: authelia
   Network:   proxy
   Config:    ${AUTHELIA_CONFIG_DIR}
-  Login:     admin / authelia (CHANGE IMMEDIATELY!)
+  Login:     admin / ${authelia_pass} (CHANGE IMMEDIATELY!)
   Reset PW:  sudo docker exec authelia cat /config/notifications.txt
 
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
@@ -915,40 +931,40 @@ ${C_B}Network${C_R}   proxy (bridge)
 ${C_B}CrowdSec${C_R}  Collections: sshd, nginx-proxy-manager, linux
 ${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
 
-${C_B}${C_YEL}Step 1 � NPM Admin${C_R}
+${C_B}${C_YEL}Step 1 ? NPM Admin${C_R}
   Open:   http://${ip}:81
-  Login:  admin@example.com / changeme
+  Login:  admin@example.com / ${npm_password}
   ${C_RED}? Change password immediately${C_R}
 
-${C_B}${C_YEL}Step 2 � Add Proxy Host in NPM${C_R}
+${C_B}${C_YEL}Step 2 ? Add Proxy Host in NPM${C_R}
   Dashboards ? Proxy Hosts ? Add Proxy Host
   +--------------------------------------+
-  � Domain Names:    casaos.YOURDOMAIN    �
-  � Scheme:          http                �
-  � Forward Host:    casaos �
-  � Forward Port:    8080      �
-  � Block Exploits:  ON                  �
+  ? Domain Names:    casaos.YOURDOMAIN    ?
+  ? Scheme:          http                ?
+  ? Forward Host:    casaos ?
+  ? Forward Port:    8080      ?
+  ? Block Exploits:  ON                  ?
   +--------------------------------------+
   Click Save
 
-${C_B}${C_YEL}Step 3 � SSL Certificate${C_R}
+${C_B}${C_YEL}Step 3 ? SSL Certificate${C_R}
   On the same proxy host ? SSL tab
   +--------------------------------------+
-  � SSL:             Request a new cert  �
-  � Force SSL:       ON                  �
-  � HTTP/2 Support:  ON                  �
-  � Email:           your-email@domain   �
-  � Agree to TOS:    ON                  �
+  ? SSL:             Request a new cert  ?
+  ? Force SSL:       ON                  ?
+  ? HTTP/2 Support:  ON                  ?
+  ? Email:           your-email@domain   ?
+  ? Agree to TOS:    ON                  ?
   +--------------------------------------+
   Click Save
 
-${C_B}${C_YEL}Step 4 � Secure Admin Port${C_R}
+${C_B}${C_YEL}Step 4 ? Secure Admin Port${C_R}
   $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "  ufw delete allow 81/tcp && ufw reload"; else echo "  firewall-cmd --permanent --remove-port=81/tcp && firewall-cmd --reload"; fi)
 
 ${C_B}${C_YEL}-- INITIAL SETUP --${C_R}
 
 1. ${C_B}NPM Admin:${C_R} Open http://${ip}:81
-   Login: admin@example.com / changeme
+   Login: admin@example.com / ${npm_password}
    ${C_RED}? Change password immediately.${C_R}
 
 2. ${C_B}Proxy CasaOS:${C_R} In NPM, add: casaos.your-domain.com ? http://casaos-gateway:8080
@@ -979,9 +995,14 @@ EOF
   _log "INFO" "=== Deployment completed in $(( elapsed / 60 ))m $(( elapsed % 60 ))s ==="
 }
 
-
 setup_crowdsec() {
   step "CrowdSec (Docker)"
+
+  local mb_pass
+  mb_pass=$(rand_password 20)
+  printf '%s' "$mb_pass" > "${NPM_DIR}/.metabase_password"
+  chmod 600 "${NPM_DIR}/.metabase_password"
+  info "Metabase dashboard password stored (crowdsec@crowdsec.net / see ${NPM_DIR}/.metabase_password)"
 
   info "Waiting for CrowdSec container to be ready..."
   local cs_ready=false
@@ -1073,12 +1094,17 @@ BOUNCER_SERVICE
     success "Firewall bouncer binary installed"
   else
     popd &>/dev/null; rm -rf "$tmpdir"
-    fatal "Firewall bouncer download failed -- check network connectivity"
+    warn "Firewall bouncer download failed -- check network connectivity"
+    return 0
   fi
 
   docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
   local api_key
-  api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer 2>/dev/null | tail -1 || true)
+  api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer -o raw 2>/dev/null | tr -d '[:space:]' || true)
+  if [[ -z "$api_key" ]]; then
+    docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
+    api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer 2>/dev/null | grep -oE '[A-Za-z0-9+/=_-]{30,}' | head -1 || true)
+  fi
   if [[ -n "$api_key" ]]; then
     mkdir -p /etc/crowdsec
     local fw_mode="iptables"
@@ -1089,6 +1115,10 @@ api_key: ${api_key}
 mode: ${fw_mode}
 deny_action: DROP
 update_frequency: 10s
+iptables_chains:
+  - INPUT
+  - FORWARD
+  - DOCKER-USER
 BOUNCER
     systemctl daemon-reload 2>/dev/null || true
     systemctl unmask crowdsec-firewall-bouncer >>"$LOG_FILE" 2>&1 || true
@@ -1115,7 +1145,7 @@ BOUNCER
 }
 
 main() {
-  printf "\n${C_B}${C_CYN}VPS Deployment � Docker + NPM + CasaOS + Authelia + CrowdSec${C_R}\n"
+  printf "\n${C_B}${C_CYN}VPS Deployment ? Docker + NPM + CasaOS + Authelia + CrowdSec${C_R}\n"
   printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
 
   step "Domain Configuration"
