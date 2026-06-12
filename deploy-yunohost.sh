@@ -457,7 +457,7 @@ storage:
     path: /config/db.sqlite3
 notifier:
   filesystem:
-    filename: /config/notifications.yml
+    filename: /config/notifications.txt
 AUTHELIA_CONFIG
   success "Authelia configuration created"
 }
@@ -619,6 +619,7 @@ ${C_B}${C_CYN}── AUTHELIA ──${C_R}
   Admin:    http://${ip}:9091
   Config:   ${AUTHELIA_CONFIG_DIR}
   Secrets:  ${AUTHELIA_SECRETS_DIR}
+  Reset PW: sudo docker exec authelia cat /config/notifications.txt
 
 ${C_B}${C_CYN}── PORTS ──${C_R}
   22   SSH         Server access

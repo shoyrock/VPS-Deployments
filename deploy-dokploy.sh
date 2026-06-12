@@ -76,6 +76,7 @@ _on_exit() {
     if [[ "$DEPLOY_STATUS" == "success" ]]; then
       printf "${C_B}║  ${C_YEL}Dokploy  ${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "dokploy.${DOMAIN:-yourdomain.com} (via NPM)"
       printf "${C_B}║  ${C_YEL}Authelia ${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "auth.${DOMAIN:-yourdomain.com} (via NPM)"
+      printf "${C_B}║  ${C_YEL}Reset PW ${C_R}${C_B}:  ${C_CYN}%-56s${C_R}${C_B}║${C_R}\n" "sudo docker exec authelia cat /config/notifications.txt"
     fi
     printf "${C_B}║  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}80 (HTTP), 443 (HTTPS), 81 (NPM Admin)          ${C_R}${C_B}║${C_R}\n"
     printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
@@ -476,7 +477,7 @@ storage:
     path: /config/db.sqlite3
 notifier:
   filesystem:
-    filename: /config/notifications.yml
+    filename: /config/notifications.txt
 AUTHELIA_CONFIG
   success "Authelia config written"
 }

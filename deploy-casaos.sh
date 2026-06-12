@@ -498,7 +498,7 @@ storage:
     path: /config/db.sqlite3
 notifier:
   filesystem:
-    filename: /config/notifications.yml
+    filename: /config/notifications.txt
 AUTHELIA_CONF
   info "users.yml will be created after authelia container starts"
   chown -R 1001:1001 "$AUTHELIA_CONFIG_DIR" 2>/dev/null || true
@@ -823,6 +823,7 @@ ${C_B}Authelia${C_R}
   Network:   proxy
   Config:    ${AUTHELIA_CONFIG_DIR}
   Login:     ${USER:-admin} / authelia (CHANGE IMMEDIATELY!)
+  Reset PW:  sudo docker exec authelia cat /config/notifications.txt
 
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
 ${C_B}Containers${C_R}  npm, authelia, crowdsec, casaos-gateway (separate compose files)

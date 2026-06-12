@@ -747,7 +747,7 @@ storage:
     path: /config/db.sqlite3
 notifier:
   filesystem:
-    filename: /config/notifications.yml
+    filename: /config/notifications.txt
 AUTHELIA_CONF
   info "users.yml will be created after authelia container starts"
   chown -R 1001:1001 "$AUTHELIA_CONFIG_DIR" 2>/dev/null || true
