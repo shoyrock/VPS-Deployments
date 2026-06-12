@@ -89,14 +89,12 @@ _on_exit() {
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
     printf "${C_B}║  %-72s  ║${C_R}\n" "Portainer: http://portainer.${DOMAIN}"
     printf "${C_B}║  %-72s  ║${C_R}\n" "Authelia:  https://authelia.${DOMAIN}"
-    [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]] && printf "${C_B}║  %-72s  ║${C_R}\n" "CrowdSec:  http://crowdsec.${DOMAIN}"
-    [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" != "x86_64" ]] && printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "ARM: CrowdSec CLI-only — see guide below"
-    [[ "$CROWDSEC_CHOICE" == "fail2ban" ]] && printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "Fail2Ban:  Active (ARM) — manage with fail2ban-client"
+    [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && printf "${C_B}║  %-72s  ║${C_R}\n" "CrowdSec:  https://crowdsec.${DOMAIN}"
     printf "${C_B}╠══════════════════════════════════════════════════════════════════════════════╣${C_R}\n"
     printf "${C_B}║  %-72s  ║${C_R}\n" "NPM Proxy Forwarding:"
     printf "${C_B}║  %-72s  ║${C_R}\n" "  authelia.${DOMAIN}          → authelia:9091"
     printf "${C_B}║  %-72s  ║${C_R}\n" "  portainer.${DOMAIN}         → portainer:9000"
-    [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]] && printf "${C_B}║  %-72s  ║${C_R}\n" "  crowdsec.${DOMAIN}          → crowdsec-dashboard:3000"
+    [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && printf "${C_B}║  %-72s  ║${C_R}\n" "  crowdsec.${DOMAIN}          → crowdsec-dashboard:3000"
     printf "${C_B}║  %-72s  ║${C_R}\n" ""
     printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "Authelia Username: admin"
     printf "${C_B}║  ${C_YEL}%-72s${C_R}${C_B}  ║${C_R}\n" "Authelia Password: $exit_pass"
@@ -652,23 +650,16 @@ services:
       - proxy
 COMPOSE_CROWDSEC
 
-  if [[ "$DOCKER_ARCH" == "amd64" ]]; then
     cat >> "${STACK_DIR}/docker-compose.crowdsec.yml" << DASHBOARD
   crowdsec-dashboard:
-    image: partitio/crowdsec-dashboard:latest
+    image: apollof/crowdsec_metabase:latest
     container_name: crowdsec-dashboard
     restart: unless-stopped
-    environment:
-      - CROWDSEC_API_URL=http://crowdsec:8080
-      - CROWDSEC_LOGIN=${CROWDSEC_LOGIN}
-      - CROWDSEC_PASSWORD=${CROWDSEC_PASSWORD}
-      - BETTER_AUTH_SECRET=${BETTER_AUTH_SECRET}
     volumes:
-      - ./crowdsec/data:/var/lib/crowdsec/data:ro
+      - ./crowdsec/data:/metabase-data:ro
     networks:
       - proxy
 DASHBOARD
-  fi
 
   # networks section must come last (after conditional dashboard append)
   cat >> "${STACK_DIR}/docker-compose.crowdsec.yml" << 'NETS'
@@ -754,27 +745,16 @@ NETS
   done
   printf "\n"
 
-  if [[ "$DOCKER_ARCH" == "amd64" ]]; then
-    info "Registering CrowdSec LAPI machine for dashboard..."
-    for i in $(seq 1 10); do
-      if docker exec crowdsec cscli machines add "$CROWDSEC_LOGIN" --password "$CROWDSEC_PASSWORD" &>/dev/null; then
-        success "LAPI machine registered"
-        break
-      fi
-      [[ $i -eq 10 ]] && warn "LAPI machine registration timed out — dashboard may not connect"
-      sleep 2
-    done
-    info "Starting CrowdSec Dashboard..."
-    docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec-dashboard
-    info "Waiting for CrowdSec Dashboard to be ready..."
-    for i in $(seq 1 30); do
-      docker ps --format '{{.Names}}' | grep -qx "crowdsec-dashboard" && { success "CrowdSec Dashboard ready"; break; }
-      printf "${C_DIM}  Waiting for CrowdSec Dashboard... (%d/30)${C_R}\r" "$i"
-      [[ $i -eq 30 ]] && warn "CrowdSec Dashboard timeout"
-      sleep 2
-    done
-    printf "\n"
-  fi
+  info "Starting CrowdSec Dashboard..."
+  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec-dashboard
+  info "Waiting for CrowdSec Dashboard to be ready..."
+  for i in $(seq 1 30); do
+    docker ps --format '{{.Names}}' | grep -qx "crowdsec-dashboard" && { success "CrowdSec Dashboard ready"; break; }
+    printf "${C_DIM}  Waiting for CrowdSec Dashboard... (%d/30)${C_R}\r" "$i"
+    [[ $i -eq 30 ]] && warn "CrowdSec Dashboard timeout"
+    sleep 2
+  done
+  printf "\n"
 
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
   success "NPM: http://${ip}:81"
@@ -1094,12 +1074,11 @@ print_summary() {
     default_pass_msg=$(tr -d '\n' < "${AUTHELIA_DIR}/.default_password")
   fi
 
-  local crowdsec_display="crowdsec    crowdsec     8080 (LAPI)        crowdsec.${DOMAIN} (amd64 only)"
-  [[ "$CROWDSEC_CHOICE" == "fail2ban" ]] && crowdsec_display="fail2ban   fail2ban   —                  (internal, no proxy needed)"
+  local crowdsec_display="crowdsec    crowdsec     8080 (LAPI)        crowdsec.${DOMAIN}"
 
   local dns_crowdsec=""
   local proxy_crowdsec=""
-  if [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]]; then
+  if [[ "$CROWDSEC_CHOICE" == "crowdsec" ]]; then
     dns_crowdsec="  A  crowdsec.${DOMAIN}   → ${ip}  (CrowdSec Dashboard)"
     proxy_crowdsec=$(cat << 'CROWDPROXY'
 
@@ -1115,21 +1094,6 @@ print_summary() {
   Save → SSL tab → Request cert → Force SSL ON
   → Dashboard is read-only — no Authelia 2FA needed
 CROWDPROXY
-)
-  elif [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" != "x86_64" ]]; then
-    dns_crowdsec="  A  crowdsec.${DOMAIN}   → ${ip}  (not used — CLI-only)"
-    proxy_crowdsec=$(cat << 'CROWDSECCLI'
-
-  ${C_B}CrowdSec (CLI-only, ARM):${C_R}
-  ┌────────────────────────────────────────────────┐
-  │ No dashboard — manage CrowdSec via CLI         │
-  │ Check alerts:   cscli alerts list              │
-  │ Check bouncers: cscli bouncers list            │
-  │ Check metrics:  cscli metrics                  │
-  │ Decisions:      cscli decisions list           │
-  │ Logs:           sudo journalctl -u crowdsec -f │
-  └────────────────────────────────────────────────┘
-CROWDSECCLI
 )
   else
     dns_crowdsec="  A  crowdsec.${DOMAIN}   → ${ip}  (not used with Fail2Ban)"
@@ -1167,8 +1131,8 @@ ${C_B}Domain${C_R}                     ${C_B}Forward to${C_R}
 ${C_DIM}──────────────────────────  ──────────────────────────${C_R}
 authelia.${DOMAIN}          → authelia:9091
 portainer.${DOMAIN}         → portainer:9000
-$(if [[ "$CROWDSEC_CHOICE" == "crowdsec" ]] && [[ "$(uname -m)" == "x86_64" ]]; then echo "crowdsec.${DOMAIN}         → crowdsec-dashboard:3000"; fi)
-$(if [[ "$CROWDSEC_CHOICE" == "fail2ban" ]]; then echo "# Fail2Ban active — no proxy host needed"; fi)
+$(if [[ "$CROWDSEC_CHOICE" == "crowdsec" ]]; then echo "crowdsec.${DOMAIN}         → crowdsec-dashboard:3000"; fi)
+
 
 ${C_B}Nginx Proxy Manager${C_R}
   Admin:   http://${ip}:81
@@ -1371,19 +1335,7 @@ main() {
   setup_stack
   setup_authelia_users
   setup_firewall
-  if [[ "$DOCKER_ARCH" == "amd64" ]]; then
-    setup_crowdsec
-  else
-    printf "\n${C_YEL}ARM architecture detected — CrowdSec dashboard not available.${C_R}\n"
-    printf "${C_B}Options:${C_R}\n"
-    printf "  ${C_CYN}1)${C_R} CrowdSec (CLI-only, no dashboard)\n"
-    printf "  ${C_CYN}2)${C_R} Fail2Ban (traditional, no dashboard needed)\n"
-    read -rp "Choose [1-2]: " choice
-    case "$choice" in
-      2) setup_fail2ban; CROWDSEC_CHOICE="fail2ban" ;;
-      *) setup_crowdsec; crowdsec_cli_guide ;;
-    esac
-  fi
+  setup_crowdsec
   setup_logrotate
   register_portainer_stacks
   DEPLOY_STATUS="success"

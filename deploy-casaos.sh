@@ -1026,19 +1026,7 @@ main() {
   setup_docker_network
   setup_casaos
   setup_nginx_proxy_manager
-  if [[ "$DOCKER_ARCH" == "amd64" ]]; then
-    setup_crowdsec
-  else
-    printf "\n${C_YEL}ARM architecture detected -- CrowdSec dashboard not available.${C_R}\n"
-    printf "${C_B}Options:${C_R}\n"
-    printf "  ${C_CYN}1)${C_R} CrowdSec (CLI-only, no dashboard)\n"
-    printf "  ${C_CYN}2)${C_R} Fail2Ban (traditional, no dashboard needed)\n"
-    read -rp "Choice [1/2]: " arm_choice
-    case "$arm_choice" in
-      2) setup_fail2ban; CROWDSEC_CHOICE="fail2ban" ;;
-      *) setup_crowdsec ;;
-    esac
-  fi
+  setup_crowdsec
   setup_firewall
   setup_logrotate
   DEPLOY_STATUS="success"
