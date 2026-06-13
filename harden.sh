@@ -287,7 +287,7 @@ GEOEOF
     kill -0 "$geoip_pid" 2>/dev/null && warn "GeoIP apply still running in background (PID $geoip_pid)"
 
     local cronline="0 4 * * * ${GEOIP_DIR}/apply-geoip.sh >> /var/log/harden.log 2>&1"
-    (crontab -l 2>/dev/null | grep -vF "apply-geoip"; echo "$cronline") | sort -u | crontab -
+    (crontab -l 2>/dev/null | grep -vF "apply-geoip" || true; echo "$cronline") | crontab - 2>/dev/null || true
 
     ok "GeoIP blocking configured (${updated} countries, daily refresh)"
     _log "GeoIP blocking applied for: cn ru kp ir"
@@ -340,7 +340,7 @@ install_aide() {
     fi
 
     local cronline="30 4 * * * /usr/bin/aide --check >> /var/log/aide-check.log 2>&1 || true"
-    (crontab -l 2>/dev/null | grep -vF "aide --check"; echo "$cronline") | sort -u | crontab -
+    (crontab -l 2>/dev/null | grep -vF "aide --check" || true; echo "$cronline") | crontab - 2>/dev/null || true
     ok "AIDE configured (daily check at 04:30)"
     _log "AIDE installed and scheduled"
 }
@@ -460,7 +460,7 @@ echo "$(date '+%Y-%m-%d %H:%M:%S') Backup complete: ${DATE}" >> /var/log/backup.
 BACKUPEOF
     chmod +x /usr/local/bin/vps-backup
     local cronline="0 3 * * * /usr/local/bin/vps-backup"
-    (crontab -l 2>/dev/null | grep -vF "vps-backup"; echo "$cronline") | sort -u | crontab -
+    (crontab -l 2>/dev/null | grep -vF "vps-backup" || true; echo "$cronline") | crontab - 2>/dev/null || true
     nohup /usr/local/bin/vps-backup >> /var/log/backup.log 2>&1 &
     ok "Backups configured (daily 03:00, 7-day retention)"
     _log "Backup system configured"
