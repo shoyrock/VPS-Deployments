@@ -30,7 +30,6 @@ DOMAIN=""  # Set at runtime via user prompt
 
 # Deployment status tracking for guaranteed completion summary
 DEPLOY_STATUS="in_progress"
-METABASE_PASS=""
 
 # Colors (TTY only)
 if [[ -t 1 ]]; then
@@ -79,10 +78,9 @@ _on_exit() {
   local ip ext_ip
   ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<internal_ip>")
   ext_ip=$(get_external_ip)
-  local authelia_pass npm_pass mb_pass
+  local authelia_pass npm_pass
   authelia_pass=$(_read_cred "${AUTHELIA_DIR}/.default_password")
   npm_pass=$(_read_cred "${STACK_DIR}/.npm_admin_password")
-  mb_pass=$(_read_cred "${STACK_DIR}/.metabase_password")
 
   printf "\n"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
@@ -99,14 +97,11 @@ _on_exit() {
   printf "${C_B}  External: %s${C_R}\n" "$ext_ip"
   printf "${C_B}  Domain:   %s${C_R}\n" "${DOMAIN:-<not set>}"
   printf "${C_B}------------------------------------------------------------------------------${C_R}\n"
-  printf "${C_B}  NPM Admin:     http://%s:81${C_R}\n" "$ip"
+  printf "${C_B}  NPM Admin:  SSH tunnel: ssh -L 8181:127.0.0.1:81 root@%s then http://localhost:8181${C_R}\n" "$ip"
   printf "${C_B}  NPM Login:     admin@example.com / %s${C_R}\n" "$npm_pass"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
     printf "${C_B}  FreedomBox:      https://freedombox.%s${C_R}\n" "$DOMAIN"
     printf "${C_B}  Authelia:      https://authelia.%s${C_R}\n" "$DOMAIN"
-    printf "${C_B}  CrowdSec:      https://crowdsec.%s${C_R}\n" "$DOMAIN"
-    printf "${C_B}    Login:       crowdsec@crowdsec.net${C_R}\n"
-    printf "${C_B}    Pass:        %s${C_R}\n" "$mb_pass"
     printf "${C_B}------------------------------------------------------------------------------${C_R}\n"
     printf "${C_B}  ${C_YEL}Authelia Username: admin${C_R}\n"
     printf "${C_B}  ${C_YEL}Authelia Password: %s${C_R}\n" "$authelia_pass"
@@ -119,7 +114,7 @@ _on_exit() {
     printf "\n"
     printf "${C_B}  All credentials are stored (mode 600) under: %s${C_R}\n" "$STACK_DIR"
   fi
-  printf "${C_B}  Ports: 80 (HTTP), 443 (HTTPS), 81 (NPM Admin)${C_R}\n"
+  printf "${C_B}  Ports: 80/443 public; 81 (NPM Admin) localhost-only (SSH tunnel)${C_R}\n"
   printf "${C_B}  Log: %s${C_R}\n" "$LOG_FILE"
   printf "${C_B}==============================================================================${C_R}\n\n"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
@@ -427,7 +422,7 @@ services:
     ports:
       - 0.0.0.0:80:80
       - 0.0.0.0:443:443
-      - 0.0.0.0:81:81
+      - 127.0.0.1:81:81
     volumes:
       - ./data:/data
       - ./letsencrypt:/etc/letsencrypt
@@ -438,10 +433,6 @@ networks:
     external: true
 COMPOSE_NPM
 
-  # Random Metabase admin password (was a hardcoded, publicly-known string).
-  METABASE_PASS=$(rand_password 20)
-  printf '%s' "$METABASE_PASS" > "${STACK_DIR}/.metabase_password"
-  chmod 600 "${STACK_DIR}/.metabase_password"
 
   cat > "${STACK_DIR}/docker-compose.crowdsec.yml" << COMPOSE_CROWDSEC
 services:
@@ -463,40 +454,12 @@ services:
     networks:
       - proxy
 
-  crowdsec-dashboard:
-    image: metabase/metabase:latest
-    container_name: crowdsec-dashboard
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-    volumes:
-      - ./crowdsec/data/crowdsec.db:/metabase-data/crowdsec.db:ro
-      - ./crowdsec/metabase.db.mv.db:/app/metabase.db.mv.db
-    environment:
-      - MB_ADMIN_EMAIL=crowdsec@crowdsec.net
-      - MB_ADMIN_PASSWORD=${METABASE_PASS}
-    networks:
-      - proxy
 
 networks:
   proxy:
     external: true
 COMPOSE_CROWDSEC
 
-  local DL_CMD=""
-  if command -v curl &>/dev/null; then
-    DL_CMD="curl -sL -o"
-  elif command -v wget &>/dev/null; then
-    DL_CMD="wget -qO"
-  fi
-  if [[ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" && -n "$DL_CMD" ]]; then
-    $DL_CMD /tmp/metabase_sqlite.zip https://crowdsec-statics-assets.s3-eu-west-1.amazonaws.com/metabase_sqlite.zip || true
-    if command -v unzip &>/dev/null && [[ -f /tmp/metabase_sqlite.zip ]]; then
-      unzip -o /tmp/metabase_sqlite.zip -d "$CROWDSEC_DIR" && rm -f /tmp/metabase_sqlite.zip
-      chown 1000:1000 "$CROWDSEC_DIR/metabase.db.mv.db" 2>/dev/null || true
-    fi
-  fi
-  [[ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ]] && warn "Metabase template not found - dashboard may not have pre-loaded collections"
 
   info "Pulling images..."
   docker compose -f "${STACK_DIR}/docker-compose.npm.yml" pull
@@ -582,30 +545,9 @@ COMPOSE_CROWDSEC
   done
   printf "\n" >&2
 
-  # The dashboard bind-mounts crowdsec.db as a FILE. If it does not exist
-  # yet, Docker would create it as a DIRECTORY and break both containers.
-  info "Waiting for CrowdSec database file..."
-  for i in $(seq 1 30); do
-    [[ -f "${CROWDSEC_DIR}/data/crowdsec.db" ]] && { success "crowdsec.db present"; break; }
-    if [[ $i -eq 30 ]]; then
-      warn "crowdsec.db not created yet - creating empty placeholder"
-      mkdir -p "${CROWDSEC_DIR}/data"
-      touch "${CROWDSEC_DIR}/data/crowdsec.db"
-    fi
-    sleep 2
-  done
 
-  info "Starting CrowdSec Dashboard..."
-  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec-dashboard
-  for i in $(seq 1 30); do
-    docker ps --format '{{.Names}}' | grep -qx "crowdsec-dashboard" && { success "CrowdSec Dashboard ready"; break; }
-    printf "${C_DIM}  Waiting for CrowdSec Dashboard... (%d/30)${C_R}\r" "$i" >&2
-    [[ $i -eq 30 ]] && warn "CrowdSec Dashboard timeout"
-    sleep 2
-  done
-  printf "\n" >&2
 
-  success "NPM: http://${ip}:81"
+  success "NPM admin bound to 127.0.0.1:81 (tunnel: ssh -L 8181:127.0.0.1:81 root@${ip})"
 }
 
 # -------------------------------------------------------------------------------
@@ -766,8 +708,6 @@ access_control:
   rules:
     - domain: "authelia.${DOMAIN}"
       policy: bypass
-    - domain: "crowdsec.${DOMAIN}"
-      policy: bypass   # Metabase has its own login
     # Wildcard catch-all LAST: any other subdomain (incl. freedombox and
     # anything you add later) requires 2FA by default.
     - domain: "*.${DOMAIN}"
@@ -886,10 +826,6 @@ automate_npm() {
   authelia_id=$(npm_create_proxy_host "authelia.${DOMAIN}" "authelia" 9091 true "") || true
   [[ -n "$authelia_id" ]] && npm_enable_ssl "$authelia_id" "authelia.${DOMAIN}" || true
 
-  # CrowdSec dashboard (Metabase)
-  local crowdsec_id=""
-  crowdsec_id=$(npm_create_proxy_host "crowdsec.${DOMAIN}" "crowdsec-dashboard" 3000 false "") || true
-  [[ -n "$crowdsec_id" ]] && npm_enable_ssl "$crowsec_id" "crowdsec.${DOMAIN}" || true
 
   success "NPM automation completed"
 }
@@ -940,7 +876,7 @@ setup_firewall_debian() {
   ufw limit "${ssh_port}/tcp" 2>/dev/null || true   # rate-limit SSH brute force at the firewall too
   ufw allow 80/tcp comment 'HTTP'
   ufw allow 443/tcp comment 'HTTPS'
-  ufw allow 81/tcp comment 'NPM Admin'
+  # NPM admin (81) is bound to 127.0.0.1 only -- reached via SSH tunnel, no public UFW rule
   ufw --force enable && ufw reload
   ufw status verbose >&2
   success "UFW configured (SSH port ${ssh_port} allowed)"
@@ -956,7 +892,7 @@ setup_firewall_rhel() {
   [[ "$ssh_port" != "22" ]] && firewall-cmd --permanent --add-port="${ssh_port}/tcp"
   firewall-cmd --permanent --add-service=http
   firewall-cmd --permanent --add-service=https
-  firewall-cmd --permanent --add-port=81/tcp
+  # NPM admin (81) is bound to 127.0.0.1 only -- no public firewalld rule
   if ! firewall-cmd --get-zones 2>/dev/null | grep -q '\bdocker\b'; then
     firewall-cmd --permanent --new-zone=docker 2>/dev/null || true
   fi
@@ -1146,6 +1082,35 @@ BOUNCER
   fi
 }
 
+setup_crowdsec_console() {
+  step "CrowdSec Console enrollment"
+  info "Enrolling this CrowdSec instance in the CrowdSec Console (https://app.crowdsec.net)..."
+
+  local console_ready=false
+  for i in $(seq 1 30); do
+    if docker exec crowdsec cscli metrics &>/dev/null; then
+      console_ready=true
+      break
+    fi
+    printf "
+  ${C_DIM}Waiting for CrowdSec LAPI... %d/30${C_R}" "$i" >&2
+    sleep 2
+  done
+  printf "
+" >&2
+
+  if ! $console_ready; then
+    warn "CrowdSec LAPI not ready - Console enrollment skipped. Enroll manually later with: docker exec crowdsec cscli console enroll --auto"
+    return 0
+  fi
+
+  if docker exec crowdsec cscli console enroll --auto &>/dev/null; then
+    success "CrowdSec enrolled in Console"
+    info "View alerts, decisions and metrics at: https://app.crowdsec.net/"
+  else
+    warn "CrowdSec Console enrollment failed or already enrolled. Check: docker logs crowdsec"
+  fi
+}
 # -------------------------------------------------------------------------------
 # Post-deploy self-verification - the script proves its own work before
 # declaring success. Failures here are loud but non-fatal (warn level),
@@ -1162,7 +1127,7 @@ verify_deployment() {
   }
 
   # Containers
-  local want="npm authelia crowdsec crowdsec-dashboard"
+  local want="npm authelia crowdsec"
   local c
   for c in $want; do
     _check "container '$c' running" bash -c "docker ps --format '{{.Names}}' | grep -qx '$c'"
@@ -1217,10 +1182,9 @@ print_summary() {
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
   local ext_ip; ext_ip=$(get_external_ip)
   local fw_cmd; [[ "$OS_FAMILY" == "debian" ]] && fw_cmd="ufw status verbose" || fw_cmd="firewall-cmd --list-all"
-  local npm_password authelia_pass mb_pass
+  local npm_password authelia_pass
   npm_password=$(_read_cred "${STACK_DIR}/.npm_admin_password")
   authelia_pass=$(_read_cred "${AUTHELIA_DIR}/.default_password")
-  mb_pass=$(_read_cred "${STACK_DIR}/.metabase_password")
 
   printf "\n"
   printf "${C_B}${C_GRN}==============================================================================\n"
@@ -1237,10 +1201,9 @@ ${C_B}Stack Directory${C_R}    ${STACK_DIR}
 ${C_B}${C_GRN}-- NPM Proxy Forwarding --------------------------------------${C_R}
 freedombox.${DOMAIN}  ->  127.0.0.1:443   (FreedomBox/Plinth, manual first-run required)
 authelia.${DOMAIN}  ->  authelia:9091
-crowdsec.${DOMAIN}  ->  crowdsec-dashboard:3000
 
 ${C_B}Nginx Proxy Manager${C_R}
-  Admin:   http://${ip}:81
+  Admin:   http://localhost:8181  (tunnel: ssh -L 8181:127.0.0.1:81 root@${ip})
   Login:   admin@example.com
   Password:${C_YEL} ${npm_password}${C_R}
   HTTP:    http://${ip}:80
@@ -1266,30 +1229,29 @@ ${C_B}Authelia${C_R}
   Login:     admin / ${authelia_pass}  (change after first login)
   Info:      Verification codes: sudo docker exec authelia cat /config/notifications.txt
 
-${C_B}CrowdSec Dashboard (Metabase)${C_R}
-  URL:      https://crowdsec.${DOMAIN}
-  Login:    crowdsec@crowdsec.net
-  Password: ${mb_pass}
-  Note:     Dashboard is read-only against crowdsec.db
+${C_B}CrowdSec Console${C_R}
+  URL:      https://app.crowdsec.net/
+  Note:     This CrowdSec instance is enrolled in the Console (cloud dashboard).
+            If enrollment failed, run: docker exec crowdsec cscli console enroll --auto
+
 
 ${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
-${C_B}Containers${C_R}  npm, freedombox, authelia, crowdsec, crowdsec-dashboard
+${C_B}Containers${C_R}  npm, freedombox, authelia, crowdsec
 ${C_B}Network${C_R}   proxy (bridge)
 
 ${C_B}${C_YEL}Done automatically:${C_R}
-  - Proxy hosts for FreedomBox / Authelia / CrowdSec created
+  - Proxy hosts for FreedomBox / Authelia created
   - Let's Encrypt SSL certificates requested and forced (where DNS resolved)
   - NPM admin password changed to a random value (saved mode 600)
   - Authelia admin password randomized (saved mode 600)
-  - Metabase admin password randomized (saved mode 600)
+  - CrowdSec Console enrollment attempted
   - Authelia 2FA protecting FreedomBox
   - CrowdSec bans enforced incl. Docker-published ports (DOCKER-USER chain)
 
 ${C_B}${C_YEL}Credential files (root-only, mode 600):${C_R}
   ${STACK_DIR}/.npm_admin_password
   ${AUTHELIA_DIR}/.default_password
-  ${STACK_DIR}/.metabase_password
 
 ${C_B}Troubleshooting:${C_R}
   Logs:    journalctl -u plinth -f    docker logs -f npm    docker logs -f authelia
@@ -1326,16 +1288,10 @@ prepare_system() {
 
 
 setup_firewall_npm() {
-  step "Firewall: Opening port 81 for NPM"
-
-  if command -v firewall-cmd &>/dev/null; then
-    firewall-cmd --permanent --add-port=81/tcp 2>/dev/null || true
-    firewall-cmd --reload 2>/dev/null || true
-    success "Port 81 opened in firewalld"
-  else
-    warn "firewall-cmd not available. Port 81 may need manual opening."
-    iptables -I INPUT -p tcp --dport 81 -j ACCEPT 2>/dev/null || true
-  fi
+  step "Firewall: NPM admin (port 81)"
+  # NPM admin is published on 127.0.0.1:81 only -- not exposed to the network.
+  # Reach it via SSH tunnel: ssh -L 8181:127.0.0.1:81 root@<vps> then http://localhost:8181
+  success "NPM admin bound to 127.0.0.1:81 (SSH tunnel only -- no firewall rule needed)"
 }
 
 

@@ -104,7 +104,8 @@ user_confirm() {
     printf "Measures:\n"
     printf "  Kernel sysctl         Firewall rate limit   GeoIP blocking\n"
     printf "  CrowdSec (local)      AIDE file integrity   Auto security updates\n"
-    printf "  NPM admin lockdown    Docker hardening      Daily local backups\n\n"
+    printf "  NPM admin lockdown    Docker hardening      Daily local backups\n"
+    printf "  SSH daemon hardening  (key-only root, password auth off if key present)\n\n"
     read -rp $'Proceed? [y/N]: ' ans
     [[ "$ans" =~ ^[Yy]$ ]] || { info "Aborted."; exit 0; }
     ok "Confirmed — hardening..."
@@ -122,7 +123,7 @@ backup_configs() {
     info "=== Backing up configs ==="
     local f
     for f in /etc/sysctl.conf /etc/ufw/before.rules \
-             /etc/ufw/ufw.conf /etc/docker/daemon.json \
+             /etc/ufw/ufw.conf /etc/docker/daemon.json /etc/ssh/sshd_config \
              /etc/apt/apt.conf.d/50unattended-upgrades /etc/dnf/automatic.conf; do
         [[ -f "$f" ]] && backup_file "$f"
     done
@@ -137,7 +138,10 @@ harden_sysctl() {
     backup_file /etc/sysctl.conf || true
     mkdir -p /etc/sysctl.d || true
     {
-        echo "net.ipv4.ip_forward=0"
+        # MUST be 1 on a Docker host — Docker routes host→container traffic through
+        # IP forwarding. Setting this to 0 breaks ALL container networking (NPM and
+        # every published port become unreachable), and persists across reboots.
+        echo "net.ipv4.ip_forward=1"
         echo "net.ipv4.conf.all.send_redirects=0"
         echo "net.ipv4.conf.default.send_redirects=0"
         echo "net.ipv4.conf.all.accept_redirects=0"
@@ -178,15 +182,23 @@ harden_firewall() {
     info "=== Configuring firewall rate limiting ==="
     if [[ "$OS_FAMILY" == "debian" ]]; then
         command -v ufw &>/dev/null || { info "Installing UFW"; $PKG_INSTALL ufw >> "$LOGFILE" 2>&1; }
+        # NOTE: Docker publishes container ports straight into the DOCKER iptables
+        # chain, BYPASSING UFW. The 80/443 limits below therefore only affect host
+        # services on those ports — NPM's containerized 80/443 are NOT rate-limited
+        # by UFW. CrowdSec (installed later) is the real layer-7 protection for HTTP.
+        # The SSH (22) limit IS effective because sshd runs on the host.
+        if ufw status 2>/dev/null | grep -q 'Status: active'; then
+            warn "UFW already active — 'ufw --force reset' will WIPE existing rules"
+            _log "Existing UFW rules before reset:"; ufw status numbered >> "$LOGFILE" 2>&1 || true
+        fi
         ufw --force reset >> "$LOGFILE" 2>&1 || true
         ufw default deny incoming  >> "$LOGFILE" 2>&1 || true
         ufw default allow outgoing >> "$LOGFILE" 2>&1 || true
-        ufw limit 22/tcp  comment 'SSH rate limit'    >> "$LOGFILE" 2>&1 || true
-        ufw limit 80/tcp  comment 'HTTP rate limit'   >> "$LOGFILE" 2>&1 || true
-        ufw limit 443/tcp comment 'HTTPS rate limit'  >> "$LOGFILE" 2>&1 || true
-        ufw delete allow 81/tcp >> "$LOGFILE" 2>&1 || true
+        ufw limit 22/tcp  comment 'SSH rate limit'                      >> "$LOGFILE" 2>&1 || true
+        ufw limit 80/tcp  comment 'HTTP (host only; Docker bypasses UFW)'  >> "$LOGFILE" 2>&1 || true
+        ufw limit 443/tcp comment 'HTTPS (host only; Docker bypasses UFW)' >> "$LOGFILE" 2>&1 || true
         ufw --force enable >> "$LOGFILE" 2>&1 || true
-        ok "UFW rate limiting configured"
+        ok "UFW configured (SSH rate-limited; HTTP/HTTPS protected by CrowdSec — see note)"
     else
         systemctl is-active --quiet firewalld 2>/dev/null || { $PKG_INSTALL firewalld >> "$LOGFILE" 2>&1; systemctl enable --now firewalld >> "$LOGFILE" 2>&1; }
         firewall-cmd --permanent --add-rich-rule='rule service name=ssh  limit value=6/m accept'  >> "$LOGFILE" 2>&1 || true
@@ -207,6 +219,7 @@ harden_firewall() {
 harden_geoip() {
     info "=== Setting up GeoIP blocking ==="
     mkdir -p "$GEOIP_DIR"
+    command -v ipset &>/dev/null || { info "Installing ipset"; $PKG_INSTALL ipset >> "$LOGFILE" 2>&1 || warn "ipset install failed — GeoIP may not apply"; }
     local c updated=0
     for c in cn ru kp ir; do
         curl -fsSL --max-time 30 "https://www.ipdeny.com/ipblocks/data/countries/${c}.zone" -o "${GEOIP_DIR}/${c}.zone" >> "$LOGFILE" 2>&1 && {
@@ -218,23 +231,34 @@ harden_geoip() {
 
     cat > "${GEOIP_DIR}/apply-geoip.sh" << 'GEOEOF'
 #!/usr/bin/env bash
-DIR="/usr/local/bin/geoip-block" CHAIN="GEOIP_BLOCK"
-for cmd in iptables ip6tables; do
-    command -v "$cmd" &>/dev/null || continue
-    "$cmd" -F "$CHAIN" 2>/dev/null || true
-    "$cmd" -D INPUT -j "$CHAIN" 2>/dev/null || true
-    "$cmd" -X "$CHAIN" 2>/dev/null || true
-    "$cmd" -N "$CHAIN" 2>/dev/null || true
-    "$cmd" -A INPUT -j "$CHAIN" 2>/dev/null || true
-done
+# Apply GeoIP DROP rules via ipset: one hash:net set + one iptables rule.
+# Far faster than thousands of individual -A rules. ipdeny.com zone files are
+# IPv4 CIDR lists, so this is IPv4/iptables only (no ip6tables — nothing to add).
+DIR="/usr/local/bin/geoip-block" SET="geoip_block" LOG="/var/log/harden.log"
+
+if ! command -v ipset &>/dev/null || ! command -v iptables &>/dev/null; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') GeoIP: ipset/iptables missing — skipping" >> "$LOG"
+    exit 0
+fi
+
+# Load into a temp set, then atomically swap in — no window where a country is unblocked.
+ipset create "${SET}_tmp" hash:net -exist
+ipset flush  "${SET}_tmp"
 for c in cn ru kp ir; do
     [[ -f "${DIR}/${c}.zone" ]] || continue
     while IFS= read -r subnet; do
         [[ -z "$subnet" || "$subnet" =~ ^# ]] && continue
-        iptables -A "$CHAIN" -s "$subnet" -j DROP 2>/dev/null || true
+        ipset add "${SET}_tmp" "$subnet" -exist 2>/dev/null || true
     done < "${DIR}/${c}.zone"
 done
-echo "$(date '+%Y-%m-%d %H:%M:%S') GeoIP blocks applied" >> /var/log/harden.log
+ipset create "$SET" hash:net -exist
+ipset swap "${SET}_tmp" "$SET"
+ipset destroy "${SET}_tmp" 2>/dev/null || true
+
+# Ensure exactly one INPUT rule referencing the set (idempotent).
+iptables -C INPUT -m set --match-set "$SET" src -j DROP 2>/dev/null || \
+    iptables -I INPUT -m set --match-set "$SET" src -j DROP
+echo "$(date '+%Y-%m-%d %H:%M:%S') GeoIP blocks applied ($(ipset list "$SET" 2>/dev/null | grep -c '/') subnets)" >> "$LOG"
 GEOEOF
     chmod +x "${GEOIP_DIR}/apply-geoip.sh"
     info "Applying GeoIP blocks (this may take a minute)..."
@@ -444,6 +468,57 @@ LIMITS
 }
 
 # ---------------------------------------------------------------------------
+# 11b. SSH Daemon Hardening — rollback: restore sshd_config backup
+# ---------------------------------------------------------------------------
+harden_ssh() {
+    info "=== Hardening SSH daemon ==="
+    local cfg="/etc/ssh/sshd_config"
+    local sshd_bin; sshd_bin="$(command -v sshd 2>/dev/null || echo /usr/sbin/sshd)"
+    [[ -f "$cfg" ]] || { warn "No $cfg — skipping SSH hardening"; return; }
+    backup_file "$cfg"
+
+    # Safety: only disable password auth if a key is already installed — otherwise
+    # we could lock the operator out of the box.
+    local have_key=false kf
+    for kf in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
+        [[ -s "$kf" ]] && { have_key=true; break; }
+    done
+
+    _set_sshd() {  # $1=key $2=value — replace existing (commented or not) or append
+        if grep -qiE "^[#[:space:]]*${1}([[:space:]]|$)" "$cfg"; then
+            sed -i -E "s|^[#[:space:]]*${1}([[:space:]]).*|${1} ${2}|I" "$cfg"
+        else
+            printf '%s %s\n' "$1" "$2" >> "$cfg"
+        fi
+    }
+
+    _set_sshd PermitRootLogin prohibit-password
+    _set_sshd X11Forwarding no
+    _set_sshd MaxAuthTries 3
+    _set_sshd ClientAliveInterval 300
+    _set_sshd ClientAliveCountMax 2
+    _set_sshd PermitEmptyPasswords no
+
+    if [[ "$have_key" == true ]]; then
+        _set_sshd PasswordAuthentication no
+        ok "SSH: password auth DISABLED (key present); root login is key-only"
+    else
+        warn "No SSH authorized_keys found — leaving PasswordAuthentication ENABLED to avoid lockout"
+        warn "Install your public key, then set 'PasswordAuthentication no' in $cfg manually"
+    fi
+
+    if "$sshd_bin" -t 2>>"$LOGFILE"; then
+        systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || \
+            systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+        ok "SSH daemon hardened"
+    else
+        warn "sshd config test FAILED — restoring backup, no changes applied"
+        cp -a "${cfg}${BAKSUF}" "$cfg" 2>/dev/null || true
+    fi
+    _log "SSH hardening applied (have_key=$have_key)"
+}
+
+# ---------------------------------------------------------------------------
 # 12. Self-Verification — checks every module and reports PASS/FAIL
 # ---------------------------------------------------------------------------
 verify_hardening() {
@@ -472,6 +547,7 @@ verify_hardening() {
     _check "Kernel SYN cookies"      "[[ \$(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null) == '1' ]]"
     _check "Kernel RP filter"        "[[ \$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null) == '1' ]]"
     _check "No source routing"       "[[ \$(sysctl -n net.ipv4.conf.all.accept_source_route 2>/dev/null) == '0' ]]"
+    _check "IP forwarding ON (Docker)" "[[ \$(sysctl -n net.ipv4.ip_forward 2>/dev/null) == '1' ]]"
 
     # 2. Firewall
     if [[ "$OS_FAMILY" == "debian" ]]; then
@@ -483,7 +559,7 @@ verify_hardening() {
 
     # 3. GeoIP
     _check "GeoIP zone files"        "[[ -f /usr/local/bin/geoip-block/cn.zone ]]"
-    _check "GeoIP iptables chain"    "iptables -L GEOIP_BLOCK -n >/dev/null 2>&1"
+    _check "GeoIP ipset rule"        "iptables -C INPUT -m set --match-set geoip_block src -j DROP 2>/dev/null"
 
     # 4. CrowdSec
     _check "CrowdSec installed"      "command -v cscli >/dev/null 2>&1"
@@ -501,10 +577,15 @@ verify_hardening() {
     fi
 
     # 7. NPM lockdown
-    _check "NPM on localhost:81"     "ss -tln 2>/dev/null | grep -q '127.0.0.1:81'"
+    # Prefer 'docker port' — robust even with userland-proxy disabled (no host
+    # listener socket shows in ss when docker-proxy is off; DNAT lives in iptables).
+    _check "NPM admin bound to localhost" "if command -v docker >/dev/null 2>&1 && docker port npm 81 >/dev/null 2>&1; then docker port npm 81 2>/dev/null | grep -q '127.0.0.1'; else ss -tln 2>/dev/null | grep -q '127.0.0.1:81'; fi"
 
     # 8. Docker
     _check "Docker daemon.json"      "[[ -f /etc/docker/daemon.json ]]"
+
+    # 8b. SSH
+    _check "SSH root login key-only" "${SSHD_BIN:-$(command -v sshd 2>/dev/null || echo /usr/sbin/sshd)} -T 2>/dev/null | grep -qiE 'permitrootlogin (prohibit-password|without-password|no)'"
 
     # 9. Backups
     _check "Backup script exists"    "[[ -f /usr/local/bin/vps-backup ]]"
@@ -590,6 +671,7 @@ main() {
     lockdown_npm_admin
     harden_docker
     harden_misc
+    harden_ssh
     setup_backups
     verify_hardening
     print_summary

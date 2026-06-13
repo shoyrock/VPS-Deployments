@@ -33,7 +33,7 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script depl
 | `deploy-yunohost.sh` | NPM + YunoHost + Authelia + CrowdSec | `/opt/yunohost-stack/` | Debian server distro (Debian 12 only) |
 | `deploy-freedombox.sh` | NPM + FreedomBox + Authelia + CrowdSec | `/opt/freedombox-stack/` | Debian home server (Debian 12 only) |
 
-**All scripts expose only 3 ports: 80 (HTTP), 443 (HTTPS), 81 (NPM admin).** Individual tool containers have **no host ports** — they communicate internally via Docker's `proxy` network using their container hostnames.
+**All scripts expose only 2 public ports: 80 (HTTP) and 443 (HTTPS).** The NPM admin panel (**81**) is bound to **`127.0.0.1` only** — it is *not* reachable from the internet and is accessed via an SSH tunnel (see [Accessing the NPM Admin Panel](#accessing-the-npm-admin-panel)). Individual tool containers have **no host ports** — they communicate internally via Docker's `proxy` network using their container hostnames.
 
 ---
 
@@ -77,7 +77,7 @@ Every script deploys the same core stack plus one platform:
 
 | Component | Container | Purpose |
 |-----------|-----------|---------|
-| **NPM** | `npm` | Reverse proxy on 80/443/81, Let's Encrypt SSL |
+| **NPM** | `npm` | Reverse proxy on 80/443 (public) + admin UI on 127.0.0.1:81 (SSH tunnel only), Let's Encrypt SSL |
 | **Authelia** | `authelia` | SSO login portal + TOTP 2FA on `authelia.YOURDOMAIN.com` |
 | **CrowdSec** | `crowdsec` | Log-based intrusion detection, SSH + NPM monitoring |
 | **CrowdSec Dashboard** | `crowdsec-dashboard` | Metabase dashboard on `crowdsec.YOURDOMAIN.com` |
@@ -107,15 +107,31 @@ All credentials are **randomly generated**, stored with mode 600 under the stack
 ## Network Flow
 
 ```
-INTERNET → UFW/Firewalld → NPM (80/443/81) → Docker proxy network
+INTERNET → UFW/Firewalld → NPM (80/443 public) → Docker proxy network
                                                     │
                     ┌───────────────────────────────┼───────────────────────┐
                     │                               │                       │
                dockhand:3000                  authelia:9091          crowdsec-dashboard:3000
                (Authelia 2FA)                 (bypass - login)       (bypass - own auth)
+
+  NPM admin UI :81  ──  bound to 127.0.0.1 only  ──  reach via SSH tunnel (localhost)
 ```
 
-**Only 3 ports exposed.** All containers communicate via the `proxy` Docker network. NPM is the single entry point.
+**Only 2 public ports (80/443).** The admin UI on 81 is localhost-only. All containers communicate via the `proxy` Docker network. NPM is the single public entry point.
+
+---
+
+## Accessing the NPM Admin Panel
+
+The NPM admin UI (port **81**) is bound to `127.0.0.1` and is **not exposed to the internet**. Reach it through an SSH tunnel from your local machine:
+
+```bash
+ssh -L 8181:127.0.0.1:81 root@<your-vps-ip>
+```
+
+Leave that session open, then browse to **`http://localhost:8181`** locally. Log in with `admin@example.com` and the password stored in `STACK_DIR/.npm_admin_password`.
+
+> **Why localhost-only?** A publicly exposed admin panel is a standing attack surface. Binding to `127.0.0.1` means the panel is unreachable from the network even if a firewall rule is misconfigured — access requires SSH (key) access first. The deployment itself is unaffected: NPM's automation talks to the API over `127.0.0.1` internally.
 
 ---
 
@@ -255,7 +271,7 @@ STACK_DIR/
 ├── deploy-runtipi.sh          ← NPM + Runtipi + Authelia + CrowdSec
 ├── deploy-yunohost.sh         ← NPM + YunoHost + Authelia + CrowdSec
 ├── deploy-freedombox.sh       ← NPM + FreedomBox + Authelia + CrowdSec
-├── VPS_Deployments.zip        ← ASCII-box-drawing copies for VPS use
+├── .gitattributes             ← Forces LF endings (CRLF breaks bash on Linux)
 └── README.md                  ← This file
 ```
 
@@ -266,6 +282,8 @@ STACK_DIR/
 | Issue | Fix |
 |-------|-----|
 | Containers unreachable | `grep DEFAULT_FORWARD_POLICY /etc/default/ufw` — should be `ACCEPT` |
+| Containers unreachable after `harden.sh` | `sysctl net.ipv4.ip_forward` — **must be `1`** (Docker needs IP forwarding; fixed in harden.sh) |
+| Can't reach NPM admin (:81) | It's localhost-only by design — use the SSH tunnel: `ssh -L 8181:127.0.0.1:81 root@<vps>` then `http://localhost:8181` |
 | Port 80/443 conflict | `ss -tlnp \| grep ':80 '` — another service may still be bound |
 | New subdomain gets 403 | Verify the two include lines are in NPM's Advanced tab |
 | CrowdSec not catching | `docker exec crowdsec cscli metrics && docker exec crowdsec cscli decisions list` |
