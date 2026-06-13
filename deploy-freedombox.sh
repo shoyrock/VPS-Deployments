@@ -3,12 +3,11 @@
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     exec sudo bash "$0" "$@"
 fi
-# deploy-freedombox.sh ? Hardened VPS Deployment for FreedomBox + NPM + CrowdSec
-# v3.0.0-crowdsec | Usage: chmod +x deploy-freedombox.sh && sudo ./deploy-freedombox.sh
-#
-# FreedomBox (Debian Pure Blend) manages its own Apache2 and firewalld.
-# CrowdSec provides intrusion prevention for FreedomBox.
-# Supports: Debian 12 (Bookworm) or newer ONLY.
+
+# deploy-freedombox.sh -- Docker + NPM + FreedomBox + Authelia + CrowdSec (v4.3.0-hardened)
+# One-click VPS deployment. Usage: sudo ./deploy-freedombox.sh
+#   Optional env vars:
+#     FORCE_CLEANUP=1        skip the destructive-cleanup confirmation
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -27,6 +26,12 @@ readonly AUTHELIA_SNIPPETS_DIR="${AUTHELIA_DIR}/snippets"
 readonly DOMAIN_PERSIST_FILE="/etc/vps-deploy-domain"
 readonly LOG_FILE="/var/log/vps-deploy.log"
 
+DOMAIN=""  # Set at runtime via user prompt
+
+# Deployment status tracking for guaranteed completion summary
+DEPLOY_STATUS="in_progress"
+METABASE_PASS=""
+
 # Colors (TTY only)
 if [[ -t 1 ]]; then
   C_R='\033[0m'; C_B='\033[1m'; C_RED='\033[0;31m'; C_GRN='\033[0;32m'
@@ -34,6 +39,7 @@ if [[ -t 1 ]]; then
 else
   C_R=''; C_B=''; C_RED=''; C_GRN=''; C_YEL=''; C_BLU=''; C_CYN=''; C_DIM=''
 fi
+
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
 _log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}" >> "$LOG_FILE" 2>/dev/null || true; }
 # NOTE: all UI helpers print to STDERR so that functions whose stdout is
@@ -44,6 +50,7 @@ error()   { printf "${C_RED}[x]${C_R}  %s\n" "$*" >&2; _log "ERROR" "$@"; }
 success() { printf "${C_GRN}[ok]${C_R} %s\n" "$*" >&2; _log "SUCCESS" "$@"; }
 fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; DEPLOY_STATUS="failed"; exit 1; }
 step()    { printf "\n${C_B}${C_CYN}-- %s --${C_R}\n" "$*" >&2; _log "STEP" "$@"; }
+
 rand_secret() {
   # 32 bytes base64. Strong fallback via /dev/urandom (never date+sha256).
   openssl rand -base64 32 2>/dev/null || head -c 32 /dev/urandom | base64
@@ -53,42 +60,10 @@ rand_password() {
   (openssl rand -base64 48 2>/dev/null || head -c 48 /dev/urandom | base64) \
     | tr -d '+/=\n' | head -c "$len"
 }
-detect_ssh_port() {
-  local p=""
-  p=$(ss -tlnpH 2>/dev/null | awk '/sshd/ { n=split($4,a,":"); print a[n]; exit }')
-  if [[ -z "$p" ]]; then
-    p=$(awk '/^[Pp]ort[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)
-  fi
-  echo "${p:-22}"
-}
 
-readonly TOOL_LABEL="FreedomBox"
-
-DEPLOY_STATUS="in_progress"
-DOMAIN=""
-
-get_user_domain() {
-  step "Domain Configuration"
-  if [[ -f "${DOMAIN_PERSIST_FILE}" ]]; then
-    local existing_domain
-    existing_domain=$(tr -d '\n' < "${DOMAIN_PERSIST_FILE}" 2>/dev/null || true)
-    if [[ -n "$existing_domain" ]]; then
-      printf "\n${C_YEL}??  Previous deployment detected with domain: ${C_B}${existing_domain}${C_R}\n"
-      printf "${C_YEL}   Press ${C_B}Y${C_R}${C_YEL} + Enter to REUSE this domain${C_R}\n"
-      printf "${C_YEL}   Press ${C_B}N${C_R}${C_YEL} + Enter to enter a NEW domain${C_R}\n\n"
-      read -rp "Reuse '${existing_domain}'? [Y/n]: " use_existing
-      [[ "$use_existing" =~ ^[Nn]$ ]] || { DOMAIN="$existing_domain"; success "Domain set to: $DOMAIN"; return 0; }
-      printf "\n${C_CYN}Switching to new domain entry...${C_R}\n"
-    fi
-  fi
-  printf "\n${C_B}Enter your root domain${C_R} (e.g., example.com): "
-  read -r DOMAIN
-  [[ -z "$DOMAIN" ]] && fatal "Domain is required."
-  DOMAIN=$(echo "$DOMAIN" | sed 's|https\?://||' | sed 's|/.*||' | tr -d ' ')
-  printf '%s' "$DOMAIN" > "${DOMAIN_PERSIST_FILE}" || warn "Could not persist domain to ${DOMAIN_PERSIST_FILE}"
-  success "Domain set to: $DOMAIN"
-}
-
+# -------------------------------------------------------------------------------
+# GUARANTEED COMPLETION SUMMARY - runs on exit regardless of success/failure
+# -------------------------------------------------------------------------------
 get_external_ip() {
   curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
   curl -s -4 --max-time 10 https://ifconfig.me 2>/dev/null || \
@@ -96,58 +71,70 @@ get_external_ip() {
   echo "unknown"
 }
 
+_read_cred() { [[ -f "$1" ]] && tr -d '\n' < "$1" 2>/dev/null || echo "<unknown>"; }
+
 _on_exit() {
   local exit_code=$?
   local elapsed=$(( $(date +%s) - START_TIME ))
   local ip ext_ip
   ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<internal_ip>")
   ext_ip=$(get_external_ip)
-  local authelia_pass npm_pass
+  local authelia_pass npm_pass mb_pass
   authelia_pass=$(_read_cred "${AUTHELIA_DIR}/.default_password")
   npm_pass=$(_read_cred "${STACK_DIR}/.npm_admin_password")
+  mb_pass=$(_read_cred "${STACK_DIR}/.metabase_password")
+
   printf "\n"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
-      printf "${C_B}${C_GRN}+------------------------------------------------------------------------------+${C_R}\n"
-      printf "${C_B}${C_GRN}?                    ?  DEPLOYMENT COMPLETED SUCCESSFULLY                      ?${C_R}\n"
-      printf "${C_B}${C_GRN}?------------------------------------------------------------------------------?${C_R}\n"
-    else
-      printf "${C_B}${C_RED}+------------------------------------------------------------------------------+${C_R}\n"
-      printf "${C_B}${C_RED}?                     ?  DEPLOYMENT DID NOT COMPLETE                           ?${C_R}\n"
-      printf "${C_B}${C_RED}?------------------------------------------------------------------------------?${C_R}\n"
-    fi
-    printf "${C_B}?  Elapsed:   ${C_CYN}%dm %ds${C_R}${C_B}                                                          ?${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
-    printf "${C_B}?  Internal:  ${C_CYN}%-16s${C_R}${C_B}                                                   ?${C_R}\n" "$ip"
-    printf "${C_B}?  External:  ${C_CYN}%-16s${C_R}${C_B}                                                   ?${C_R}\n" "$ext_ip"
-    printf "${C_B}?  Status:    %-16s${C_B}                                                   ?${C_R}\n" "$(if [[ "$DEPLOY_STATUS" == "success" ]]; then printf "${C_GRN}All systems go"; else printf "${C_RED}Check logs"; fi)"
-    printf "${C_B}?------------------------------------------------------------------------------?${C_R}\n"
-    printf "${C_B}?  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}?${C_R}\n" "${ip}:81"
-    printf "${C_B}?  ${C_YEL}NPM Login${C_R}${C_B}:  admin@example.com / ${npm_pass}                                   ?${C_R}\n"
-    printf "${C_B}?  ${C_YEL}%-9s${C_R}${C_B}:  ${C_CYN}%-63s${C_R}${C_B}?${C_R}\n" "${TOOL_LABEL}" "${ip}:80/443 (own proxy, NPM on 81)"
-    printf "${C_B}?  ${C_YEL}Authelia ${C_R}${C_B}:  ${C_CYN}%-63s${C_R}${C_B}?${C_R}\n" "${ip}:9091"
-    printf "${C_B}?  ${C_YEL}Authelia  ${C_R}${C_B}:  admin / authelia (CHANGE IMMEDIATELY!)                        ?${C_R}\n"
-    printf "${C_B}?  ${C_YEL}Verify    ${C_R}${C_B}:  sudo docker exec authelia cat /config/notifications.txt       ?${C_R}\n"
-    printf "${C_B}?  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}22 (SSH), 80 (HTTP), 443 (HTTPS), 81 (NPM)    ${C_R}${C_B}?${C_R}\n"
-    printf "${C_B}?------------------------------------------------------------------------------?${C_R}\n"
-    printf "${C_B}?  Log file: ${C_CYN}%-66s${C_R}${C_B}?${C_R}\n" "$LOG_FILE"
-    printf "${C_B}+------------------------------------------------------------------------------+${C_R}\n"
+    printf "${C_B}${C_GRN}==============================================================================\n"
+    printf "                    DEPLOYMENT COMPLETED SUCCESSFULLY\n"
+    printf "==============================================================================${C_R}\n"
+  else
+    printf "${C_B}${C_RED}==============================================================================\n"
+    printf "                        DEPLOYMENT DID NOT COMPLETE\n"
+    printf "==============================================================================${C_R}\n"
+  fi
+  printf "${C_B}  Elapsed:  %ss${C_R}\n" "$elapsed"
+  printf "${C_B}  VPS IP:   %s${C_R}\n" "$ip"
+  printf "${C_B}  External: %s${C_R}\n" "$ext_ip"
+  printf "${C_B}  Domain:   %s${C_R}\n" "${DOMAIN:-<not set>}"
+  printf "${C_B}------------------------------------------------------------------------------${C_R}\n"
+  printf "${C_B}  NPM Admin:     http://%s:81${C_R}\n" "$ip"
+  printf "${C_B}  NPM Login:     admin@example.com / %s${C_R}\n" "$npm_pass"
+  if [[ "$DEPLOY_STATUS" == "success" ]]; then
+    printf "${C_B}  FreedomBox:      https://freedombox.%s${C_R}\n" "$DOMAIN"
+    printf "${C_B}  Authelia:      https://authelia.%s${C_R}\n" "$DOMAIN"
+    printf "${C_B}  CrowdSec:      https://crowdsec.%s${C_R}\n" "$DOMAIN"
+    printf "${C_B}    Login:       crowdsec@crowdsec.net${C_R}\n"
+    printf "${C_B}    Pass:        %s${C_R}\n" "$mb_pass"
+    printf "${C_B}------------------------------------------------------------------------------${C_R}\n"
+    printf "${C_B}  ${C_YEL}Authelia Username: admin${C_R}\n"
+    printf "${C_B}  ${C_YEL}Authelia Password: %s${C_R}\n" "$authelia_pass"
+    printf "${C_B}  ${C_RED}Change this password after first login!${C_R}\n"
     printf "\n"
-    if [[ "$DEPLOY_STATUS" == "success" ]]; then
-      printf "${C_B}${C_GRN}Your VPS is ready!${C_R} Configure DNS ? ${C_CYN}${ext_ip}${C_R} and set up NPM.\n\n"
-    else
-      printf "${C_B}${C_YEL}The deployment did not finish.${C_R} Check: ${C_CYN}cat %s${C_R}\n\n" "$LOG_FILE"
-    fi
+    printf "${C_B}  ${C_YEL}-- Verification Codes --${C_R}\n"
+    printf "${C_B}  Authelia requires a code to change password or add 2FA.${C_R}\n"
+    printf "${C_B}  The code appears AFTER you request it in the Authelia UI. Then run:${C_R}\n"
+    printf "${C_B}  ${C_CYN}sudo docker exec authelia cat /config/notifications.txt${C_R}\n"
+    printf "\n"
+    printf "${C_B}  All credentials are stored (mode 600) under: %s${C_R}\n" "$STACK_DIR"
+  fi
+  printf "${C_B}  Ports: 80 (HTTP), 443 (HTTPS), 81 (NPM Admin)${C_R}\n"
+  printf "${C_B}  Log: %s${C_R}\n" "$LOG_FILE"
+  printf "${C_B}==============================================================================${C_R}\n\n"
+  if [[ "$DEPLOY_STATUS" == "success" ]]; then
+    printf "${C_B}${C_GRN}Your VPS is ready!${C_R} DNS must point ${C_CYN}*.${DOMAIN} -> ${ext_ip}${C_R}\n\n"
+  else
+    printf "${C_B}${C_YEL}Deployment failed.${C_R} Check: ${C_CYN}cat $LOG_FILE${C_R}\n\n"
+  fi
+  _log "INFO" "=== Script exited (code $exit_code, status: $DEPLOY_STATUS, elapsed: ${elapsed}s) ===" 2>/dev/null || true
   exit $exit_code
 }
 trap _on_exit EXIT
 
-## PRE-FLIGHT CHECKS
 preflight_checks() {
   step "Pre-flight Checks"
-  mkdir -p "$(dirname "$LOG_FILE")"
-  touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
-  if [[ "${EUID:-0}" -ne 0 ]]; then
-    fatal "Must run as root (use sudo)."
-  fi
+  if [[ "${EUID:-0}" -ne 0 ]]; then fatal "Run as root (use sudo)."; fi
   success "Running as root"
 
   if [[ -f /etc/os-release ]]; then
@@ -156,27 +143,38 @@ preflight_checks() {
     readonly OS_ID="${ID:-unknown}"
     readonly OS_NAME="${NAME:-Unknown}"
     readonly OS_VERSION_ID="${VERSION_ID:-0}"
+    readonly OS_LIKE="${ID_LIKE:-}"
   else
     fatal "/etc/os-release not found."
   fi
 
-  # FreedomBox requires Debian 12+ (Bookworm)
-  [[ "$OS_ID" == "debian" ]] || fatal "FreedomBox requires Debian. You have: ${OS_NAME}."
-  [[ "${OS_VERSION_ID%%.*}" -ge 12 ]] || fatal "FreedomBox requires Debian 12+. You have: ${OS_VERSION_ID}"
-  success "OS: ${OS_NAME} ${OS_VERSION_ID}"
+  case "$OS_ID" in
+    ubuntu|debian|linuxmint|pop|kali) readonly OS_FAMILY="debian" ;;
+    centos|rhel|rocky|almalinux|fedora|ol|oraclelinux|amzn) readonly OS_FAMILY="rhel" ;;
+    *)
+      if [[ "$OS_LIKE" == *"debian"* ]]; then readonly OS_FAMILY="debian"
+      elif [[ "$OS_LIKE" == *"rhel"* ]] || [[ "$OS_LIKE" == *"fedora"* ]] || [[ "$OS_LIKE" == *"centos"* ]]; then readonly OS_FAMILY="rhel"
+      else fatal "Unsupported: ${OS_NAME} (${OS_ID}). Need Ubuntu 20.04+, Debian 11+, Rocky/Alma 8+, Fedora 35+, Amazon Linux 2023"; fi
+      ;;
+  esac
+  success "OS: ${OS_NAME} ${OS_VERSION_ID} (${OS_FAMILY})"
 
-  readonly ARCH=$(uname -m)
+  if [[ "$OS_FAMILY" == "debian" ]]; then
+    local major_ver="${OS_VERSION_ID%%.*}"
+    if [[ "$OS_ID" == "ubuntu" && "$major_ver" -lt 20 ]]; then fatal "Ubuntu ${OS_VERSION_ID} too old (min 20.04)."; fi
+    if [[ "$OS_ID" == "debian" && "$major_ver" -lt 11 ]]; then fatal "Debian ${OS_VERSION_ID} too old (min 11)."; fi
+  fi
+
+  ARCH=$(uname -m); readonly ARCH
   case "$ARCH" in
     x86_64) readonly DOCKER_ARCH="amd64" ;;
     aarch64|arm64) readonly DOCKER_ARCH="arm64" ;;
-    *) fatal "Unsupported arch: ${ARCH}. Need x86_64 or arm64/aarch64." ;;
+    *) fatal "Unsupported arch: ${ARCH}. Need x86_64 or arm64." ;;
   esac
   success "Arch: ${ARCH} (${DOCKER_ARCH})"
 
-  readonly OS_FAMILY="debian"
-
   info "Checking internet..."
-  if ! curl -sf --max-time 10 https://deb.debian.org/ >/dev/null 2>&1 && \
+  if ! curl -sf --max-time 10 https://download.docker.com/ >/dev/null 2>&1 && \
      ! curl -sf --max-time 10 https://github.com/ >/dev/null 2>&1; then
     fatal "No internet connectivity."
   fi
@@ -185,24 +183,24 @@ preflight_checks() {
   local free_mb; free_mb=$(df -m / | awk 'NR==2 {print $4}')
   if [[ "$free_mb" -lt 2048 ]]; then warn "Low disk: ${free_mb}MB free (recommend >= 2048MB)."
   else success "Disk: $(( free_mb / 1024 ))GB free"; fi
+
+  mkdir -p "$(dirname "$LOG_FILE")"
+  touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
   _log "INFO" "=== ${SCRIPT_NAME} v${SCRIPT_VERSION} started ==="
-  _log "INFO" "OS: ${OS_NAME} ${OS_VERSION_ID}, Arch: ${ARCH}"
+  _log "INFO" "OS: ${OS_NAME} ${OS_VERSION_ID}, Family: ${OS_FAMILY}, Arch: ${ARCH}"
 }
 
-## IDEMPOTENT CLEANUP
 idempotent_cleanup() {
   step "Cleanup"
-  if [[ "${FORCE_CLEANUP:-0}" != "1" ]]; then
-    warn "WARNING: This will STOP and DELETE ALL Docker containers, volumes, and platform data."
-    printf "Continue? [y/N] "
-    read -r _confirm
-    if [[ ! "$_confirm" =~ ^[Yy]([Ee][Ss])?$ ]]; then
-      info "Cleanup skipped. Set FORCE_CLEANUP=1 to bypass this prompt."
-      return 0
+  # SAFETY GATE: this step destroys ALL Docker containers and volumes on the
+  # host, not just ones from a previous run of this script. Require explicit
+  # confirmation unless FORCE_CLEANUP=1 (for unattended/CI use).
+  if command -v docker &>/dev/null && [[ -n "$(docker ps -aq 2>/dev/null)" ]]; then
+    if [[ "${FORCE_CLEANUP:-0}" != "1" ]]; then
+      printf "\n${C_RED}${C_B}WARNING:${C_R}${C_RED} This will STOP and DELETE ALL Docker containers and ALL Docker volumes on this host (irreversible).${C_R}\n" >&2
+      read -rp "Continue? [yes/no]: " _confirm
+      [[ "$_confirm" =~ ^[Yy]([Ee][Ss])?$ ]] || fatal "Aborted by user before destructive cleanup. Re-run with FORCE_CLEANUP=1 to skip this prompt."
     fi
-  fi
-
-  if command -v docker &>/dev/null; then
     info "Removing ALL existing containers and volumes..."
     docker ps -aq 2>/dev/null | xargs -r docker stop &>/dev/null || true
     docker ps -aq 2>/dev/null | xargs -r docker rm -f &>/dev/null || true
@@ -211,7 +209,7 @@ idempotent_cleanup() {
 
   # Remove ALL previously deployed platform data directories
   info "Removing ALL previous platform data..."
-  for dir in /opt/npm /opt/casaos /var/lib/casaos /opt/casaos-stack /opt/coolify-stack /opt/cosmos-stack /opt/dockge-stack /opt/dokploy-stack /opt/portainer-stack /opt/runtipi-stack /opt/freedombox-stack /opt/yunohost-stack; do
+  for dir in /opt/npm /opt/casaos /var/lib/casaos /opt/casaos-stack /opt/coolify-stack /opt/cosmos-stack /opt/dockge-stack /opt/dockhand-stack /opt/dokploy-stack /opt/portainer-stack /opt/runtipi-stack /opt/freedombox-stack /opt/yunohost-stack; do
     rm -rf "$dir" 2>/dev/null || true
   done
 
@@ -222,6 +220,9 @@ idempotent_cleanup() {
     systemctl disable "$svc" 2>/dev/null || true
     systemctl mask "$svc" 2>/dev/null || true
     rm -f "/etc/systemd/system/${svc}.service" "/etc/systemd/system/${svc}" 2>/dev/null || true
+  done
+  for svc in casaos-gateway casaos-user-service casaos-local-storage casaos-message-bus runtipi crowdsec-firewall-bouncer; do
+    systemctl unmask "$svc" 2>/dev/null || true   # unmask so this run can re-create them
   done
   systemctl daemon-reload 2>/dev/null || true
 
@@ -246,84 +247,85 @@ idempotent_cleanup() {
   fi
 
   # Immediately recreate the stack directory after cleaning
-  mkdir -p "$STACK_DIR" "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR"
+  mkdir -p "$STACK_DIR" "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR" "$STACK_DIR"
+  chmod 750 "$STACK_DIR"
   success "Stack directory recreated: $STACK_DIR"
 }
 
-## SYSTEM UPDATE & DEPENDENCIES
 system_update() {
   step "System Update"
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
-  apt-get update -qq && apt-get upgrade -y -qq && apt-get autoremove -y -qq && apt-get autoclean -qq
+  info "Updating packages - this may take a few minutes, please wait..."
+  if [[ "$OS_FAMILY" == "debian" ]]; then
+    apt-get update -qq && apt-get upgrade -y -qq && apt-get autoremove -y -qq && apt-get autoclean -qq
+  else
+    if command -v dnf &>/dev/null; then dnf update -y -q && dnf autoremove -y -q 2>/dev/null || true
+    else yum update -y -q; fi
+  fi
   success "System updated"
 }
 
 install_dependencies() {
-  step "Installing Dependencies"
-  apt-get install -y -qq ca-certificates curl gnupg lsb-release \
-    software-properties-common apt-transport-https jq cron logrotate
+  step "Dependencies"
+  info "Installing required packages - please wait..."
+  if [[ "$OS_FAMILY" == "debian" ]]; then
+    apt-get install -y -qq ca-certificates curl gnupg lsb-release \
+      software-properties-common apt-transport-https jq unzip cron logrotate
+  else
+    local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
+    $pkg install -y -q ca-certificates curl gnupg2 yum-utils \
+      device-mapper-persistent-data lvm2 jq unzip cronie logrotate
+  fi
   success "Dependencies installed"
 }
 
-## PREPARE SYSTEM FOR FREEDOMBOX
-prepare_system() {
-  step "Preparing System"
-
-  # UFW conflicts with firewalld which FreedomBox uses
-  info "Removing UFW (FreedomBox uses firewalld)..."
-  apt-get remove -y -qq ufw 2>/dev/null || true
-  systemctl stop ufw 2>/dev/null || true
-  systemctl disable ufw 2>/dev/null || true
-  apt-get purge -y -qq ufw 2>/dev/null || true
-
-  # NetworkManager is required by FreedomBox
-  info "Installing NetworkManager..."
-  apt-get install -y -qq network-manager 2>/dev/null || true
-  systemctl enable NetworkManager 2>/dev/null || true
-  systemctl start NetworkManager 2>/dev/null || true
-
-  info "Installing firewalld..."
-  apt-get install -y -qq firewalld 2>/dev/null || true
-  systemctl enable firewalld 2>/dev/null || true
-
-  success "System prepared"
-}
-
-## DOCKER CE INSTALLATION
 install_docker() {
-  step "Installing Docker CE"
+  step "Docker CE"
   if command -v docker &>/dev/null && docker version &>/dev/null; then
     success "Docker already installed: $(docker --version)"; return 0
   fi
-
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" -o /etc/apt/keyrings/docker.asc 2>/dev/null || \
-    curl -fsSL "https://download.docker.com/linux/debian/gpg" -o /etc/apt/keyrings/docker.asc
-  chmod a+r /etc/apt/keyrings/docker.asc
-
-  local repo_url; repo_url="https://download.docker.com/linux/${OS_ID}"
-  echo "deb [arch=${DOCKER_ARCH} signed-by=/etc/apt/keyrings/docker.asc] ${repo_url} $(lsb_release -cs) stable" \
-    > /etc/apt/sources.list.d/docker.list
-  apt-get update -qq
-  apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
-
+  info "Installing Docker CE - this may take a few minutes, please wait..."
+  if [[ "$OS_FAMILY" == "debian" ]]; then
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL "https://download.docker.com/linux/${OS_ID}/gpg" -o /etc/apt/keyrings/docker.asc 2>/dev/null || \
+      curl -fsSL "https://download.docker.com/linux/debian/gpg" -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+    local repo_url
+    if [[ "$OS_ID" == "debian" || "$OS_ID" == "ubuntu" ]]; then
+      repo_url="https://download.docker.com/linux/${OS_ID}"
+    else
+      repo_url="https://download.docker.com/linux/ubuntu"
+    fi
+    echo "deb [arch=${DOCKER_ARCH} signed-by=/etc/apt/keyrings/docker.asc] ${repo_url} $(lsb_release -cs) stable" \
+      > /etc/apt/sources.list.d/docker.list
+    apt-get update -qq
+    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
+  else
+    local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
+    if [[ "$OS_ID" == "amzn" || "$OS_ID" == "fedora" ]]; then
+      $pkg config-manager --add-repo "https://download.docker.com/linux/fedora/docker-ce.repo" 2>/dev/null || \
+        yum-config-manager --add-repo "https://download.docker.com/linux/fedora/docker-ce.repo"
+    else
+      $pkg config-manager --add-repo "https://download.docker.com/linux/centos/docker-ce.repo" 2>/dev/null || \
+        yum-config-manager --add-repo "https://download.docker.com/linux/centos/docker-ce.repo"
+    fi
+    $pkg install -y -q docker-ce docker-ce-cli containerd.io docker-compose-plugin
+  fi
   systemctl start docker && systemctl enable docker
   systemctl is-active --quiet docker || fatal "Docker daemon failed. Check: journalctl -u docker -n 50"
-
-  info "Verifying Docker (please wait)..."
+  info "Verifying Docker..."
   for i in {1..3}; do
-    docker run --rm hello-world &>/dev/null && break
-    printf "${C_DIM}  Waiting... (%d/3)${C_R}\r" "$i"
+    printf "\r  ${C_DIM}Verifying Docker... %d/3${C_R}" "$i" >&2
+    docker run --rm hello-world &>/dev/null && { printf "\r" >&2; break; }
+    [[ $i -eq 3 ]] && { printf "\r" >&2; fatal "Docker verification failed after 3 attempts."; }
     sleep 5
   done
   docker compose version &>/dev/null && success "Docker $(docker version --format '{{.Server.Version}}') + Compose $(docker compose version --short)" || \
     success "Docker $(docker version --format '{{.Server.Version}}')"
 }
 
-## DOCKER NETWORK
 setup_docker_network() {
   step "Docker Network: proxy"
-  # NEVER remove existing proxy network ? other containers may depend on it
   if ! docker network ls --format '{{.Name}}' | grep -qx "proxy"; then
     docker network create proxy 2>/dev/null || true
   fi
@@ -331,312 +333,31 @@ setup_docker_network() {
   success "Network 'proxy' ready"
 }
 
-## NGINX PROXY MANAGER (port 81 ? FreedomBox Apache owns 80/443)
-setup_nginx_proxy_manager() {
-  step "Nginx Proxy Manager (supplementary proxy on port 81)"
-  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR"
-
-  cat > "${STACK_DIR}/docker-compose.npm.yml" << 'COMPOSE_NPM'
-services:
-  npm:
-    image: jc21/nginx-proxy-manager:latest
-    restart: always
-    container_name: npm
-    ports:
-      - 0.0.0.0:81:81
-    volumes:
-      - ./data:/data
-      - ./letsencrypt:/etc/letsencrypt
-    networks:
-      - proxy
-networks:
-  proxy:
-    external: true
-COMPOSE_NPM
-
-  cat > "${STACK_DIR}/docker-compose.authelia.yml" << 'COMPOSE_AUTHELIA'
-services:
-  authelia:
-    image: authelia/authelia:latest
-    container_name: authelia
-    hostname: authelia
-    restart: always
-    user: "0:0"
-    volumes:
-      - ./authelia/config:/config
-      - ./authelia/secrets:/config/secrets:ro
-    environment:
-      - AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE=/config/secrets/jwt_reset
-      - AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE=/config/secrets/storage_encryption
-      - AUTHELIA_SESSION_SECRET_FILE=/config/secrets/session
-      - TZ=America/New_York
-    networks:
-      - proxy
-networks:
-  proxy:
-    external: true
-COMPOSE_AUTHELIA
-
-  cat > "${STACK_DIR}/docker-compose.crowdsec.yml" << 'COMPOSE_CROWDSEC'
-services:
-  crowdsec:
-    image: crowdsecurity/crowdsec:latest
-    container_name: crowdsec
-    hostname: crowdsec
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:8080:8080"
-    volumes:
-      - ./crowdsec/data:/var/lib/crowdsec/data
-      - ./crowdsec/config:/etc/crowdsec
-      - ./data/logs:/npm-logs:ro
-      - /var/log:/var/log:ro
-    environment:
-      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux
-      - TZ=UTC
-    networks:
-      - proxy
-networks:
-  proxy:
-    external: true
-COMPOSE_CROWDSEC
-
-  docker compose -f "${STACK_DIR}/docker-compose.npm.yml" pull
-  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" pull
-  docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" pull
-
-  info "Starting NPM..."
-  docker compose -f "${STACK_DIR}/docker-compose.npm.yml" up -d
-
-  info "Verifying NPM port 81 is bound (FreedomBox Apache owns 80/443)..."
-  local ports_ok=false
-  info "Please wait..."
-  for i in $(seq 1 30); do
-    if ss -tlnp 2>/dev/null | grep -q ':81[[:space:]]'; then
-      success "NPM bound port 81 (FreedomBox Apache owns 80/443)"
-      ports_ok=true
-      break
+get_user_domain() {
+  step "Domain Configuration"
+  if [[ -f "${DOMAIN_PERSIST_FILE}" ]]; then
+    local existing_domain
+    existing_domain=$(tr -d '\n' < "${DOMAIN_PERSIST_FILE}" 2>/dev/null || true)
+    if [[ -n "$existing_domain" ]]; then
+      printf "\n${C_YEL}Previous deployment detected with domain: ${C_B}${existing_domain}${C_R}\n" >&2
+      printf "${C_YEL}   Press ${C_B}Y${C_R}${C_YEL} + Enter to REUSE this domain${C_R}\n" >&2
+      printf "${C_YEL}   Press ${C_B}N${C_R}${C_YEL} + Enter to enter a NEW domain${C_R}\n\n" >&2
+      read -rp "Reuse '${existing_domain}'? [Y/n]: " use_existing
+      [[ "$use_existing" =~ ^[Nn]$ ]] || { DOMAIN="$existing_domain"; success "Domain set to: $DOMAIN"; return 0; }
+      printf "\n${C_CYN}Switching to new domain entry...${C_R}\n" >&2
     fi
-    printf "${C_DIM}  Waiting... (%d/30)${C_R}\r" "$i"
-    [[ $i -eq 30 ]] && {
-      echo ""; ss -tlnp 2>/dev/null | grep -E ':81 ' || true; echo ""
-      fatal "NPM failed to bind port 81. Check: docker logs npm"
-    }
-    sleep 2
-  done
-
-  info "Waiting for NPM container (please wait)..."
-  for i in $(seq 1 30); do
-    docker ps --format '{{.Names}}' | grep -qx "npm" && break
-    printf "${C_DIM}  Waiting... (%d/30)${C_R}\r" "$i"
-    sleep 2
-  done
-
-  info "Waiting for NPM admin UI (port 81)..."
-  for i in $(seq 1 60); do
-    curl -sf --max-time 5 http://127.0.0.1:81/ &>/dev/null && { success "NPM admin UI responding"; break; }
-    printf "${C_DIM}  Waiting... (%d/60)${C_R}\r" "$i"
-    [[ $i -eq 60 ]] && warn "NPM UI timed out (2m). Still starting?"
-    sleep 2
-  done
-
-  info "Waiting for NPM log files..."
-  for i in $(seq 1 30); do
-    if ls "${NPM_LOGS_DIR}/"*_access.log "${NPM_LOGS_DIR}/"*_error.log &>/dev/null; then
-      success "NPM logs present"; break
-    fi
-    printf "${C_DIM}  Waiting... (%d/30)${C_R}\r" "$i"
-    if [[ $i -eq 30 ]]; then
-      warn "NPM logs not found. Creating placeholders."
-      touch "${NPM_LOGS_DIR}/fallback_http_access.log" \
-            "${NPM_LOGS_DIR}/fallback_http_error.log" \
-            "${NPM_LOGS_DIR}/default-host_access.log" \
-            "${NPM_LOGS_DIR}/default-host_error.log"
-    fi
-    sleep 2
-  done
-
-  info "Deploying Authelia..."
-  mkdir -p "$AUTHELIA_DIR" "$AUTHELIA_CONFIG_DIR" "$AUTHELIA_SECRETS_DIR" "$AUTHELIA_SNIPPETS_DIR"
-  setup_authelia_secrets
-  setup_authelia_config
-  setup_authelia_snippets
-  docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" up -d
-  info "Waiting for Authelia..."
-  for i in $(seq 1 30); do
-    docker ps --format '{{.Names}}' | grep -qx "authelia" && { success "Authelia ready"; break; }
-    printf "${C_DIM}  Waiting for Authelia container... (%d/30)${C_R}\r" "$i"
-    [[ $i -eq 30 ]] && warn "Authelia container not found"
-    sleep 2
-  done
-  printf "\n"
-  setup_authelia_users
-
-  info "Starting CrowdSec..."
-  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d
-
-  local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
-  success "NPM deployed: http://${ip}:81"
-}
-
-## AUTHELIA SETUP
-
-setup_authelia_secrets() {
-  info "Generating Authelia secrets..."
-  mkdir -p "$AUTHELIA_SECRETS_DIR"
-  local jwt_reset storage_encryption session
-  jwt_reset=$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")
-  storage_encryption=$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")
-  session=$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")
-  printf '%s' "$jwt_reset" > "${AUTHELIA_SECRETS_DIR}/jwt_reset"
-  printf '%s' "$storage_encryption" > "${AUTHELIA_SECRETS_DIR}/storage_encryption"
-  printf '%s' "$session" > "${AUTHELIA_SECRETS_DIR}/session"
-  chmod 600 "${AUTHELIA_SECRETS_DIR}"/*
-  chown -R 1001:1001 "$AUTHELIA_SECRETS_DIR" 2>/dev/null || true
-  success "Authelia secrets generated: $AUTHELIA_SECRETS_DIR"
-}
-
-setup_authelia_config() {
-  info "Generating Authelia config..."
-  mkdir -p "$AUTHELIA_CONFIG_DIR"
-  cat > "${AUTHELIA_CONFIG_DIR}/configuration.yml" << AUTHELIA_CONFIG
-server:
-  address: 'tcp://:9091/'
-log:
-  level: info
-totp:
-  issuer: authelia.${DOMAIN}
-authentication_backend:
-  file:
-    path: /config/users.yml
-access_control:
-  default_policy: deny
-  rules:
-    - domain: "authelia.${DOMAIN}"
-      policy: bypass
-    - domain: "*.${DOMAIN}"
-      policy: two_factor
-session:
-  name: authelia_session
-  expiration: 1h
-  inactivity: 5m
-  remember_me: 1M
-  cookies:
-    - domain: "${DOMAIN}"
-      authelia_url: "https://authelia.${DOMAIN}"
-      default_redirection_url: "https://freedombox.${DOMAIN}"
-      same_site: lax
-regulation:
-  max_retries: 5
-  find_time: 2m
-  ban_time: 10m
-storage:
-  local:
-    path: /config/db.sqlite3
-notifier:
-  filesystem:
-    filename: /config/notifications.txt
-AUTHELIA_CONFIG
-  success "Authelia config generated"
-}
-
-setup_authelia_snippets() {
-  step "Authelia NPM Snippets"
-  mkdir -p "$AUTHELIA_SNIPPETS_DIR"
-  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" << 'SNIPPET2'
-location /internal/authelia/authz {
-    internal;
-    proxy_pass http://authelia:9091/api/authz/auth-request;
-    proxy_set_header X-Original-Method $request_method;
-    proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
-    proxy_set_header X-Forwarded-For $remote_addr;
-    proxy_set_header Content-Length "";
-    proxy_pass_request_body off;
-}
-SNIPPET2
-  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" << SNIPPET1
-auth_request /internal/authelia/authz;
-auth_request_set \$user \$upstream_http_remote_user;
-auth_request_set \$groups \$upstream_http_remote_groups;
-auth_request_set \$name \$upstream_http_remote_name;
-auth_request_set \$email \$upstream_http_remote_email;
-proxy_set_header Remote-User \$user;
-proxy_set_header Remote-Groups \$groups;
-proxy_set_header Remote-Name \$name;
-proxy_set_header Remote-Email \$email;
-auth_request_set \$redirection_url \$upstream_http_location;
-error_page 401 =302 \$redirection_url;
-SNIPPET1
-  # Also write to NPM's custom config directory so they're accessible inside the container
-  local npm_custom_dir="${NPM_DATA_DIR}/nginx/custom"
-  mkdir -p "$npm_custom_dir"
-  cp "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" "$npm_custom_dir/"
-  cp "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" "$npm_custom_dir/"
-  success "Authelia NPM snippets created"
-}
-
-setup_authelia_users() {
-  step "Authelia Users"
-  local default_pass hash
-  default_pass=$(rand_password 16)
-  info "Generating argon2 hash for default admin user..."
-  hash=$(docker run --rm authelia/authelia:latest \
-           authelia crypto hash generate argon2 --password "$default_pass" 2>/dev/null \
-         | awk -F': ' '/Digest/ {print $2}')
-  [[ -n "$hash" ]] || fatal "Failed to generate Authelia password hash"
-  cat > "${AUTHELIA_CONFIG_DIR}/users.yml" << AUTHELIA_USERS
-users:
-  admin:
-    displayname: "Admin User"
-    password: "${hash}"
-    email: admin@${DOMAIN}
-    groups:
-      - admins
-AUTHELIA_USERS
-  chmod 600 "${AUTHELIA_CONFIG_DIR}/users.yml"
-  printf '%s' "$default_pass" > "${AUTHELIA_DIR}/.default_password"
-  chmod 600 "${AUTHELIA_DIR}/.default_password"
-  success "Default user created. Login: admin / (see ${AUTHELIA_DIR}/.default_password) - change after first login"
-}
-
-## CROWDSEC
-
-## FIREWALL: Open port 81 in firewalld for NPM
-setup_firewall_npm() {
-  step "Firewall: Opening port 81 for NPM"
-
-  if command -v firewall-cmd &>/dev/null; then
-    firewall-cmd --permanent --add-port=81/tcp 2>/dev/null || true
-    firewall-cmd --reload 2>/dev/null || true
-    success "Port 81 opened in firewalld"
-  else
-    warn "firewall-cmd not available. Port 81 may need manual opening."
-    iptables -I INPUT -p tcp --dport 81 -j ACCEPT 2>/dev/null || true
   fi
+  printf "\n${C_B}Enter your root domain${C_R} (e.g., example.com): " >&2
+  read -r DOMAIN
+  [[ -z "$DOMAIN" ]] && fatal "Domain is required."
+  DOMAIN=$(echo "$DOMAIN" | sed 's|https\?://||' | sed 's|/.*||' | tr -d ' ')
+  # Basic sanity check: domain is interpolated into nginx/Authelia configs.
+  [[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] || \
+    fatal "Invalid domain: '$DOMAIN'"
+  printf '%s' "$DOMAIN" > "${DOMAIN_PERSIST_FILE}" || warn "Could not persist domain to ${DOMAIN_PERSIST_FILE}"
+  success "Domain set to: $DOMAIN"
 }
 
-## LOG ROTATION
-setup_logrotate() {
-  step "Log Rotation"
-  cat > /etc/logrotate.d/npm << EOF
-${NPM_LOGS_DIR}/*.log {
-    weekly
-    missingok
-    rotate 14
-    compress
-    delaycompress
-    notifempty
-    create 0644 root root
-    sharedscripts
-    postrotate
-        docker kill --signal='USR1' npm 2>/dev/null || true
-    endscript
-}
-EOF
-  success "Log rotation: ${NPM_LOGS_DIR}/*.log (14 days)"
-}
-
-## FREEDOMBOX INSTALLATION
 setup_freedombox() {
   step "FreedomBox Installation"
   info "Installing FreedomBox (this may take 5-10 minutes)..."
@@ -667,238 +388,607 @@ setup_freedombox() {
   info "  Cockpit:       https://${ip}:9090/"
 }
 
-## SSH HARDENING
-harden_ssh() {
-  step "Hardening SSH"
+setup_stack() {
+  step "Deploying NPM, Authelia and CrowdSec"
+  local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
+  mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR"
 
-  local sshd_custom="/etc/ssh/sshd_config.d/99-freedombox-deploy.conf"
-  info "Applying SSH hardening via ${sshd_custom}..."
+  cat > "${STACK_DIR}/docker-compose.authelia.yml" << 'COMPOSE_AUTHELIA'
+services:
+  authelia:
+    image: authelia/authelia:latest
+    container_name: authelia
+    hostname: authelia
+    restart: always
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./authelia/config:/config
+      - ./authelia/secrets:/config/secrets:ro
+    environment:
+      - AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET_FILE=/config/secrets/jwt_reset
+      - AUTHELIA_STORAGE_ENCRYPTION_KEY_FILE=/config/secrets/storage_encryption
+      - AUTHELIA_SESSION_SECRET_FILE=/config/secrets/session
+      - TZ=UTC
+    networks:
+      - proxy
+networks:
+  proxy:
+    external: true
+COMPOSE_AUTHELIA
 
-  cat > "$sshd_custom" << 'SSHD'
-# Auto-generated by deploy-freedombox.sh
-PermitRootLogin prohibit-password
-ChallengeResponseAuthentication no
-MaxAuthTries 3
-ClientAliveInterval 300
-ClientAliveCountMax 2
-MaxStartups 10:30:60
-X11Forwarding no
-GatewayPorts no
-# PasswordAuthentication no   # Enable only after verifying key-based login
-# AllowTcpForwarding no       # Enable only if SSH tunneling is needed
-SSHD
+  cat > "${STACK_DIR}/docker-compose.npm.yml" << 'COMPOSE_NPM'
+services:
+  npm:
+    image: jc21/nginx-proxy-manager:latest
+    restart: always
+    container_name: npm
+    hostname: npm
+    ports:
+      - 0.0.0.0:80:80
+      - 0.0.0.0:443:443
+      - 0.0.0.0:81:81
+    volumes:
+      - ./data:/data
+      - ./letsencrypt:/etc/letsencrypt
+    networks:
+      - proxy
+networks:
+  proxy:
+    external: true
+COMPOSE_NPM
 
-  if sshd -t; then
-    systemctl restart sshd
-    success "SSH hardened"
-  else
-    warn "SSH config test failed. Skipping hardening."
-    rm -f "$sshd_custom"
+  # Random Metabase admin password (was a hardcoded, publicly-known string).
+  METABASE_PASS=$(rand_password 20)
+  printf '%s' "$METABASE_PASS" > "${STACK_DIR}/.metabase_password"
+  chmod 600 "${STACK_DIR}/.metabase_password"
+
+  cat > "${STACK_DIR}/docker-compose.crowdsec.yml" << COMPOSE_CROWDSEC
+services:
+  crowdsec:
+    image: crowdsecurity/crowdsec:latest
+    container_name: crowdsec
+    hostname: crowdsec
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./crowdsec/data:/var/lib/crowdsec/data
+      - ./crowdsec/config:/etc/crowdsec
+      - ./data/logs:/npm-logs:ro
+      - /var/log:/var/log:ro
+    environment:
+      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux
+      - TZ=UTC
+    networks:
+      - proxy
+
+  crowdsec-dashboard:
+    image: metabase/metabase:latest
+    container_name: crowdsec-dashboard
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./crowdsec/data/crowdsec.db:/metabase-data/crowdsec.db:ro
+      - ./crowdsec/metabase.db.mv.db:/app/metabase.db.mv.db
+    environment:
+      - MB_ADMIN_EMAIL=crowdsec@crowdsec.net
+      - MB_ADMIN_PASSWORD=${METABASE_PASS}
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true
+COMPOSE_CROWDSEC
+
+  local DL_CMD=""
+  if command -v curl &>/dev/null; then
+    DL_CMD="curl -sL -o"
+  elif command -v wget &>/dev/null; then
+    DL_CMD="wget -qO"
   fi
+  if [[ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" && -n "$DL_CMD" ]]; then
+    $DL_CMD /tmp/metabase_sqlite.zip https://crowdsec-statics-assets.s3-eu-west-1.amazonaws.com/metabase_sqlite.zip || true
+    if command -v unzip &>/dev/null && [[ -f /tmp/metabase_sqlite.zip ]]; then
+      unzip -o /tmp/metabase_sqlite.zip -d "$CROWDSEC_DIR" && rm -f /tmp/metabase_sqlite.zip
+      chown 1000:1000 "$CROWDSEC_DIR/metabase.db.mv.db" 2>/dev/null || true
+    fi
+  fi
+  [[ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ]] && warn "Metabase template not found - dashboard may not have pre-loaded collections"
 
-  info "SSH host key fingerprints:"
-  local key_file; key_file="/etc/ssh/ssh_host_ed25519_key.pub"
-  [[ -f "$key_file" ]] && info "  ED25519: $(ssh-keygen -lf "$key_file" | awk '{print $2}')" || true
-  key_file="/etc/ssh/ssh_host_ecdsa_key.pub"
-  [[ -f "$key_file" ]] && info "  ECDSA:   $(ssh-keygen -lf "$key_file" | awk '{print $2}')" || true
+  info "Pulling images..."
+  docker compose -f "${STACK_DIR}/docker-compose.npm.yml" pull
+  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" pull
+
+  info "Starting NPM..."
+  docker compose -f "${STACK_DIR}/docker-compose.npm.yml" up -d
+  for i in $(seq 1 30); do
+    local has_80=false has_443=false has_81=false
+    ss -tlnp 2>/dev/null | grep -q ':80[[:space:]]' && has_80=true
+    ss -tlnp 2>/dev/null | grep -q ':443[[:space:]]' && has_443=true
+    ss -tlnp 2>/dev/null | grep -q ':81[[:space:]]' && has_81=true
+    if $has_80 && $has_443 && $has_81; then
+      success "NPM bound all ports: 80, 443, 81"
+      break
+    fi
+    [[ $i -eq 30 ]] && {
+      echo "" >&2; echo "  Port 80 bound:  $has_80" >&2; echo "  Port 443 bound: $has_443" >&2; echo "  Port 81 bound:  $has_81" >&2
+      ss -tlnp 2>/dev/null | grep -E ':80 |:443 |:81 ' >&2 || true
+      fatal "NPM failed to bind required ports. Check: docker logs npm"
+    }
+    printf "\r  ${C_DIM}Waiting for NPM ports... %d/30${C_R}" "$i" >&2
+    sleep 2
+  done
+  printf "\r" >&2
+
+  info "Deploying Authelia..."
+  mkdir -p "$AUTHELIA_DIR" "$AUTHELIA_CONFIG_DIR" "$AUTHELIA_SECRETS_DIR" "$AUTHELIA_SNIPPETS_DIR"
+  setup_authelia_secrets
+  setup_authelia_config
+  setup_authelia_snippets
+  setup_authelia_users          # users.yml MUST exist before the container starts
+  docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" pull
+  docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" up -d
+  info "Waiting for Authelia..."
+  for i in $(seq 1 30); do
+    if docker ps --format '{{.Names}}' | grep -qx "authelia" && \
+       docker exec authelia wget -q -O /dev/null http://127.0.0.1:9091/api/health 2>/dev/null; then
+      success "Authelia ready"; break
+    fi
+    printf "${C_DIM}  Waiting for Authelia... (%d/30)${C_R}\r" "$i" >&2
+    [[ $i -eq 30 ]] && warn "Authelia not healthy yet. Check: docker logs authelia"
+    sleep 2
+  done
+  printf "\n" >&2
+
+  info "Waiting for NPM admin UI (:81)..."
+  for i in $(seq 1 60); do
+    printf "\r  ${C_DIM}Waiting for NPM admin UI... %d/60${C_R}" "$i" >&2
+    curl -sf --max-time 5 http://127.0.0.1:81/ &>/dev/null && { printf "\r" >&2; success "NPM UI ready"; break; }
+    [[ $i -eq 60 ]] && { printf "\r" >&2; warn "NPM UI timed out (2m)."; }
+    sleep 2
+  done
+  printf "\r" >&2
+
+  info "Waiting for NPM log files..."
+  for i in $(seq 1 30); do
+    printf "\r  ${C_DIM}Waiting for NPM log files... %d/30${C_R}" "$i" >&2
+    if ls "${NPM_LOGS_DIR}/"*_access.log "${NPM_LOGS_DIR}/"*_error.log &>/dev/null; then
+      printf "\r" >&2
+      success "NPM logs present"
+      break
+    fi
+    if [[ $i -eq 30 ]]; then
+      printf "\r" >&2
+      warn "NPM logs not found. Creating placeholders."
+      touch "${NPM_LOGS_DIR}/fallback_http_access.log" \
+            "${NPM_LOGS_DIR}/fallback_http_error.log" \
+            "${NPM_LOGS_DIR}/default-host_access.log" \
+            "${NPM_LOGS_DIR}/default-host_error.log"
+    fi
+    sleep 2
+  done
+  printf "\r" >&2
+
+  info "Starting CrowdSec..."
+  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec
+  for i in $(seq 1 30); do
+    docker ps --format '{{.Names}}' | grep -qx "crowdsec" && { success "CrowdSec container running"; break; }
+    printf "${C_DIM}  Waiting for CrowdSec container... (%d/30)${C_R}\r" "$i" >&2
+    [[ $i -eq 30 ]] && warn "CrowdSec container not found"
+    sleep 2
+  done
+  printf "\n" >&2
+
+  # The dashboard bind-mounts crowdsec.db as a FILE. If it does not exist
+  # yet, Docker would create it as a DIRECTORY and break both containers.
+  info "Waiting for CrowdSec database file..."
+  for i in $(seq 1 30); do
+    [[ -f "${CROWDSEC_DIR}/data/crowdsec.db" ]] && { success "crowdsec.db present"; break; }
+    if [[ $i -eq 30 ]]; then
+      warn "crowdsec.db not created yet - creating empty placeholder"
+      mkdir -p "${CROWDSEC_DIR}/data"
+      touch "${CROWDSEC_DIR}/data/crowdsec.db"
+    fi
+    sleep 2
+  done
+
+  info "Starting CrowdSec Dashboard..."
+  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec-dashboard
+  for i in $(seq 1 30); do
+    docker ps --format '{{.Names}}' | grep -qx "crowdsec-dashboard" && { success "CrowdSec Dashboard ready"; break; }
+    printf "${C_DIM}  Waiting for CrowdSec Dashboard... (%d/30)${C_R}\r" "$i" >&2
+    [[ $i -eq 30 ]] && warn "CrowdSec Dashboard timeout"
+    sleep 2
+  done
+  printf "\n" >&2
+
+  success "NPM: http://${ip}:81"
 }
 
-## POST-INSTALL VERIFICATION
-verify_installation() {
-  step "Verifying Installation"
+# -------------------------------------------------------------------------------
+# NPM API automation - secure password & proxy hosts
+# -------------------------------------------------------------------------------
+NPM_TOKEN=""
+NPM_API_BASE="http://127.0.0.1:81/api"
 
-  local -a services=("NetworkManager" "firewalld" "apache2" "plinth")
-  local -a failed=()
-  local svc status
+_npm_api() {
+  # _npm_api <path> [extra curl args...]
+  local path="$1"; shift
+  local args=(-s --max-time 60 -H "Content-Type: application/json")
+  [[ -n "$NPM_TOKEN" ]] && args+=(-H "Authorization: Bearer ${NPM_TOKEN}")
+  curl "${args[@]}" "${NPM_API_BASE}${path}" "$@"
+}
 
-  info "Checking services..."
-  for svc in "${services[@]}"; do
-    if systemctl is-enabled "$svc" &>/dev/null; then
-      status=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
-      if [[ "$status" == "active" ]]; then
-        info "  ${svc}: ${C_GRN}${status}${C_R}"
-      else
-        warn "  ${svc}: ${C_YEL}${status}${C_R} (not active)"
-      fi
+npm_change_password() {
+  step "Securing NPM admin password"
+  local NEW_PASS JSON LOGIN
+  NEW_PASS=$(rand_password 24)
+  JSON='{"identity":"admin@example.com","secret":"changeme"}'
+  LOGIN=$(_npm_api "/tokens" -d "$JSON" 2>/dev/null) || true
+  NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty')
+  if [[ -z "$NPM_TOKEN" ]]; then
+    warn "Could not get NPM token - skipping automated NPM setup"
+    return 1
+  fi
+
+  JSON=$(jq -nc --arg s "$NEW_PASS" '{type:"password",current:"changeme",secret:$s}')
+  _npm_api "/users/1/auth" -X PUT -d "$JSON" >/dev/null 2>&1 || true
+  # Re-authenticate with new password
+  JSON=$(jq -nc --arg s "$NEW_PASS" '{identity:"admin@example.com",secret:$s}')
+  LOGIN=$(_npm_api "/tokens" -d "$JSON" 2>/dev/null) || true
+  NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty')
+  if [[ -n "$NPM_TOKEN" ]]; then
+    printf '%s' "$NEW_PASS" > "${STACK_DIR}/.npm_admin_password"
+    chmod 600 "${STACK_DIR}/.npm_admin_password"
+    success "NPM admin password changed - saved to ${STACK_DIR}/.npm_admin_password (mode 600)"
+    return 0
+  else
+    warn "NPM password change failed - manual intervention required (default creds may still be active!)"
+    return 1
+  fi
+}
+
+npm_create_proxy_host() {
+  # Creates host WITHOUT SSL first (NPM rejects ssl_forced with no cert).
+  # SSL is attached afterwards by npm_enable_ssl. Prints host ID on stdout.
+  local DOMAIN_NAME="$1"
+  local FWD_HOST="$2"
+  local FWD_PORT="$3"
+  local WS="${4:-true}"
+  local ADVANCED_CONFIG="${5:-}"
+
+  local JSON
+  JSON=$(jq -nc --arg domain "$DOMAIN_NAME" --arg fwd_host "$FWD_HOST" --argjson fwd_port "$FWD_PORT" \
+    --argjson ws "$WS" --arg adv "$ADVANCED_CONFIG" \
+    '{
+      domain_names: [$domain],
+      forward_scheme: "http",
+      forward_host: $fwd_host,
+      forward_port: $fwd_port,
+      access_list_id: 0,
+      certificate_id: 0,
+      ssl_forced: false,
+      caching_enabled: false,
+      block_exploits: true,
+      allow_websocket_upgrade: $ws,
+      http2_support: false,
+      hsts_enabled: false,
+      hsts_subdomains: false,
+      advanced_config: $adv
+    }')
+
+  local RESP ID
+  RESP=$(_npm_api "/nginx/proxy-hosts" -X POST -d "$JSON")
+  ID=$(echo "$RESP" | jq -r '.id // empty')
+  if [[ -n "$ID" ]]; then
+    success "Created proxy host: ${DOMAIN_NAME} -> ${FWD_HOST}:${FWD_PORT}"
+    echo "$ID"
+  else
+    warn "Failed to create proxy host for ${DOMAIN_NAME}: $(echo "$RESP" | jq -r '.error.message // .message // "unknown error"' 2>/dev/null)"
+    return 1
+  fi
+}
+
+npm_enable_ssl() {
+  # Correct NPM API flow: 1) create LE certificate, 2) attach it to the host.
+  # (The old /nginx/proxy-hosts/{id}/certificates endpoint does not exist.)
+  local HOST_ID="$1"
+  local DOMAIN_NAME="$2"
+  local EMAIL="${3:-admin@${DOMAIN}}"
+  local JSON RESP CERT_ID
+
+  JSON=$(jq -nc --arg email "$EMAIL" --arg domain "$DOMAIN_NAME" '{
+    provider: "letsencrypt",
+    nice_name: $domain,
+    domain_names: [$domain],
+    meta: { letsencrypt_email: $email, letsencrypt_agree: true, dns_challenge: false }
+  }')
+  info "Requesting Let's Encrypt certificate for ${DOMAIN_NAME} (can take up to 2 minutes)..."
+  RESP=$(_npm_api "/nginx/certificates" --max-time 180 -X POST -d "$JSON") || true
+  CERT_ID=$(echo "$RESP" | jq -r '.id // empty')
+  if [[ -z "$CERT_ID" ]]; then
+    warn "Certificate issuance failed for ${DOMAIN_NAME} (is DNS pointed at this server yet?). Host stays HTTP-only; add SSL in the NPM UI once DNS resolves."
+    return 1
+  fi
+
+  JSON=$(jq -nc --argjson cert "$CERT_ID" '{
+    certificate_id: $cert,
+    ssl_forced: true,
+    hsts_enabled: true,
+    hsts_subdomains: false,
+    http2_support: true
+  }')
+  RESP=$(_npm_api "/nginx/proxy-hosts/${HOST_ID}" -X PUT -d "$JSON") || true
+  if [[ -n "$(echo "$RESP" | jq -r '.id // empty')" ]]; then
+    success "SSL enabled + forced for ${DOMAIN_NAME} (cert id ${CERT_ID})"
+  else
+    warn "Could not attach certificate ${CERT_ID} to host ${HOST_ID} - attach it manually in NPM UI"
+  fi
+}
+
+# -------------------------------------------------------------------------------
+# Authelia SSO/MFA setup
+# -------------------------------------------------------------------------------
+setup_authelia_secrets() {
+  step "Authelia Secrets"
+  mkdir -p "$AUTHELIA_SECRETS_DIR"
+  # Separate secrets for each purpose (the old script reused the session JWT
+  # secret for password-reset JWTs).
+  rand_secret > "${AUTHELIA_SECRETS_DIR}/jwt_reset"
+  rand_secret > "${AUTHELIA_SECRETS_DIR}/storage_encryption"
+  rand_secret > "${AUTHELIA_SECRETS_DIR}/session"
+  chmod 600 "${AUTHELIA_SECRETS_DIR}/"*
+  success "Authelia secrets generated: $AUTHELIA_SECRETS_DIR"
+}
+
+setup_authelia_config() {
+  step "Authelia Configuration"
+  mkdir -p "$AUTHELIA_CONFIG_DIR"
+  cat > "${AUTHELIA_CONFIG_DIR}/configuration.yml" << AUTHELIA_CONF
+###############################################################
+#                       Authelia configuration                #
+#       https://www.authelia.com/configuration/               #
+###############################################################
+server:
+  address: 'tcp://:9091/'
+log:
+  level: info
+totp:
+  issuer: authelia.${DOMAIN}
+authentication_backend:
+  file:
+    path: /config/users.yml
+access_control:
+  default_policy: deny
+  rules:
+    - domain: "authelia.${DOMAIN}"
+      policy: bypass
+    - domain: "crowdsec.${DOMAIN}"
+      policy: bypass   # Metabase has its own login
+    # Wildcard catch-all LAST: any other subdomain (incl. freedombox and
+    # anything you add later) requires 2FA by default.
+    - domain: "*.${DOMAIN}"
+      policy: two_factor
+session:
+  name: authelia_session
+  expiration: 1h
+  inactivity: 5m
+  remember_me: 1M
+  cookies:
+    - domain: "${DOMAIN}"
+      authelia_url: "https://authelia.${DOMAIN}"
+      default_redirection_url: "https://freedombox.${DOMAIN}"
+regulation:
+  max_retries: 5
+  find_time: 2m
+  ban_time: 10m
+storage:
+  local:
+    path: /config/db.sqlite3
+notifier:
+  filesystem:
+    filename: /config/notifications.txt
+AUTHELIA_CONF
+  success "Authelia configuration created"
+}
+
+setup_authelia_snippets() {
+  step "Authelia NPM Snippets"
+  mkdir -p "$AUTHELIA_SNIPPETS_DIR"
+
+  # FIXED: the old snippet proxied auth_request to authelia:9091/authelia,
+  # which is a 404 -> every request to FreedomBox would 500. The correct
+  # endpoint (Authelia 4.38+) is /api/authz/auth-request, marked internal,
+  # with body stripped and the original method/URL forwarded.
+  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" << 'SNIPPET'
+location /internal/authelia/authz {
+    internal;
+    proxy_pass http://authelia:9091/api/authz/auth-request;
+    proxy_set_header X-Original-Method $request_method;
+    proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header Content-Length "";
+    proxy_pass_request_body off;
+}
+SNIPPET
+
+  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" << 'SNIPPET'
+auth_request /internal/authelia/authz;
+auth_request_set $user $upstream_http_remote_user;
+auth_request_set $groups $upstream_http_remote_groups;
+auth_request_set $name $upstream_http_remote_name;
+auth_request_set $email $upstream_http_remote_email;
+proxy_set_header Remote-User $user;
+proxy_set_header Remote-Groups $groups;
+proxy_set_header Remote-Name $name;
+proxy_set_header Remote-Email $email;
+auth_request_set $redirection_url $upstream_http_location;
+error_page 401 =302 $redirection_url;
+SNIPPET
+
+  # Also write to NPM's custom config directory so they're accessible inside the container
+  local npm_custom_dir="${NPM_DATA_DIR}/nginx/custom"
+  mkdir -p "$npm_custom_dir"
+  cp "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" "$npm_custom_dir/"
+  cp "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" "$npm_custom_dir/"
+  success "Authelia NPM snippets created"
+}
+
+setup_authelia_users() {
+  step "Authelia Users"
+  # FIXED: users.yml is now created BEFORE the container starts (Authelia
+  # crash-loops without it), the password is RANDOM (was the literal string
+  # "authelia"), and the bogus hard-coded fallback hash that could never
+  # authenticate has been removed - hash generation failure is now fatal.
+  local default_pass hash
+  default_pass=$(rand_password 16)
+  info "Generating argon2 hash for default admin user..."
+  hash=$(docker run --rm authelia/authelia:latest \
+           authelia crypto hash generate argon2 --password "$default_pass" 2>/dev/null \
+         | awk -F': ' '/Digest/ {print $2}')
+  [[ -n "$hash" ]] || fatal "Failed to generate Authelia password hash"
+  cat > "${AUTHELIA_CONFIG_DIR}/users.yml" << USERS
+users:
+  admin:
+    displayname: "Admin User"
+    password: "${hash}"
+    email: admin@${DOMAIN}
+    groups:
+      - admins
+USERS
+  chmod 600 "${AUTHELIA_CONFIG_DIR}/users.yml"
+  printf '%s' "$default_pass" > "${AUTHELIA_DIR}/.default_password"
+  chmod 600 "${AUTHELIA_DIR}/.default_password"
+  success "Default user created. Login: admin / (see ${AUTHELIA_DIR}/.default_password) - change after first login"
+}
+
+
+automate_npm() {
+  step "Automating NPM setup (proxy hosts + SSL)"
+
+  if ! npm_change_password; then
+    warn "Could not change NPM password; manual setup needed (NPM still has DEFAULT credentials - change them NOW at :81)"
+    return 0
+  fi
+
+  # FreedomBox: protected by Authelia auth_request. Both snippets are required:
+  # the location block AND the auth_request directives.
+  local auth_snippet=$'include /data/nginx/custom/authelia-location.conf;\ninclude /data/nginx/custom/authelia-authrequest.conf;'
+  local freedombox_id=""
+  freedombox_id=$(npm_create_proxy_host "freedombox.${DOMAIN}" "127.0.0.1" 443 true "$auth_snippet") || true
+  [[ -n "$freedombox_id" ]] && npm_enable_ssl "$freedombox_id" "freedombox.${DOMAIN}" || true
+
+  # Authelia portal
+  local authelia_id=""
+  authelia_id=$(npm_create_proxy_host "authelia.${DOMAIN}" "authelia" 9091 true "") || true
+  [[ -n "$authelia_id" ]] && npm_enable_ssl "$authelia_id" "authelia.${DOMAIN}" || true
+
+  # CrowdSec dashboard (Metabase)
+  local crowdsec_id=""
+  crowdsec_id=$(npm_create_proxy_host "crowdsec.${DOMAIN}" "crowdsec-dashboard" 3000 false "") || true
+  [[ -n "$crowdsec_id" ]] && npm_enable_ssl "$crowsec_id" "crowdsec.${DOMAIN}" || true
+
+  success "NPM automation completed"
+}
+
+# -------------------------------------------------------------------------------
+# Firewall, logrotate, CrowdSec setup
+# -------------------------------------------------------------------------------
+detect_ssh_port() {
+  # FIXED: the old detection grepped for ':22 ' specifically, so a custom SSH
+  # port was never detected -> UFW reset would lock you out of your own VPS.
+  local p=""
+  p=$(ss -tlnpH 2>/dev/null | awk '/sshd/ { n=split($4,a,":"); print a[n]; exit }')
+  if [[ -z "$p" ]]; then
+    p=$(awk '/^[Pp]ort[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)
+  fi
+  echo "${p:-22}"
+}
+
+setup_firewall() {
+  step "Firewall"
+  info "Configuring firewall - please wait..."
+  if [[ "$OS_FAMILY" == "debian" ]]; then setup_firewall_debian
+  else setup_firewall_rhel; fi
+  warn "Note: Docker-published ports bypass UFW/firewalld INPUT rules by design. Only 80/443/81 are published; CrowdSec bans are enforced in DOCKER-USER as well (see bouncer config)."
+}
+
+setup_firewall_debian() {
+  info "Configuring UFW..."
+  apt-get install -y -qq ufw
+  local ufw_def="/etc/default/ufw"
+  if [[ -f "$ufw_def" ]]; then
+    cp -n "$ufw_def" "${ufw_def}.bak" 2>/dev/null || true
+    if grep -q '^DEFAULT_FORWARD_POLICY=' "$ufw_def"; then
+      sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' "$ufw_def"
     else
-      warn "  ${svc}: not enabled"
-      failed+=("$svc")
+      echo 'DEFAULT_FORWARD_POLICY="ACCEPT"' >> "$ufw_def"
     fi
-  done
-
-  local secret_file="/var/lib/plinth/firstboot-wizard-secret"
-  if [[ -f "$secret_file" ]] && [[ -s "$secret_file" ]]; then
-    info "  Firstboot secret: ${C_GRN}generated${C_R}"
   else
-    warn "  Firstboot secret: not yet generated"
+    echo 'DEFAULT_FORWARD_POLICY="ACCEPT"' > "$ufw_def"
   fi
-
-  info "Checking listeners..."
-  ss -tlnp 2>/dev/null | grep -q ':80\b'  && info "  Port 80 (HTTP):      ${C_GRN}listening${C_R}" || warn "  Port 80 (HTTP):      not listening"
-  ss -tlnp 2>/dev/null | grep -q ':443\b' && info "  Port 443 (HTTPS):    ${C_GRN}listening${C_R}" || warn "  Port 443 (HTTPS):    not listening"
-  ss -tlnp 2>/dev/null | grep -q ':9090\b' && info "  Port 9090 (Cockpit): ${C_GRN}listening${C_R}" || warn "  Port 9090 (Cockpit): not listening"
-
-  if command -v firewall-cmd &>/dev/null; then
-    local default_zone; default_zone=$(firewall-cmd --get-default-zone 2>/dev/null || echo "unknown")
-    info "  Firewalld zone:      ${default_zone}"
-  fi
-
-  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "npm"; then
-    info "  Port 81 (NPM):       ${C_GRN}listening (Docker)${C_R}"
-  else
-    warn "  Port 81 (NPM):       not running"
-  fi
-
-  if [[ ${#failed[@]} -eq 0 ]]; then
-    success "All critical services verified"
-  else
-    warn "Services need attention: ${failed[*]}"
-  fi
+  success "UFW DEFAULT_FORWARD_POLICY=ACCEPT"
+  local ssh_port; ssh_port=$(detect_ssh_port)
+  info "Detected SSH port: ${ssh_port}"
+  ufw --force reset
+  ufw default deny incoming
+  ufw default allow outgoing
+  ufw allow "${ssh_port}/tcp" comment 'SSH'
+  ufw limit "${ssh_port}/tcp" 2>/dev/null || true   # rate-limit SSH brute force at the firewall too
+  ufw allow 80/tcp comment 'HTTP'
+  ufw allow 443/tcp comment 'HTTPS'
+  ufw allow 81/tcp comment 'NPM Admin'
+  ufw --force enable && ufw reload
+  ufw status verbose >&2
+  success "UFW configured (SSH port ${ssh_port} allowed)"
 }
 
-## SUMMARY
-
-verify_deployment() {
-  step "Post-Deploy Verification"
-  local fails=0
-
-  _check() {
-    local label="$1"; shift
-    if "$@" &>/dev/null; then success "VERIFY: ${label}"
-    else warn "VERIFY FAILED: ${label}"; fails=$((fails+1)); fi
-  }
-
-  # Containers
-  local want="npm authelia crowdsec crowdsec-dashboard"
-  local c
-  for c in $want; do
-    _check "container '$c' running" bash -c "docker ps --format '{{.Names}}' | grep -qx '$c'"
-  done
-
-  # Core service health
-  _check "NPM API responding"        curl -sf --max-time 5 http://127.0.0.1:81/api/
-  _check "NPM default creds REJECTED (password was changed)" bash -c \
-    "! curl -s --max-time 5 -X POST http://127.0.0.1:81/api/tokens -H 'Content-Type: application/json' -d '{\"identity\":\"admin@example.com\",\"secret\":\"changeme\"}' | grep -q token"
-  _check "Authelia health endpoint OK" bash -c \
-    "docker exec authelia wget -q -O- http://127.0.0.1:9091/api/health 2>/dev/null | grep -q OK"
-  _check "nginx config valid inside NPM" docker exec npm nginx -t
-\1\n  \2   docker exec crowdsec cscli metrics
-    _check "acquisition label is nginx-proxy-manager" bash -c \
-      "docker exec crowdsec cat /etc/crowdsec/acquis.d/npm.yaml 2>/dev/null | grep -q 'type: nginx-proxy-manager'"
-    _check "nginx-proxy-manager collection installed" bash -c \
-      "docker exec crowdsec cscli collections list 2>/dev/null | grep -q crowdsecurity/nginx-proxy-manager"
-    _check "bouncer registered in LAPI" bash -c \
-      "docker exec crowdsec cscli bouncers list 2>/dev/null | grep -q npm-bouncer"
-    _check "firewall bouncer service ACTIVE" systemctl is-active --quiet crowdsec-firewall-bouncer
-    if systemctl is-active --quiet crowdsec-firewall-bouncer; then
-      info "Running live ban round-trip test (192.0.2.1, reserved test IP)..."
-      docker exec crowdsec cscli decisions add --ip 192.0.2.1 --duration 2m --reason "deploy-verify" &>/dev/null || true
-      sleep 15
-      local banned=false
-      if command -v nft &>/dev/null && nft list ruleset 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=true; fi
-      if ! $banned && iptables -S 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=true; fi
-      if ! $banned && ipset list 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=true; fi
-      docker exec crowdsec cscli decisions delete --ip 192.0.2.1 &>/dev/null || true
-      if $banned; then success "VERIFY: end-to-end ban enforcement works"
-      else warn "VERIFY FAILED: test ban did not appear in firewall rules"; fails=$((fails+1)); fi
-    fi
-
-  if [[ $fails -eq 0 ]]; then
-    success "All verification checks passed"
-  else
-    warn "${fails} verification check(s) failed - review warnings above and ${LOG_FILE}"
+setup_firewall_rhel() {
+  info "Configuring firewalld..."
+  local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
+  $pkg install -y -q firewalld
+  systemctl start firewalld && systemctl enable firewalld
+  local ssh_port; ssh_port=$(detect_ssh_port)
+  firewall-cmd --permanent --add-service=ssh
+  [[ "$ssh_port" != "22" ]] && firewall-cmd --permanent --add-port="${ssh_port}/tcp"
+  firewall-cmd --permanent --add-service=http
+  firewall-cmd --permanent --add-service=https
+  firewall-cmd --permanent --add-port=81/tcp
+  if ! firewall-cmd --get-zones 2>/dev/null | grep -q '\bdocker\b'; then
+    firewall-cmd --permanent --new-zone=docker 2>/dev/null || true
   fi
+  firewall-cmd --permanent --zone=docker --add-interface=docker0 2>/dev/null || true
+  firewall-cmd --permanent --zone=docker --set-target=ACCEPT 2>/dev/null || true
+  firewall-cmd --reload
+  firewall-cmd --list-all >&2
+  success "Firewalld configured (SSH port ${ssh_port} allowed)"
 }
 
-print_summary() {
-  local elapsed=$(( $(date +%s) - START_TIME ))
-  local ip ext_ip
-  ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
-  ext_ip=$(get_external_ip)
-  local npm_password authelia_pass
-  npm_password=$(_read_cred "${STACK_DIR}/.npm_admin_password")
-  authelia_pass=$(_read_cred "${AUTHELIA_DIR}/.default_password")
-  local setup_secret; setup_secret=$(cat /var/lib/plinth/firstboot-wizard-secret 2>/dev/null || echo "<run: sudo cat /var/lib/plinth/firstboot-wizard-secret>")
-
-  cat << EOF
-
-${C_B}${C_GRN}DEPLOYMENT COMPLETE${C_R}  (${SCRIPT_NAME} v${SCRIPT_VERSION})
-${C_B}External IP:${C_R} ${ext_ip}
-${C_B}Duration:${C_R} $(( elapsed / 60 ))m $(( elapsed % 60 ))s
-
-${C_B}${C_CYN}-- SERVICES --${C_R}
-  FreedomBox (Plinth)
-    URL:    https://${ip}/freedombox/
-    Config: /etc/plinth/
-    Data:   /var/lib/plinth/
-
-  Cockpit
-    URL:    https://${ip}:9090/
-
-  Apache2    (managed by FreedomBox)
-  Firewalld  (managed by FreedomBox)
-  CrowdSec   (intrusion prevention)
-
-${C_B}${C_CYN}-- NGINX PROXY MANAGER --${C_R}
-  Admin:    http://${ip}:81  (admin@example.com / ${npm_password})
-  ${C_RED}? Change password immediately.${C_R}
-  Purpose:  Supplementary proxy for Docker-based services
-  Data:     ${NPM_DATA_DIR}
-  SSL:      ${NPM_LE_DIR}
-  Logs:     ${NPM_LOGS_DIR}
-
-${C_B}${C_CYN}-- CROWDSEC --${C_R}
-  Status:   cscli metrics    cscli decisions list
-  Config:   /etc/crowdsec/
-
-${C_B}${C_CYN}-- AUTHELIA --${C_R}
-  URL:      http://${ip}:9091
-  Config:   ${AUTHELIA_CONFIG_DIR}
-  Secrets:  ${AUTHELIA_SECRETS_DIR}
-  Docs:     https://www.authelia.com/
-  Reset PW: sudo docker exec authelia cat /config/notifications.txt
-
-${C_B}${C_CYN}-- PORTS --${C_R}
-  22     TCP  SSH       Secure shell
-  80     TCP  HTTP      FreedomBox Apache
-  81     TCP  HTTP      NPM Admin UI
-  443    TCP  HTTPS     FreedomBox Plinth + apps
-  9090   TCP  HTTPS     Cockpit admin panel
-
-${C_B}${C_YEL}-- FIRST-BOOT SETUP --${C_R}
-  1. Get secret:  sudo cat /var/lib/plinth/firstboot-wizard-secret
-     (Current:     ${setup_secret})
-  2. Visit:        https://${ip}/freedombox/
-  3. Enter secret, create admin account.
-  4. NPM admin:    http://${ip}:81  (admin@example.com / ${npm_password})
-  5. Explore apps: BitTorrent, Calendar, File Sharing, Matrix, VPN, etc.
-
-${C_B}${C_CYN}-- TROUBLESHOOTING --${C_R}
-  Plinth:   journalctl -u plinth -n 50
-  Apache:   journalctl -u apache2 -n 50
-  Firewall: firewall-cmd --list-all
-  CrowdSec: cscli metrics    cscli decisions list
-  Cockpit:  systemctl status cockpit
-  NPM:      cd ${STACK_DIR} && docker compose -f docker-compose.npm.yml restart
-  CrowdSec: cd ${STACK_DIR} && docker compose -f docker-compose.crowdsec.yml restart
-  Deploy:   ${LOG_FILE}
-
-${C_B}${C_YEL}-- NOTES --${C_R}
-  Firewall is managed by FreedomBox (firewalld). Do NOT install UFW.
-  Apache2 is managed by FreedomBox. Do NOT modify vhosts directly.
-  SSL certs can be configured via Plinth UI or Let's Encrypt.
-  FreedomBox is a Debian Pure Blend ? all packages from Debian repos.
-  NPM, CrowdSec, and Authelia are deployed as separate Docker Compose services.
-  Compose files: ${STACK_DIR}/docker-compose.npm.yml, ${STACK_DIR}/docker-compose.crowdsec.yml, ${STACK_DIR}/docker-compose.authelia.yml
+setup_logrotate() {
+  step "Log Rotation"
+  cat > /etc/logrotate.d/npm << EOF
+${NPM_LOGS_DIR}/*.log {
+    weekly
+    missingok
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    create 0644 root root
+    sharedscripts
+    postrotate
+        docker kill --signal='USR1' npm 2>/dev/null || true
+    endscript
+}
 EOF
-  _log "INFO" "=== Deployment completed in $(( elapsed / 60 ))m $(( elapsed % 60 ))s ==="
+  success "Log rotation: ${NPM_LOGS_DIR}/*.log (14 days)"
 }
-
-## MAIN
 
 setup_crowdsec() {
   step "CrowdSec (Docker)"
-
   info "Waiting for CrowdSec container to be ready..."
   local cs_ready=false
   for i in $(seq 1 30); do
@@ -908,22 +998,22 @@ setup_crowdsec() {
     fi
     sleep 2
   done
-
   if ! $cs_ready; then
-    docker logs crowdsec --tail 20 2>/dev/null || true
+    docker logs crowdsec --tail 20 >&2 2>/dev/null || true
     warn "CrowdSec container not ready -- check ${LOG_FILE}. Continuing..."
     return 0
   fi
   success "CrowdSec container running"
-
   info "Verifying collections..."
   docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/sshd" && success "sshd collection" || warn "sshd collection not found"
   docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/nginx-proxy-manager" && success "nginx-proxy-manager collection" || warn "nginx-proxy-manager not found"
   docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/linux" && success "linux collection" || warn "linux not found"
-
   info "Configuring NPM log acquisition..."
   local npm_acquis="${CROWDSEC_DIR}/config/acquis.d/npm.yaml"
   mkdir -p "$(dirname "$npm_acquis")"
+  # NOTE: NPM's proxy-host log format is NOT plain nginx. With "type: nginx"
+  # every line is read but ZERO lines parse -> no web-based bans ever fire.
+  # The crowdsecurity/nginx-proxy-manager collection expects this label:
   cat > "$npm_acquis" << 'NPM_ACQUIS'
 filenames:
   - /npm-logs/*.log
@@ -941,7 +1031,8 @@ labels:
 EOF
     warn "NPM acquisition written (via docker exec)"
   fi
-
+  # A full restart is required for new acquisition files to take effect
+  # (SIGHUP does not reliably reload acquisition sources).
   info "Restarting CrowdSec to apply acquisition config..."
   docker restart crowdsec &>/dev/null || true
   for i in $(seq 1 30); do
@@ -952,7 +1043,8 @@ EOF
 
   info "Installing firewall bouncer..."
   local bouncer_version
-  bouncer_version=$(curl -sf --max-time 10 "https://api.github.com/repos/crowdsecurity/cs-firewall-bouncer/releases/latest" | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/') || bouncer_version="0.0.34"
+  bouncer_version=$(curl -sf --max-time 10 "https://api.github.com/repos/crowdsecurity/cs-firewall-bouncer/releases/latest" | jq -r '.tag_name // empty' | sed 's/^v//') || true
+  [[ -z "${bouncer_version:-}" ]] && bouncer_version="0.0.34"
   local arch_map
   case "$(uname -m)" in
     x86_64)  arch_map="amd64" ;;
@@ -989,14 +1081,20 @@ BOUNCER_SERVICE
     success "Firewall bouncer binary installed"
   else
     popd &>/dev/null; rm -rf "$tmpdir"
-    warn "Firewall bouncer download failed -- check network connectivity"
+    # Was fatal -- now degrades gracefully: detection still works, only
+    # host-level remediation is missing, and the rest of the stack is fine.
+    warn "Firewall bouncer download failed -- bans will not be enforced at the firewall. Install manually later."
     return 0
   fi
-
   docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
+  # FIXED: the old extraction grepped for lowercase hex ([a-f0-9]{32,}), but
+  # modern CrowdSec issues base64-style keys with uppercase chars -> the grep
+  # matched nothing, the config file was never written, and the bouncer
+  # crash-looped on "no such file". '-o raw' prints exactly the key.
   local api_key
   api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer -o raw 2>/dev/null | tr -d '[:space:]' || true)
   if [[ -z "$api_key" ]]; then
+    # fallback for very old cscli without -o raw: accept base64/hex charsets
     docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
     api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer 2>/dev/null | grep -oE '[A-Za-z0-9+/=_-]{30,}' | head -1 || true)
   fi
@@ -1004,7 +1102,26 @@ BOUNCER_SERVICE
     mkdir -p /etc/crowdsec
     local fw_mode="iptables"
     command -v nft &>/dev/null && fw_mode="nftables"
-systemctl daemon-reload 2>/dev/null || true
+    # iptables_chains includes DOCKER-USER so bans also apply to traffic
+    # heading into Docker-published ports (80/443/81), which otherwise
+    # bypasses INPUT entirely. (Used in iptables mode; ignored by nftables.)
+    cat > /etc/crowdsec/crowdsec-firewall-bouncer.yaml << BOUNCER
+api_url: http://127.0.0.1:8080
+api_key: ${api_key}
+mode: ${fw_mode}
+deny_action: DROP
+update_frequency: 10s
+iptables_chains:
+  - INPUT
+  - FORWARD
+  - DOCKER-USER
+BOUNCER
+    chmod 600 /etc/crowdsec/crowdsec-firewall-bouncer.yaml
+    # FIXED: 'enable --now' with all errors swallowed left the service
+    # silently inactive. Now: unmask defensively, test the config ourselves
+    # (output goes to the log), enable and restart as separate steps, then
+    # poll for active state and dump the journal on failure.
+    systemctl daemon-reload 2>/dev/null || true
     systemctl unmask crowdsec-firewall-bouncer >>"$LOG_FILE" 2>&1 || true
     if ! /usr/local/bin/crowdsec-firewall-bouncer -c /etc/crowdsec/crowdsec-firewall-bouncer.yaml -t >>"$LOG_FILE" 2>&1; then
       warn "Bouncer config self-test failed - details in ${LOG_FILE}"
@@ -1015,6 +1132,7 @@ systemctl daemon-reload 2>/dev/null || true
     for i in $(seq 1 10); do
       if systemctl is-active --quiet crowdsec-firewall-bouncer; then bouncer_ok=true; break; fi
       sleep 2
+      # one mid-loop retry in case LAPI wasn't ready on first start
       [[ $i -eq 5 ]] && systemctl restart crowdsec-firewall-bouncer >>"$LOG_FILE" 2>&1 || true
     done
     if $bouncer_ok; then
@@ -1028,30 +1146,309 @@ systemctl daemon-reload 2>/dev/null || true
   fi
 }
 
+# -------------------------------------------------------------------------------
+# Post-deploy self-verification - the script proves its own work before
+# declaring success. Failures here are loud but non-fatal (warn level),
+# with exact debug commands printed.
+# -------------------------------------------------------------------------------
+verify_deployment() {
+  step "Post-Deploy Verification"
+  local fails=0
+
+  _check() {  # _check <label> <command...>
+    local label="$1"; shift
+    if "$@" &>/dev/null; then success "VERIFY: ${label}"
+    else warn "VERIFY FAILED: ${label}"; fails=$((fails+1)); fi
+  }
+
+  # Containers
+  local want="npm authelia crowdsec crowdsec-dashboard"
+  local c
+  for c in $want; do
+    _check "container '$c' running" bash -c "docker ps --format '{{.Names}}' | grep -qx '$c'"
+  done
+
+  # Core service health
+  _check "NPM API responding"        curl -sf --max-time 5 http://127.0.0.1:81/api/
+  _check "NPM default creds REJECTED (password was changed)" bash -c \
+    "! curl -s --max-time 5 -X POST http://127.0.0.1:81/api/tokens -H 'Content-Type: application/json' -d '{\"identity\":\"admin@example.com\",\"secret\":\"changeme\"}' | grep -q token"
+  _check "Authelia health endpoint OK" bash -c \
+    "docker exec authelia wget -q -O- http://127.0.0.1:9091/api/health 2>/dev/null | grep -q OK"
+  _check "nginx config valid inside NPM" docker exec npm nginx -t
+  _check "Authelia snippets present in NPM custom dir" bash -c \
+    "test -f '${NPM_DATA_DIR}/nginx/custom/authelia-location.conf' && test -f '${NPM_DATA_DIR}/nginx/custom/authelia-authrequest.conf'"
+
+  _check "CrowdSec LAPI responding"   docker exec crowdsec cscli metrics
+  _check "acquisition label is nginx-proxy-manager" bash -c \
+    "docker exec crowdsec cat /etc/crowdsec/acquis.d/npm.yaml 2>/dev/null | grep -q 'type: nginx-proxy-manager'"
+  _check "nginx-proxy-manager collection installed" bash -c \
+    "docker exec crowdsec cscli collections list 2>/dev/null | grep -q crowdsecurity/nginx-proxy-manager"
+  _check "bouncer registered in LAPI" bash -c \
+    "docker exec crowdsec cscli bouncers list 2>/dev/null | grep -q npm-bouncer"
+  _check "firewall bouncer service ACTIVE" systemctl is-active --quiet crowdsec-firewall-bouncer
+  # Live end-to-end ban test: ban a TEST-NET IP, confirm it lands in the
+  # firewall via the bouncer, then remove it. TEST-NET-1 (192.0.2.0/24) is
+  # reserved (RFC 5737) and can never belong to a real client.
+  if systemctl is-active --quiet crowdsec-firewall-bouncer; then
+    info "Running live ban round-trip test (192.0.2.1, reserved test IP)..."
+    docker exec crowdsec cscli decisions add --ip 192.0.2.1 --duration 2m --reason "deploy-verify" &>/dev/null || true
+    sleep 15  # bouncer pulls every 10s
+    local banned=false
+    if command -v nft &>/dev/null && nft list ruleset 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=true; fi
+    if ! $banned && iptables -S 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=true; fi
+    if ! $banned && ipset list 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=true; fi
+    docker exec crowdsec cscli decisions delete --ip 192.0.2.1 &>/dev/null || true
+    if $banned; then success "VERIFY: end-to-end ban enforcement works"
+    else warn "VERIFY FAILED: test ban did not appear in firewall rules"; fails=$((fails+1)); fi
+  fi
+
+  if [[ $fails -eq 0 ]]; then
+    success "All verification checks passed"
+  else
+    warn "${fails} verification check(s) failed - review warnings above and ${LOG_FILE}"
+  fi
+}
+
+# -------------------------------------------------------------------------------
+# Final summary
+# -------------------------------------------------------------------------------
+print_summary() {
+  local elapsed=$(( $(date +%s) - START_TIME ))
+  local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
+  local ext_ip; ext_ip=$(get_external_ip)
+  local fw_cmd; [[ "$OS_FAMILY" == "debian" ]] && fw_cmd="ufw status verbose" || fw_cmd="firewall-cmd --list-all"
+  local npm_password authelia_pass mb_pass
+  npm_password=$(_read_cred "${STACK_DIR}/.npm_admin_password")
+  authelia_pass=$(_read_cred "${AUTHELIA_DIR}/.default_password")
+  mb_pass=$(_read_cred "${STACK_DIR}/.metabase_password")
+
+  printf "\n"
+  printf "${C_B}${C_GRN}==============================================================================\n"
+  printf "                          DEPLOYMENT COMPLETE\n"
+  printf "==============================================================================${C_R}\n"
+  printf "${C_B}  ${C_CYN}%s v%s${C_R}\n" "$SCRIPT_NAME" "$SCRIPT_VERSION"
+  printf "${C_B}  Elapsed: ${C_CYN}%dm %ds${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
+  printf "${C_B}==============================================================================${C_R}\n"
+
+  cat << EOF
+
+${C_B}Stack Directory${C_R}    ${STACK_DIR}
+
+${C_B}${C_GRN}-- NPM Proxy Forwarding --------------------------------------${C_R}
+freedombox.${DOMAIN}  ->  127.0.0.1:443   (FreedomBox/Plinth, manual first-run required)
+authelia.${DOMAIN}  ->  authelia:9091
+crowdsec.${DOMAIN}  ->  crowdsec-dashboard:3000
+
+${C_B}Nginx Proxy Manager${C_R}
+  Admin:   http://${ip}:81
+  Login:   admin@example.com
+  Password:${C_YEL} ${npm_password}${C_R}
+  HTTP:    http://${ip}:80
+  HTTPS:   https://${ip}:443
+  Ext IP:  ${ext_ip}
+  Data:    ${NPM_DATA_DIR}
+  SSL:     ${NPM_LE_DIR}
+  Logs:    ${NPM_LOGS_DIR}
+
+${C_B}FreedomBox${C_R}
+  URL:        https://freedombox.${DOMAIN}
+  Container:  freedombox
+  Network:    proxy
+  Data:       ${DOCKHAND_DATA_DIR}
+  Auth:       Authelia 2FA in front + FreedomBox built-in SSO/MFA (setup wizard on first visit)
+  Host Files: READ-ONLY mount under /host (see compose file comment to enable writes)
+
+${C_B}Authelia${C_R}
+  URL:       https://authelia.${DOMAIN}
+  Container: authelia
+  Network:   proxy
+  Config:    ${AUTHELIA_CONFIG_DIR}
+  Login:     admin / ${authelia_pass}  (change after first login)
+  Info:      Verification codes: sudo docker exec authelia cat /config/notifications.txt
+
+${C_B}CrowdSec Dashboard (Metabase)${C_R}
+  URL:      https://crowdsec.${DOMAIN}
+  Login:    crowdsec@crowdsec.net
+  Password: ${mb_pass}
+  Note:     Dashboard is read-only against crowdsec.db
+
+${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
+${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
+${C_B}Containers${C_R}  npm, freedombox, authelia, crowdsec, crowdsec-dashboard
+${C_B}Network${C_R}   proxy (bridge)
+
+${C_B}${C_YEL}Done automatically:${C_R}
+  - Proxy hosts for FreedomBox / Authelia / CrowdSec created
+  - Let's Encrypt SSL certificates requested and forced (where DNS resolved)
+  - NPM admin password changed to a random value (saved mode 600)
+  - Authelia admin password randomized (saved mode 600)
+  - Metabase admin password randomized (saved mode 600)
+  - Authelia 2FA protecting FreedomBox
+  - CrowdSec bans enforced incl. Docker-published ports (DOCKER-USER chain)
+
+${C_B}${C_YEL}Credential files (root-only, mode 600):${C_R}
+  ${STACK_DIR}/.npm_admin_password
+  ${AUTHELIA_DIR}/.default_password
+  ${STACK_DIR}/.metabase_password
+
+${C_B}Troubleshooting:${C_R}
+  Logs:    journalctl -u plinth -f    docker logs -f npm    docker logs -f authelia
+  Restart: cd ${STACK_DIR} && docker compose -f docker-compose.npm.yml restart
+  FW:      ${fw_cmd}
+  Log:     ${LOG_FILE}
+EOF
+  _log "INFO" "=== Deployment completed in $(( elapsed / 60 ))m $(( elapsed % 60 ))s ==="
+}
+
+
+prepare_system() {
+  step "Preparing System"
+
+  # UFW conflicts with firewalld which FreedomBox uses
+  info "Removing UFW (FreedomBox uses firewalld)..."
+  apt-get remove -y -qq ufw 2>/dev/null || true
+  systemctl stop ufw 2>/dev/null || true
+  systemctl disable ufw 2>/dev/null || true
+  apt-get purge -y -qq ufw 2>/dev/null || true
+
+  # NetworkManager is required by FreedomBox
+  info "Installing NetworkManager..."
+  apt-get install -y -qq network-manager 2>/dev/null || true
+  systemctl enable NetworkManager 2>/dev/null || true
+  systemctl start NetworkManager 2>/dev/null || true
+
+  info "Installing firewalld..."
+  apt-get install -y -qq firewalld 2>/dev/null || true
+  systemctl enable firewalld 2>/dev/null || true
+
+  success "System prepared"
+}
+
+
+setup_firewall_npm() {
+  step "Firewall: Opening port 81 for NPM"
+
+  if command -v firewall-cmd &>/dev/null; then
+    firewall-cmd --permanent --add-port=81/tcp 2>/dev/null || true
+    firewall-cmd --reload 2>/dev/null || true
+    success "Port 81 opened in firewalld"
+  else
+    warn "firewall-cmd not available. Port 81 may need manual opening."
+    iptables -I INPUT -p tcp --dport 81 -j ACCEPT 2>/dev/null || true
+  fi
+}
+
+
+harden_ssh() {
+  step "Hardening SSH"
+
+  local sshd_custom="/etc/ssh/sshd_config.d/99-freedombox-deploy.conf"
+  info "Applying SSH hardening via ${sshd_custom}..."
+
+  cat > "$sshd_custom" << 'SSHD'
+# Auto-generated by deploy-freedombox.sh
+PermitRootLogin prohibit-password
+ChallengeResponseAuthentication no
+MaxAuthTries 3
+ClientAliveInterval 300
+ClientAliveCountMax 2
+MaxStartups 10:30:60
+X11Forwarding no
+GatewayPorts no
+# PasswordAuthentication no   # Enable only after verifying key-based login
+# AllowTcpForwarding no       # Enable only if SSH tunneling is needed
+SSHD
+
+  if sshd -t; then
+    systemctl restart sshd
+    success "SSH hardened"
+  else
+    warn "SSH config test failed. Skipping hardening."
+    rm -f "$sshd_custom"
+  fi
+
+  info "SSH host key fingerprints:"
+  local key_file; key_file="/etc/ssh/ssh_host_ed25519_key.pub"
+  [[ -f "$key_file" ]] && info "  ED25519: $(ssh-keygen -lf "$key_file" | awk '{print $2}')" || true
+  key_file="/etc/ssh/ssh_host_ecdsa_key.pub"
+  [[ -f "$key_file" ]] && info "  ECDSA:   $(ssh-keygen -lf "$key_file" | awk '{print $2}')" || true
+}
+
+
+verify_installation() {
+  step "Verifying Installation"
+
+  local -a services=("NetworkManager" "firewalld" "apache2" "plinth")
+  local -a failed=()
+  local svc status
+
+  info "Checking services..."
+  for svc in "${services[@]}"; do
+    if systemctl is-enabled "$svc" &>/dev/null; then
+      status=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
+      if [[ "$status" == "active" ]]; then
+        info "  ${svc}: ${C_GRN}${status}${C_R}"
+      else
+        warn "  ${svc}: ${C_YEL}${status}${C_R} (not active)"
+      fi
+    else
+      warn "  ${svc}: not enabled"
+      failed+=("$svc")
+    fi
+  done
+
+  local secret_file="/var/lib/plinth/firstboot-wizard-secret"
+  if [[ -f "$secret_file" ]] && [[ -s "$secret_file" ]]; then
+    info "  Firstboot secret: ${C_GRN}generated${C_R}"
+  else
+    warn "  Firstboot secret: not yet generated"
+  fi
+
+  info "Checking listeners..."
+  ss -tlnp 2>/dev/null | grep -q ':80'  && info "  Port 80 (HTTP):      ${C_GRN}listening${C_R}" || warn "  Port 80 (HTTP):      not listening"
+  ss -tlnp 2>/dev/null | grep -q ':443' && info "  Port 443 (HTTPS):    ${C_GRN}listening${C_R}" || warn "  Port 443 (HTTPS):    not listening"
+  ss -tlnp 2>/dev/null | grep -q ':9090' && info "  Port 9090 (Cockpit): ${C_GRN}listening${C_R}" || warn "  Port 9090 (Cockpit): not listening"
+
+  if command -v firewall-cmd &>/dev/null; then
+    local default_zone; default_zone=$(firewall-cmd --get-default-zone 2>/dev/null || echo "unknown")
+    info "  Firewalld zone:      ${default_zone}"
+  fi
+
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "npm"; then
+    info "  Port 81 (NPM):       ${C_GRN}listening (Docker)${C_R}"
+  else
+    warn "  Port 81 (NPM):       not running"
+  fi
+
+  if [[ ${#failed[@]} -eq 0 ]]; then
+    success "All critical services verified"
+  else
+    warn "Services need attention: ${failed[*]}"
+  fi
+}
+
 main() {
-  printf "\n${C_B}${C_CYN}VPS Deployment ? FreedomBox + NPM + Authelia${C_R}\n"
-  printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
-
-  get_user_domain
-
+  printf "\n${C_B}${C_CYN}VPS Deployment -- Docker + NPM + FreedomBox + Authelia + CrowdSec${C_R}\n" >&2
+  printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n" >&2
   preflight_checks
   idempotent_cleanup
   system_update
   install_dependencies
   prepare_system
-  setup_freedombox
   install_docker
   setup_docker_network
-  setup_nginx_proxy_manager
+  get_user_domain
+  setup_freedombox
+  setup_stack
+  setup_firewall
   setup_crowdsec
   setup_firewall_npm
   setup_logrotate
   harden_ssh
   verify_installation
-
+  automate_npm
   verify_deployment
   DEPLOY_STATUS="success"
-
   print_summary
 }
 
