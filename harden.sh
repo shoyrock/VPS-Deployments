@@ -406,9 +406,11 @@ lockdown_npm_admin() {
         for dcf in "$p"/docker-compose.npm.yml "$p"/docker-compose.npm.yaml "$p"/docker-compose.yml "$p"/docker-compose.yaml; do
             [[ -f "$dcf" ]] || continue
             found=1; backup_file "$dcf"
-            sed -i -E "s/([\"']?)0\.0\.0\.0:81:81\1/\1127.0.0.1:81:81\1/g" "$dcf" 2>/dev/null || true
-            sed -i -E "s/([\"']?)81:81\1/\1127.0.0.1:81:81\1/g" "$dcf" 2>/dev/null || true
-            sed -i '/port.*81:81/s/81:81/127.0.0.1:81:81/' "$dcf" 2>/dev/null || true
+            # Normalize any host prefix(es) off the 81:81 mapping (handles 0.0.0.0:,
+            # an already-applied 127.0.0.1:, or a doubled/corrupted prefix), then bind
+            # to loopback. Two idempotent passes — safe to re-run, never compounds.
+            sed -i -E 's#([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)+81:81#81:81#g' "$dcf" 2>/dev/null || true
+            sed -i -E 's#(^[[:space:]]*-[[:space:]]*"?)81:81#\1127.0.0.1:81:81#' "$dcf" 2>/dev/null || true
             info "Updated: $dcf"
             if command -v docker &>/dev/null; then
                 (cd "$p" && docker compose -f "$dcf" up -d >> "$LOGFILE" 2>&1) || \
@@ -568,8 +570,8 @@ verify_hardening() {
 
     # 2. Firewall
     if [[ "$OS_FAMILY" == "debian" ]]; then
-        _check "UFW rate limit SSH"  "ufw status 2>/dev/null | grep -q 'LIMIT.*22'"
-        _check "UFW rate limit HTTP" "ufw status 2>/dev/null | grep -q 'LIMIT.*80'"
+        _check "UFW rate limit SSH"  "ufw status 2>/dev/null | grep -qE '22/tcp .*LIMIT'"
+        _check "UFW rate limit HTTP" "ufw status 2>/dev/null | grep -qE '80/tcp .*LIMIT'"
     else
         _check "Firewalld rate limit" "firewall-cmd --list-all 2>/dev/null | grep -q 'rich rule'"
     fi
@@ -579,8 +581,8 @@ verify_hardening() {
     _check "GeoIP rule active"       "iptables -C INPUT -m set --match-set geoip_block src -j DROP 2>/dev/null || iptables -L GEOIP_BLOCK -n >/dev/null 2>&1"
 
     # 4. CrowdSec
-    _check "CrowdSec installed"      "command -v cscli >/dev/null 2>&1"
-    _check "CrowdSec running"        "systemctl is-active --quiet crowdsec 2>/dev/null"
+    _check "CrowdSec installed"      "command -v cscli >/dev/null 2>&1 || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx crowdsec"
+    _check "CrowdSec running"        "systemctl is-active --quiet crowdsec 2>/dev/null || docker ps --format '{{.Names}}' 2>/dev/null | grep -qx crowdsec"
     _check "CrowdSec bouncer"        "systemctl is-active --quiet crowdsec-firewall-bouncer 2>/dev/null"
 
     # 5. AIDE
@@ -602,7 +604,7 @@ verify_hardening() {
     _check "Docker daemon.json"      "[[ -f /etc/docker/daemon.json ]]"
 
     # 8b. SSH
-    _check "SSH root login key-only" "${SSHD_BIN:-$(command -v sshd 2>/dev/null || echo /usr/sbin/sshd)} -T 2>/dev/null | grep -qiE 'permitrootlogin (prohibit-password|without-password|no)'"
+    _check "SSH root login key-only" "${SSHD_BIN:-$(command -v sshd 2>/dev/null || echo /usr/sbin/sshd)} -T 2>/dev/null | grep -qiE 'permitrootlogin (prohibit-password|without-password|no)' || grep -rqiE '^[[:space:]]*PermitRootLogin[[:space:]]+(prohibit-password|without-password|no)' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null"
 
     # 9. Backups
     _check "Backup script exists"    "[[ -f /usr/local/bin/vps-backup ]]"
@@ -651,7 +653,7 @@ print_summary() {
     printf "${C_BLD}║    • Firewall rate limiting   • Docker log rotation                          ║${C_RST}\n"
     printf "${C_BLD}╠══════════════════════════════════════════════════════════════════════════════╣${C_RST}\n"
     printf "${C_BLD}║  ${C_RED}⚠️  IMPORTANT:${C_RST} NPM admin (port 81) now restricted to localhost.           ${C_BLD}║${C_RST}\n"
-    printf "${C_BLD}║     Access via SSH tunnel:  ssh -L 8080:localhost:81 user@${ext_ip}         ${C_BLD}║${C_RST}\n"
+    printf "${C_BLD}║     Tunnel:  ssh -L 8181:127.0.0.1:81 root@${ext_ip}  -> http://localhost:8181   ${C_BLD}║${C_RST}\n"
     printf "${C_BLD}╚══════════════════════════════════════════════════════════════════════════════╝${C_RST}\n"
     printf "\n"
     printf "  Log:     %s\n" "$LOGFILE"
