@@ -10,7 +10,7 @@ IFS=$'\n\t'
 
 readonly SCRIPT_VERSION="4.5.0-hardened"
 readonly SCRIPT_NAME="deploy-cosmos.sh"
-readonly START_TIME=$(date +%s)
+START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/cosmos-stack"
 readonly COSMOS_DATA_DIR="/opt/cosmos-stack/cosmos-data"
 readonly NPM_DATA_DIR="${STACK_DIR}/data"
@@ -40,15 +40,16 @@ fi
 
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
 _log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}" >> "$LOG_FILE" 2>/dev/null || true; }
-_read_cred() { [[ -f "$1" ]] && tr -d '\n' < "$1" 2>/dev/null || echo "<unknown>"; }
-info()    { printf "${C_BLU}?${C_R}  %s\n" "$*" >&2; _log "INFO" "$@"; }
-warn()    { printf "${C_YEL}?${C_R}  %s\n" "$*" >&2; _log "WARN" "$@"; }
-error()   { printf "${C_RED}?${C_R}  %s\n" "$*" >&2; _log "ERROR" "$@"; }
-success() { printf "${C_GRN}?${C_R}  %s\n" "$*" >&2; _log "SUCCESS" "$@"; }
+# NOTE: all UI helpers print to STDERR so that functions whose stdout is
+# captured via $(...) (e.g. npm_create_proxy_host) are not polluted.
+info()    { printf "${C_BLU}[i]${C_R}  %s\n" "$*" >&2; _log "INFO" "$@"; }
+warn()    { printf "${C_YEL}[!]${C_R}  %s\n" "$*" >&2; _log "WARN" "$@"; }
+error()   { printf "${C_RED}[x]${C_R}  %s\n" "$*" >&2; _log "ERROR" "$@"; }
+success() { printf "${C_GRN}[ok]${C_R} %s\n" "$*" >&2; _log "SUCCESS" "$@"; }
 fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; DEPLOY_STATUS="failed"; exit 1; }
 step()    { printf "\n${C_B}${C_CYN}-- %s --${C_R}\n" "$*" >&2; _log "STEP" "$@"; }
-
 rand_secret() {
+  # 32 bytes base64. Strong fallback via /dev/urandom (never date+sha256).
   openssl rand -base64 32 2>/dev/null || head -c 32 /dev/urandom | base64
 }
 rand_password() {
@@ -56,7 +57,6 @@ rand_password() {
   (openssl rand -base64 48 2>/dev/null || head -c 48 /dev/urandom | base64) \
     | tr -d '+/=\n' | head -c "$len"
 }
-
 detect_ssh_port() {
   local p=""
   p=$(ss -tlnpH 2>/dev/null | awk '/sshd/ { n=split($4,a,":"); print a[n]; exit }')
@@ -145,6 +145,8 @@ trap _on_exit EXIT
 
 preflight_checks() {
   step "Pre-flight Checks"
+  mkdir -p "$(dirname "$LOG_FILE")"
+  touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
   if [[ "${EUID:-0}" -ne 0 ]]; then fatal "Run as root (use sudo)."; fi
   success "Running as root"
 
@@ -193,8 +195,6 @@ preflight_checks() {
   local free_mb; free_mb=$(df -m / 2>/dev/null | awk 'NR==2 {print $4}' || echo "0")
   if [[ "$free_mb" -lt 2048 ]]; then warn "Low disk: ${free_mb}MB free (recommend >= 2048MB)."
   else success "Disk: $(( free_mb / 1024 ))GB free"; fi
-
-  mkdir -p "$(dirname "$LOG_FILE")"
   _log "INFO" "=== ${SCRIPT_NAME} v${SCRIPT_VERSION} started ==="
   _log "INFO" "OS: ${OS_NAME} ${OS_VERSION_ID}, Family: ${OS_FAMILY}, Arch: ${ARCH}"
 }
@@ -368,126 +368,87 @@ setup_authelia_secrets() {
       info "Secret '${secret_name}' already exists (preserved)"
     fi
   done
+  chown -R 1001:1001 "$AUTHELIA_SECRETS_DIR" 2>/dev/null || true
 }
 
 setup_authelia_config() {
   step "Authelia Configuration"
   mkdir -p "$AUTHELIA_CONFIG_DIR"
 
-  # -- configuration.yml (unquoted EOF for $DOMAIN substitution) --
   cat > "${AUTHELIA_CONFIG_DIR}/configuration.yml" << EOF
 server:
-  address: "tcp://0.0.0.0:9091"
-  endpoints:
-    authz:
-      auth-request:
-        implementation: "AuthRequest"
-
+  address: 'tcp://:9091/'
 log:
   level: info
-  format: text
-
 totp:
-  issuer: "authelia.${DOMAIN}"
-  period: 30
-  skew: 1
-
+  issuer: authelia.${DOMAIN}
 authentication_backend:
   file:
     path: /config/users.yml
-
 access_control:
-  default_policy: two_factor
+  default_policy: deny
   rules:
     - domain: "authelia.${DOMAIN}"
-      policy: one_factor
+      policy: bypass
+    - domain: "crowdsec.${DOMAIN}"
+      policy: bypass
+    - domain: "cosmos.${DOMAIN}"
+      policy: two_factor
     - domain: "*.${DOMAIN}"
       policy: two_factor   # wildcard protects ALL other subdomains
-
 session:
+  name: authelia_session
+  expiration: 1h
+  inactivity: 5m
+  remember_me: 1M
   cookies:
-    - name: authelia_session
-      domain: "${DOMAIN}"
+    - domain: "${DOMAIN}"
       authelia_url: "https://authelia.${DOMAIN}"
       default_redirection_url: "https://cosmos.${DOMAIN}"
-      same_site: lax
-      expiration: 1h
-      inactivity: 5m
-      remember_me: 1M
-
 regulation:
-  max_retries: 3
+  max_retries: 5
   find_time: 2m
-  ban_time: 1h
-
+  ban_time: 10m
 storage:
   local:
     path: /config/db.sqlite3
-
 notifier:
   filesystem:
     filename: /config/notifications.txt
 EOF
 
+  chown -R 1001:1001 "$AUTHELIA_CONFIG_DIR" 2>/dev/null || true
   info "users.yml will be created after authelia container starts"
 }
 
-create_nginx_snippets() {
-  step "Creating Nginx Snippets"
+setup_authelia_snippets() {
+  step "Authelia NPM Snippets"
   mkdir -p "$AUTHELIA_SNIPPETS_DIR"
 
-  # Ensure authelia can read config files (runs as non-root uid 1001 by default)
-  chmod 755 "${AUTHELIA_CONFIG_DIR}" "${AUTHELIA_SECRETS_DIR}" 2>/dev/null || true
-  chmod 644 "${AUTHELIA_CONFIG_DIR}"/*.yml "${AUTHELIA_CONFIG_DIR}"/*.txt 2>/dev/null || true
-  chmod 600 "${AUTHELIA_SECRETS_DIR}"/* 2>/dev/null || true
+  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" << 'SNIPPET'
+auth_request /internal/authelia/authz;
+auth_request_set $user $upstream_http_remote_user;
+auth_request_set $groups $upstream_http_remote_groups;
+auth_request_set $name $upstream_http_remote_name;
+auth_request_set $email $upstream_http_remote_email;
+proxy_set_header Remote-User $user;
+proxy_set_header Remote-Groups $groups;
+proxy_set_header Remote-Name $name;
+proxy_set_header Remote-Email $email;
+auth_request_set $redirection_url $upstream_http_location;
+error_page 401 =302 $redirection_url;
+SNIPPET
 
-  # -- proxy.conf --
-  cat > "${AUTHELIA_SNIPPETS_DIR}/proxy.conf" << 'PROXY'
-client_body_buffer_size 128k;
-proxy_next_upstream error timeout invalid_header http_500 http_502 http_503;
-proxy_set_header Host $host;
-proxy_set_header X-Real-IP $remote_addr;
-proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-proxy_set_header X-Forwarded-Proto $scheme;
-proxy_set_header X-Forwarded-Host $http_host;
-proxy_set_header X-Forwarded-Uri $request_uri;
-proxy_set_header X-Forwarded-Ssl on;
-proxy_redirect http:// $scheme://;
-proxy_http_version 1.1;
-proxy_set_header Connection "";
-proxy_cache_bypass $cookie_session;
-proxy_no_cache $cookie_session;
-proxy_buffers 4 32k;
-proxy_send_timeout 600s;
-proxy_read_timeout 600s;
-PROXY
-
-  # -- authelia-location.conf --
-  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" << SNIPPET
+  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" << 'SNIPPET1'
 location /internal/authelia/authz {
     internal;
     proxy_pass http://authelia:9091/api/authz/auth-request;
-    proxy_set_header X-Original-Method \$request_method;
-    proxy_set_header X-Original-URL \$scheme://\$http_host\$request_uri;
-    proxy_set_header X-Forwarded-For \$remote_addr;
+    proxy_set_header X-Original-Method $request_method;
+    proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+    proxy_set_header X-Forwarded-For $remote_addr;
     proxy_set_header Content-Length "";
     proxy_pass_request_body off;
 }
-SNIPPET
-
-  # -- authelia-authrequest.conf --
-  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" << SNIPPET1
-auth_request /internal/authelia/authz;
-auth_request_set \$user \$upstream_http_remote_user;
-auth_request_set \$groups \$upstream_http_remote_groups;
-auth_request_set \$name \$upstream_http_remote_name;
-auth_request_set \$email \$upstream_http_remote_email;
-proxy_set_header Remote-User \$user;
-proxy_set_header Remote-Groups \$groups;
-proxy_set_header Remote-Name \$name;
-proxy_set_header Remote-Email \$email;
-auth_request_set \$redirection_url \$upstream_http_location;
-error_page 401 =302 \$redirection_url;
 SNIPPET1
 
   # Also write to NPM's custom config directory so they're accessible inside the container
@@ -495,7 +456,7 @@ SNIPPET1
   mkdir -p "$npm_custom_dir"
   cp "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" "$npm_custom_dir/"
   cp "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" "$npm_custom_dir/"
-  success "Nginx snippets created in ${AUTHELIA_SNIPPETS_DIR}"
+  success "Authelia NPM snippets created"
 }
 
 setup_authelia_users() {
@@ -590,6 +551,11 @@ networks:
     external: true
 COMPOSE_AUTHELIA
 
+  # Random Metabase admin password (was a hardcoded, publicly-known string).
+  METABASE_PASS=$(rand_password 20)
+  printf '%s' "$METABASE_PASS" > "${STACK_DIR}/.metabase_password"
+  chmod 600 "${STACK_DIR}/.metabase_password"
+
   cat > "${STACK_DIR}/docker-compose.crowdsec.yml" << 'COMPOSE_CROWDSEC'
 services:
   crowdsec:
@@ -621,7 +587,7 @@ COMPOSE_CROWDSEC
       - ./crowdsec/metabase.db.mv.db:/app/metabase.db.mv.db
     environment:
       - MB_ADMIN_EMAIL=crowdsec@crowdsec.net
-      - MB_ADMIN_PASSWORD=!!Cr0wdS3c_M3t4b4s3??
+      - MB_ADMIN_PASSWORD=${METABASE_PASS}
     networks:
       - proxy
 DASHBOARD
@@ -840,10 +806,7 @@ verify_deployment() {
   _check "Authelia health endpoint OK" bash -c \
     "docker exec authelia wget -q -O- http://127.0.0.1:9091/api/health 2>/dev/null | grep -q OK"
   _check "nginx config valid inside NPM" docker exec npm nginx -t
-  _check "Authelia snippets present in NPM custom dir" bash -c \
-    "test -f '${NPM_DATA_DIR}/nginx/custom/authelia-location.conf' && test -f '${NPM_DATA_DIR}/nginx/custom/authelia-authrequest.conf'"
-
-    _check "CrowdSec LAPI responding"   docker exec crowdsec cscli metrics
+\1\n  \2   docker exec crowdsec cscli metrics
     _check "acquisition label is nginx-proxy-manager" bash -c \
       "docker exec crowdsec cat /etc/crowdsec/acquis.d/npm.yaml 2>/dev/null | grep -q 'type: nginx-proxy-manager'"
     _check "nginx-proxy-manager collection installed" bash -c \
@@ -1068,7 +1031,7 @@ setup_crowdsec() {
   if ! $cs_ready; then
     docker logs crowdsec --tail 20 2>/dev/null || true
     warn "CrowdSec container not ready -- check ${LOG_FILE}. Continuing..."
-    return
+    return 0
   fi
   success "CrowdSec container running"
 
@@ -1160,18 +1123,7 @@ BOUNCER_SERVICE
     mkdir -p /etc/crowdsec
     local fw_mode="iptables"
     command -v nft &>/dev/null && fw_mode="nftables"
-    cat > /etc/crowdsec/crowdsec-firewall-bouncer.yaml << BOUNCER
-api_url: http://127.0.0.1:8080
-api_key: ${api_key}
-mode: ${fw_mode}
-deny_action: DROP
-update_frequency: 10s
-iptables_chains:
-  - INPUT
-  - FORWARD
-  - DOCKER-USER
-BOUNCER
-    systemctl daemon-reload 2>/dev/null || true
+systemctl daemon-reload 2>/dev/null || true
     systemctl unmask crowdsec-firewall-bouncer >>"$LOG_FILE" 2>&1 || true
     if ! /usr/local/bin/crowdsec-firewall-bouncer -c /etc/crowdsec/crowdsec-firewall-bouncer.yaml -t >>"$LOG_FILE" 2>&1; then
       warn "Bouncer config self-test failed - details in ${LOG_FILE}"
@@ -1231,7 +1183,7 @@ main() {
   get_user_domain
   setup_authelia_secrets
   setup_authelia_config
-  create_nginx_snippets
+  setup_authelia_snippets
   setup_stack
   setup_authelia_users
   setup_firewall

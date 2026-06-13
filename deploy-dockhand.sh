@@ -884,32 +884,26 @@ automate_npm() {
   step "Automating NPM setup (proxy hosts + SSL)"
 
   if ! npm_change_password; then
-    warn "Could not change NPM password; continuing with manual setup needed"
-    return
+    warn "Could not change NPM password; manual setup needed (NPM still has DEFAULT credentials - change them NOW at :81)"
+    return 0
   fi
 
-  # Create proxy host for Dockhand
-  local dockhand_id
+  # Dockhand: protected by Authelia auth_request. Both snippets are required:
+  # the location block AND the auth_request directives.
   local auth_snippet=$'include /data/nginx/custom/authelia-location.conf;\ninclude /data/nginx/custom/authelia-authrequest.conf;'
-  dockhand_id=$(npm_create_proxy_host "dockhand.${DOMAIN}" "dockhand" 3000 true "$auth_snippet")
-  if [[ -n "$dockhand_id" ]]; then
-    npm_enable_ssl "$dockhand_id" "dockhand.${DOMAIN}"
-  fi
+  local dockhand_id=""
+  dockhand_id=$(npm_create_proxy_host "dockhand.${DOMAIN}" "dockhand" 3000 true "$auth_snippet") || true
+  [[ -n "$dockhand_id" ]] && npm_enable_ssl "$dockhand_id" "dockhand.${DOMAIN}" || true
 
-  # Create proxy host for Authelia
-  local authelia_id
-  authelia_id=$(npm_create_proxy_host "authelia.${DOMAIN}" "authelia" 9091 true "")
-  if [[ -n "$authelia_id" ]]; then
-    npm_enable_ssl "$authelia_id" "authelia.${DOMAIN}"
-  fi
+  # Authelia portal
+  local authelia_id=""
+  authelia_id=$(npm_create_proxy_host "authelia.${DOMAIN}" "authelia" 9091 true "") || true
+  [[ -n "$authelia_id" ]] && npm_enable_ssl "$authelia_id" "authelia.${DOMAIN}" || true
 
-  # Create proxy host for CrowdSec dashboard (partitio amd64 / Metabase arm64 ? same name+port)
-    local crowdsec_id
-    crowdsec_id=$(npm_create_proxy_host "crowdsec.${DOMAIN}" "crowdsec-dashboard" 3000 false "")
-    if [[ -n "$crowdsec_id" ]]; then
-      npm_enable_ssl "$crowdsec_id" "crowdsec.${DOMAIN}"
-    fi
-  fi
+  # CrowdSec dashboard (Metabase)
+  local crowdsec_id=""
+  crowdsec_id=$(npm_create_proxy_host "crowdsec.${DOMAIN}" "crowdsec-dashboard" 3000 false "") || true
+  [[ -n "$crowdsec_id" ]] && npm_enable_ssl "$crowdsec_id" "crowdsec.${DOMAIN}" || true
 
   success "NPM automation completed"
 }
@@ -1012,7 +1006,7 @@ setup_crowdsec() {
   if ! $cs_ready; then
     docker logs crowdsec --tail 20 2>/dev/null || true
     warn "CrowdSec container not ready -- check ${LOG_FILE}. Continuing..."
-    return
+    return 0
   fi
   success "CrowdSec container running"
   info "Verifying collections..."

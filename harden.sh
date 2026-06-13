@@ -11,8 +11,13 @@ IFS=$'\n\t'
 readonly LOGFILE="/var/log/harden.log"
 readonly BAKSUF=".harden-backup-$(date +%Y%m%d-%H%M%S)"
 readonly GEOIP_DIR="/usr/local/bin/geoip-block"
-readonly C_RST='\033[0m' C_BLD='\033[1m' C_GRN='\033[1;32m'
-readonly C_YLW='\033[1;33m' C_RED='\033[1;31m' C_BLU='\033[1;34m'
+# Colors (TTY only)
+if [[ -t 1 ]]; then
+  readonly C_RST='\033[0m' C_BLD='\033[1m' C_GRN='\033[1;32m'
+  readonly C_YLW='\033[1;33m' C_RED='\033[1;31m' C_BLU='\033[1;34m'
+else
+  readonly C_RST='' C_BLD='' C_GRN='' C_YLW='' C_RED='' C_BLU=''
+fi
 
 get_external_ip() {
   curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
@@ -64,13 +69,10 @@ preflight() {
     # Detect if deployment scripts have been run first
     # ---------------------------------------------------------------------------
     local deployed=false
-    [[ -d /opt/npm/data ]] && deployed=true
-    [[ -d /opt/portainer ]] && deployed=true
-    [[ -d /opt/dockge ]] && deployed=true
-    [[ -d /opt/coolify ]] && deployed=true
-    [[ -d /captain ]] && deployed=true
-    [[ -d /opt/stacks ]] && deployed=true
-    command -v docker &>/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -qE 'npm|portainer|dockge|coolify' && deployed=true
+    for d in /opt/dockhand-stack /opt/portainer-stack /opt/dockge-stack /opt/cosmos-stack /opt/coolify-stack /opt/dokploy-stack /opt/casaos-stack /opt/runtipi-stack /opt/yunohost-stack /opt/freedombox-stack; do
+        [[ -d "$d" ]] && deployed=true && break
+    done
+    command -v docker &>/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -qE 'npm|portainer|dockge|coolify|dockhand|cosmos|dokploy|casaos|runtipi|yunohost|freedombox' && deployed=true
 
     if [[ "$deployed" == false ]]; then
         echo ""
@@ -357,7 +359,7 @@ lockdown_npm_admin() {
     if grep -q '127\.0\.0\.1:81:81' "$dcf" 2>/dev/null; then
         info "NPM admin already locked to localhost"; return 0
     fi
-    local paths=(/opt/npm /root/npm /home/*/npm /opt/nginx-proxy-manager /opt/portainer-stack /opt/dockge-stack /opt/cosmos-stack)
+    local paths=(/opt/dockhand-stack /opt/portainer-stack /opt/dockge-stack /opt/cosmos-stack /opt/coolify-stack /opt/dokploy-stack /opt/casaos-stack /opt/runtipi-stack /opt/yunohost-stack /opt/freedombox-stack /opt/npm /root/npm /home/*/npm /opt/nginx-proxy-manager)
     local found=0
     for p in "${paths[@]}"; do
         for dcf in "$p"/docker-compose.npm.yml "$p"/docker-compose.npm.yaml "$p"/docker-compose.yml "$p"/docker-compose.yaml; do

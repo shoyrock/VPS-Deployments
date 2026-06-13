@@ -6,20 +6,22 @@ fi
 # deploy-runtipi.sh ? Docker + NPM + Runtipi + CrowdSec
 # v3.0.0-crowdsec | Usage: sudo ./deploy-runtipi.sh
 set -euo pipefail
+IFS=$'\n\t'
 
 readonly SCRIPT_VERSION="4.5.0-hardened"
 readonly SCRIPT_NAME="deploy-runtipi.sh"
-readonly START_TIME=$(date +%s)
+START_TIME=$(date +%s); readonly START_TIME
 readonly TIPI_DIR="/opt/runtipi"
-readonly NPM_DIR="/opt/npm"
-readonly NPM_DATA_DIR="${NPM_DIR}/data"
-readonly NPM_LE_DIR="${NPM_DIR}/letsencrypt"
+readonly STACK_DIR="/opt/runtipi-stack"
+readonly NPM_DATA_DIR="${STACK_DIR}/data"
+readonly NPM_LE_DIR="${STACK_DIR}/letsencrypt"
 readonly NPM_LOGS_DIR="${NPM_DATA_DIR}/logs"
-readonly CROWDSEC_DIR="${NPM_DIR}/crowdsec"
-readonly AUTHELIA_DIR="${NPM_DIR}/authelia"
+readonly CROWDSEC_DIR="${STACK_DIR}/crowdsec"
+readonly AUTHELIA_DIR="${STACK_DIR}/authelia"
 readonly AUTHELIA_CONFIG_DIR="${AUTHELIA_DIR}/config"
 readonly AUTHELIA_SECRETS_DIR="${AUTHELIA_DIR}/secrets"
 readonly AUTHELIA_SNIPPETS_DIR="${AUTHELIA_DIR}/snippets"
+readonly DOMAIN_PERSIST_FILE="/etc/vps-deploy-domain"
 readonly LOG_FILE="/var/log/vps-deploy.log"
 
 if [[ -t 1 ]]; then
@@ -29,8 +31,11 @@ else
   C_R=''; C_B=''; C_RED=''; C_GRN=''; C_YEL=''; C_BLU=''; C_CYN=''; C_DIM=''
 fi
 
+DOMAIN=""  # Set at runtime via user prompt
+
+# Deployment status tracking for guaranteed completion summary
 DEPLOY_STATUS="in_progress"
-DOMAIN=""
+
 get_external_ip() {
   curl -s -4 --max-time 10 https://api.ipify.org 2>/dev/null || \
   curl -s -4 --max-time 10 https://ifconfig.me 2>/dev/null || \
@@ -47,55 +52,70 @@ _on_exit() {
   local authelia_pass npm_pass
   authelia_pass=$(_read_cred "${AUTHELIA_DIR}/.default_password")
   npm_pass=$(_read_cred "${STACK_DIR}/.npm_admin_password")
-  if [[ -n "${DEPLOYED_SERVICES:-}" ]] || [[ "$DEPLOY_STATUS" != "in_progress" ]]; then
-    printf "\n"
-    if [[ "$DEPLOY_STATUS" == "success" ]]; then
-      printf "${C_B}${C_GRN}+------------------------------------------------------------------------------+${C_R}\n"
-      printf "${C_B}${C_GRN}?                     ?  DEPLOYMENT COMPLETED SUCCESSFULLY                       ?${C_R}\n"
-      printf "${C_B}${C_GRN}?------------------------------------------------------------------------------?${C_R}\n"
-    else
-      printf "${C_B}${C_RED}+------------------------------------------------------------------------------+${C_R}\n"
-      printf "${C_B}${C_RED}?                     ?  DEPLOYMENT DID NOT COMPLETE                           ?${C_R}\n"
-      printf "${C_B}${C_RED}?------------------------------------------------------------------------------?${C_R}\n"
-    fi
-    printf "${C_B}?  Elapsed:   ${C_CYN}%dm %ds${C_R}${C_B}                                                          ?${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
-    printf "${C_B}?  Internal:  ${C_CYN}%-16s${C_R}${C_B}                                                   ?${C_R}\n" "$ip"
-    printf "${C_B}?  External:  ${C_CYN}%-16s${C_R}${C_B}                                                   ?${C_R}\n" "$ext_ip"
-    printf "${C_B}?------------------------------------------------------------------------------?${C_R}\n"
-    printf "${C_B}?  ${C_YEL}NPM Admin${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}?${C_R}\n" "${ip}:81"
-    printf "${C_B}?  ${C_YEL}NPM Login${C_R}${C_B}:  admin@example.com / ${npm_pass}                                   ?${C_R}\n"
-    if [[ "$DEPLOY_STATUS" == "success" ]]; then
-      printf "${C_B}?  ${C_YEL}%s${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}?${C_R}\n" "Runtipi" "runtipi.${DOMAIN:-yourdomain.com} (via NPM)"
-    fi
-    printf "${C_B}?  ${C_YEL}%s${C_R}${C_B}:  http://${C_CYN}%-56s${C_R}${C_B}?${C_R}\n" "Authelia" "auth.${DOMAIN:-yourdomain.com} (via NPM)"
-    printf "${C_B}?  ${C_YEL}Authelia  ${C_R}${C_B}:  admin / authelia (CHANGE IMMEDIATELY!)                        ?${C_R}\n"
-    printf "${C_B}?  ${C_YEL}Verify    ${C_R}${C_B}:  sudo docker exec authelia cat /config/notifications.txt       ?${C_R}\n"
-    printf "${C_B}?  ${C_YEL}Ports    ${C_R}${C_B}:  ${C_CYN}80 (HTTP), 443 (HTTPS), 81 (NPM Admin)          ${C_R}${C_B}?${C_R}\n"
-    printf "${C_B}?------------------------------------------------------------------------------?${C_R}\n"
-    printf "${C_B}?  Log file: ${C_CYN}%-66s${C_R}${C_B}?${C_R}\n" "$LOG_FILE"
-    printf "${C_B}+------------------------------------------------------------------------------+${C_R}\n"
-    printf "\n"
-    if [[ "$DEPLOY_STATUS" == "success" ]]; then
-      printf "${C_B}${C_GRN}Your VPS is ready!${C_R} Configure DNS ? ${C_CYN}${ext_ip}${C_R} and set up NPM.\n\n"
-    else
-      printf "${C_B}${C_YEL}The deployment did not finish.${C_R} Check: ${C_CYN}cat %s${C_R}\n\n" "$LOG_FILE"
-    fi
+
+  printf "\n"
+  if [[ "$DEPLOY_STATUS" == "success" ]]; then
+    printf "${C_B}${C_GRN}+------------------------------------------------------------------------------+${C_R}\n"
+    printf "${C_B}${C_GRN}?                    ?  DEPLOYMENT COMPLETED SUCCESSFULLY                      ?${C_R}\n"
+    printf "${C_B}${C_GRN}?------------------------------------------------------------------------------?${C_R}\n"
+  else
+    printf "${C_B}${C_RED}+------------------------------------------------------------------------------+${C_R}\n"
+    printf "${C_B}${C_RED}?                     ?  DEPLOYMENT DID NOT COMPLETE                           ?${C_R}\n"
+    printf "${C_B}${C_RED}?------------------------------------------------------------------------------?${C_R}\n"
   fi
+  printf "${C_B}?  %-72s  ?${C_R}\n" "Elapsed:  ${elapsed}s"
+  printf "${C_B}?  %-72s  ?${C_R}\n" "VPS IP:   $ip"
+  printf "${C_B}?  %-72s  ?${C_R}\n" "External: $ext_ip"
+  printf "${C_B}?  %-72s  ?${C_R}\n" "Domain:   ${DOMAIN:-<not set>}"
+  printf "${C_B}?------------------------------------------------------------------------------?${C_R}\n"
+  printf "${C_B}?  %-72s  ?${C_R}\n" "NPM Admin:     http://${ip}:81"
+  printf "${C_B}?  %-72s  ?${C_R}\n" "NPM Login:     admin@example.com / ${npm_pass}"
+  if [[ "$DEPLOY_STATUS" == "success" ]]; then
+    printf "${C_B}?  %-72s  ?${C_R}\n" "Runtipi:       https://runtipi.${DOMAIN}"
+    printf "${C_B}?  %-72s  ?${C_R}\n" "Authelia:      https://authelia.${DOMAIN}"
+    printf "${C_B}?------------------------------------------------------------------------------?${C_R}\n"
+    printf "${C_B}?  %-72s  ?${C_R}\n" "NPM Proxy Forwarding:"
+    printf "${C_B}?  %-72s  ?${C_R}\n" "  runtipi.${DOMAIN}                -> tipi-reverse-proxy:80"
+    printf "${C_B}?  %-72s  ?${C_R}\n" "  authelia.${DOMAIN}               -> authelia:9091"
+    printf "${C_B}?  %-72s  ?${C_R}\n" ""
+    printf "${C_B}?  ${C_YEL}%-72s${C_R}${C_B}  ?${C_R}\n" "Authelia Username: admin"
+    printf "${C_B}?  ${C_YEL}%-72s${C_R}${C_B}  ?${C_R}\n" "Authelia Password: $authelia_pass"
+    printf "${C_B}?  ${C_RED}%-72s${C_R}${C_B}  ?${C_R}\n" "Change this password immediately after first login!"
+    printf "${C_B}?  %-72s  ?${C_R}\n" ""
+    printf "${C_B}?  ${C_YEL}%-72s${C_R}${C_B}  ?${C_R}\n" "-- Verification Codes --"
+    printf "${C_B}?  %-72s  ?${C_R}\n" "Authelia requires a code to change password or add 2FA."
+    printf "${C_B}?  %-72s  ?${C_R}\n" "The code appears AFTER you request it in the Authelia UI."
+    printf "${C_B}?  %-72s  ?${C_R}\n" "Then run:"
+    printf "${C_B}?  ${C_CYN}%-72s${C_R}${C_B}  ?${C_R}\n" "sudo docker exec authelia cat /config/notifications.txt"
+    printf "${C_B}?  %-72s  ?${C_R}\n" ""
+  fi
+  printf "${C_B}?  %-72s  ?${C_R}\n" "Ports: 80 (HTTP), 443 (HTTPS), 81 (NPM Admin)"
+  printf "${C_B}?------------------------------------------------------------------------------?${C_R}\n"
+  printf "${C_B}?  %-72s  ?${C_R}\n" "Log: $LOG_FILE"
+  printf "${C_B}+------------------------------------------------------------------------------+${C_R}\n"
+  printf "\n"
+  if [[ "$DEPLOY_STATUS" == "success" ]]; then
+    printf "${C_B}${C_GRN}Your VPS is ready!${C_R} DNS must point ${C_CYN}*.${DOMAIN} ? ${ext_ip}${C_R}\n\n"
+  else
+    printf "${C_B}${C_YEL}Deployment failed.${C_R} Check: ${C_CYN}cat $LOG_FILE${C_R}\n\n"
+  fi
+  _log "INFO" "=== Script exited (code $exit_code, status: $DEPLOY_STATUS, elapsed: ${elapsed}s) ===" 2>/dev/null || true
   exit $exit_code
 }
 trap _on_exit EXIT
 
 _ts() { date '+%Y-%m-%d %H:%M:%S'; }
 _log() { printf "[%s] [%-5s] %s\n" "$(_ts)" "$1" "${*:2}" >> "$LOG_FILE" 2>/dev/null || true; }
-_read_cred() { [[ -f "$1" ]] && tr -d '\n' < "$1" 2>/dev/null || echo "<unknown>"; }
-info()    { printf "${C_BLU}?${C_R}  %s\n" "$*" >&2; _log "INFO" "$@"; }
-warn()    { printf "${C_YEL}?${C_R}  %s\n" "$*" >&2; _log "WARN" "$@"; }
-error()   { printf "${C_RED}?${C_R}  %s\n" "$*" >&2; _log "ERROR" "$@"; }
-success() { printf "${C_GRN}?${C_R}  %s\n" "$*" >&2; _log "SUCCESS" "$@"; }
+# NOTE: all UI helpers print to STDERR so that functions whose stdout is
+# captured via $(...) (e.g. npm_create_proxy_host) are not polluted.
+info()    { printf "${C_BLU}[i]${C_R}  %s\n" "$*" >&2; _log "INFO" "$@"; }
+warn()    { printf "${C_YEL}[!]${C_R}  %s\n" "$*" >&2; _log "WARN" "$@"; }
+error()   { printf "${C_RED}[x]${C_R}  %s\n" "$*" >&2; _log "ERROR" "$@"; }
+success() { printf "${C_GRN}[ok]${C_R} %s\n" "$*" >&2; _log "SUCCESS" "$@"; }
 fatal()   { printf "${C_RED}${C_B}FATAL${C_R}${C_RED}: %s${C_R}\n" "$*" >&2; _log "FATAL" "$@"; DEPLOY_STATUS="failed"; exit 1; }
 step()    { printf "\n${C_B}${C_CYN}-- %s --${C_R}\n" "$*" >&2; _log "STEP" "$@"; }
-
 rand_secret() {
+  # 32 bytes base64. Strong fallback via /dev/urandom (never date+sha256).
   openssl rand -base64 32 2>/dev/null || head -c 32 /dev/urandom | base64
 }
 rand_password() {
@@ -103,7 +123,6 @@ rand_password() {
   (openssl rand -base64 48 2>/dev/null || head -c 48 /dev/urandom | base64) \
     | tr -d '+/=\n' | head -c "$len"
 }
-
 detect_ssh_port() {
   local p=""
   p=$(ss -tlnpH 2>/dev/null | awk '/sshd/ { n=split($4,a,":"); print a[n]; exit }')
@@ -115,6 +134,8 @@ detect_ssh_port() {
 
 preflight_checks() {
   step "Pre-flight Checks"
+  mkdir -p "$(dirname "$LOG_FILE")"
+  touch "$LOG_FILE" && chmod 600 "$LOG_FILE"
   [[ "${EUID:-0}" -ne 0 ]] && fatal "Must run as root (use sudo)."
   success "Running as root"
 
@@ -163,8 +184,6 @@ preflight_checks() {
 
   local free_mb; free_mb=$(df -m / | awk 'NR==2 {print $4}')
   [[ "$free_mb" -lt 2048 ]] && warn "Low disk: ${free_mb}MB free (recommend >= 2048MB)." || success "Disk: $(( free_mb / 1024 ))GB free"
-
-  mkdir -p "$(dirname "$LOG_FILE")"
   _log "INFO" "=== ${SCRIPT_NAME} v${SCRIPT_VERSION} started ==="
   _log "INFO" "OS: ${OS_NAME} ${OS_VERSION_ID}, Family: ${OS_FAMILY}, Arch: ${ARCH}"
 }
@@ -186,15 +205,10 @@ idempotent_cleanup() {
     docker ps -aq 2>/dev/null | xargs -r docker rm -f &>/dev/null || true
     docker volume ls -q 2>/dev/null | xargs -r docker volume rm -f &>/dev/null || true
   fi
-  if [[ "$OS_FAMILY" == "debian" ]]; then
-    dpkg -l 2>/dev/null | grep -E "docker|containerd|runc" | awk '{print $2}' | xargs -r apt-get remove -y -qq &>/dev/null || true
-    apt-get autoremove -y -qq &>/dev/null || true
-  else
-    yum remove -y -q docker-ce docker-ce-cli containerd.io 2>/dev/null || true
-  fi
+
   # Remove ALL previously deployed platform data directories
   info "Removing ALL previous platform data..."
-  for dir in /opt/npm /opt/casaos /var/lib/casaos /opt/casaos-stack /opt/coolify-stack /opt/cosmos-stack /opt/dockge-stack /opt/dokploy-stack /opt/portainer-stack /opt/runtipi-stack /opt/freedombox-stack /opt/yunohost-stack ~/runtipi; do
+  for dir in /opt/npm /opt/casaos /var/lib/casaos /opt/casaos-stack /opt/coolify-stack /opt/cosmos-stack /opt/dockge-stack /opt/dockhand-stack /opt/dokploy-stack /opt/portainer-stack /opt/runtipi-stack /opt/freedombox-stack /opt/yunohost-stack; do
     rm -rf "$dir" 2>/dev/null || true
   done
 
@@ -227,6 +241,10 @@ idempotent_cleanup() {
     snap disable docker 2>/dev/null || true
     snap remove docker 2>/dev/null || true
   fi
+
+  # Immediately recreate the stack directory after cleaning
+  mkdir -p "$STACK_DIR" "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR"
+  success "Stack directory recreated: $STACK_DIR"
 }
 
 system_update() {
@@ -287,9 +305,13 @@ install_docker() {
   fi
   systemctl start docker && systemctl enable docker
   systemctl is-active --quiet docker || fatal "Docker daemon failed. Check: journalctl -u docker -n 50"
-  info "Verifying Docker, please wait..."
-  for i in {1..3}; do docker run --rm hello-world &>/dev/null && break; printf "${C_DIM}  Verifying Docker... (%d/3)${C_R}\r" "$i"; sleep 5; done
-  printf "${C_GRN}?${C_R}  Docker verified\n"
+  info "Verifying Docker..."
+  for i in {1..3}; do
+    printf "\r  ${C_DIM}Verifying Docker... %d/3${C_R}" "$i"
+    docker run --rm hello-world &>/dev/null && { printf "\r"; break; }
+    [[ $i -eq 3 ]] && { printf "\r"; fatal "Docker verification failed after 3 attempts."; }
+    sleep 5
+  done
   docker compose version &>/dev/null && success "Docker $(docker version --format '{{.Server.Version}}') + Compose $(docker compose version --short)" || \
     success "Docker $(docker version --format '{{.Server.Version}}')"
 }
@@ -308,7 +330,7 @@ setup_nginx_proxy_manager() {
   step "Nginx Proxy Manager"
   mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR"
 
-  cat > "${NPM_DIR}/docker-compose.npm.yml" << 'COMPOSE_NPM'
+  cat > "${STACK_DIR}/docker-compose.npm.yml" << 'COMPOSE_NPM'
 services:
   npm:
     image: jc21/nginx-proxy-manager:latest
@@ -328,7 +350,7 @@ networks:
     external: true
 COMPOSE_NPM
 
-  cat > "${NPM_DIR}/docker-compose.authelia.yml" << 'COMPOSE_AUTHELIA'
+  cat > "${STACK_DIR}/docker-compose.authelia.yml" << 'COMPOSE_AUTHELIA'
 services:
   authelia:
     image: authelia/authelia:latest
@@ -351,7 +373,7 @@ networks:
     external: true
 COMPOSE_AUTHELIA
 
-  cat > "${NPM_DIR}/docker-compose.crowdsec.yml" << 'COMPOSE_CROWDSEC'
+  cat > "${STACK_DIR}/docker-compose.crowdsec.yml" << 'COMPOSE_CROWDSEC'
 services:
   crowdsec:
     image: crowdsecurity/crowdsec:latest
@@ -375,12 +397,12 @@ networks:
     external: true
 COMPOSE_CROWDSEC
 
-  docker compose -f "${NPM_DIR}/docker-compose.npm.yml" pull
-  docker compose -f "${NPM_DIR}/docker-compose.authelia.yml" pull
-  docker compose -f "${NPM_DIR}/docker-compose.crowdsec.yml" pull
+  docker compose -f "${STACK_DIR}/docker-compose.npm.yml" pull
+  docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" pull
+  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" pull
 
   info "Starting NPM..."
-  docker compose -f "${NPM_DIR}/docker-compose.npm.yml" up -d
+  docker compose -f "${STACK_DIR}/docker-compose.npm.yml" up -d
 
   info "Verifying NPM ports (80, 443, 81) are bound, please wait..."
   local ports_ok=false
@@ -439,7 +461,7 @@ COMPOSE_CROWDSEC
   setup_authelia_secrets
   setup_authelia_config
   setup_authelia_snippets
-  docker compose -f "${NPM_DIR}/docker-compose.authelia.yml" up -d
+  docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" up -d
   info "Waiting for Authelia..."
   for i in $(seq 1 30); do
     docker ps --format '{{.Names}}' | grep -qx "authelia" && { success "Authelia ready"; break; }
@@ -451,7 +473,7 @@ COMPOSE_CROWDSEC
   setup_authelia_users
 
   info "Starting CrowdSec..."
-  docker compose -f "${NPM_DIR}/docker-compose.crowdsec.yml" up -d
+  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d
 
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
   success "NPM deployed: http://${ip}:81"
@@ -460,11 +482,15 @@ COMPOSE_CROWDSEC
 setup_authelia_secrets() {
   step "Authelia Secrets"
   mkdir -p "$AUTHELIA_SECRETS_DIR"
-  [[ -f "${AUTHELIA_SECRETS_DIR}/jwt_reset" ]] || openssl rand -hex 64 > "${AUTHELIA_SECRETS_DIR}/jwt_reset"
-  [[ -f "${AUTHELIA_SECRETS_DIR}/storage_encryption" ]] || openssl rand -hex 64 > "${AUTHELIA_SECRETS_DIR}/storage_encryption"
-  [[ -f "${AUTHELIA_SECRETS_DIR}/session" ]] || openssl rand -hex 64 > "${AUTHELIA_SECRETS_DIR}/session"
+  local jwt_reset storage_encryption session
+  jwt_reset=$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")
+  storage_encryption=$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")
+  session=$(openssl rand -base64 32 2>/dev/null || echo "$(date +%s | sha256sum | base64 | head -c 44)")
+  printf '%s' "$jwt_reset" > "${AUTHELIA_SECRETS_DIR}/jwt_reset"
+  printf '%s' "$storage_encryption" > "${AUTHELIA_SECRETS_DIR}/storage_encryption"
+  printf '%s' "$session" > "${AUTHELIA_SECRETS_DIR}/session"
   chmod 600 "${AUTHELIA_SECRETS_DIR}"/*
-  success "Authelia secrets generated"
+  success "Authelia secrets generated: $AUTHELIA_SECRETS_DIR"
 }
 
 setup_authelia_config() {
@@ -495,7 +521,7 @@ session:
   cookies:
     - domain: "${DOMAIN}"
       authelia_url: "https://authelia.${DOMAIN}"
-      default_redirection_url: "https://authelia.${DOMAIN}"
+      default_redirection_url: "https://runtipi.${DOMAIN}"
 regulation:
   max_retries: 5
   find_time: 2m
@@ -689,10 +715,7 @@ verify_deployment() {
   _check "Authelia health endpoint OK" bash -c \
     "docker exec authelia wget -q -O- http://127.0.0.1:9091/api/health 2>/dev/null | grep -q OK"
   _check "nginx config valid inside NPM" docker exec npm nginx -t
-  _check "Authelia snippets present in NPM custom dir" bash -c \
-    "test -f '${NPM_DATA_DIR}/nginx/custom/authelia-location.conf' && test -f '${NPM_DATA_DIR}/nginx/custom/authelia-authrequest.conf'"
-
-    _check "CrowdSec LAPI responding"   docker exec crowdsec cscli metrics
+\1\n  \2   docker exec crowdsec cscli metrics
     _check "acquisition label is nginx-proxy-manager" bash -c \
       "docker exec crowdsec cat /etc/crowdsec/acquis.d/npm.yaml 2>/dev/null | grep -q 'type: nginx-proxy-manager'"
     _check "nginx-proxy-manager collection installed" bash -c \
@@ -819,8 +842,8 @@ ${C_B}${C_CYN}-- TROUBLESHOOTING --${C_R}
   Logs:       docker logs -f npm
               docker logs -f tipi-reverse-proxy
 ${C_B}Restart${C_R}
-  NPM:      cd ${NPM_DIR} && docker compose -f docker-compose.npm.yml restart
-  CrowdSec: cd ${NPM_DIR} && docker compose -f docker-compose.crowdsec.yml restart
+  NPM:      cd ${STACK_DIR} && docker compose -f docker-compose.npm.yml restart
+  CrowdSec: cd ${STACK_DIR} && docker compose -f docker-compose.crowdsec.yml restart
               cd ${TIPI_DIR} && ./runtipi-cli restart
   CrowdSec:   cscli metrics    cscli decisions list
   Firewall:   ${fw_cmd}
@@ -846,7 +869,7 @@ setup_crowdsec() {
   if ! $cs_ready; then
     docker logs crowdsec --tail 20 2>/dev/null || true
     warn "CrowdSec container not ready -- check ${LOG_FILE}. Continuing..."
-    return
+    return 0
   fi
   success "CrowdSec container running"
 
@@ -938,18 +961,7 @@ BOUNCER_SERVICE
     mkdir -p /etc/crowdsec
     local fw_mode="iptables"
     command -v nft &>/dev/null && fw_mode="nftables"
-    cat > /etc/crowdsec/crowdsec-firewall-bouncer.yaml << BOUNCER
-api_url: http://127.0.0.1:8080
-api_key: ${api_key}
-mode: ${fw_mode}
-deny_action: DROP
-update_frequency: 10s
-iptables_chains:
-  - INPUT
-  - FORWARD
-  - DOCKER-USER
-BOUNCER
-    systemctl daemon-reload 2>/dev/null || true
+systemctl daemon-reload 2>/dev/null || true
     systemctl unmask crowdsec-firewall-bouncer >>"$LOG_FILE" 2>&1 || true
     if ! /usr/local/bin/crowdsec-firewall-bouncer -c /etc/crowdsec/crowdsec-firewall-bouncer.yaml -t >>"$LOG_FILE" 2>&1; then
       warn "Bouncer config self-test failed - details in ${LOG_FILE}"
@@ -973,15 +985,31 @@ BOUNCER
   fi
 }
 
-main() {
-  printf "\n${C_B}${C_CYN}VPS Deployment ? Docker + NPM + Runtipi + CrowdSec + Authelia${C_R}\n"
-  printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
-
+get_user_domain() {
   step "Domain Configuration"
+  if [[ -f "${DOMAIN_PERSIST_FILE}" ]]; then
+    local existing_domain
+    existing_domain=$(tr -d '\n' < "${DOMAIN_PERSIST_FILE}" 2>/dev/null || true)
+    if [[ -n "$existing_domain" ]]; then
+      printf "\n${C_YEL}??  Previous deployment detected with domain: ${C_B}${existing_domain}${C_R}\n"
+      printf "${C_YEL}   Press ${C_B}Y${C_R}${C_YEL} + Enter to REUSE this domain${C_R}\n"
+      printf "${C_YEL}   Press ${C_B}N${C_R}${C_YEL} + Enter to enter a NEW domain${C_R}\n\n"
+      read -rp "Reuse '${existing_domain}'? [Y/n]: " use_existing
+      [[ "$use_existing" =~ ^[Nn]$ ]] || { DOMAIN="$existing_domain"; success "Domain set to: $DOMAIN"; return 0; }
+      printf "\n${C_CYN}Switching to new domain entry...${C_R}\n"
+    fi
+  fi
   printf "\n${C_B}Enter your root domain${C_R} (e.g., example.com): "
   read -r DOMAIN
-  [[ -z "$DOMAIN" ]] && DOMAIN="yourdomain.com"
+  [[ -z "$DOMAIN" ]] && fatal "Domain is required."
   DOMAIN=$(echo "$DOMAIN" | sed 's|https\?://||' | sed 's|/.*||' | tr -d ' ')
+  printf '%s' "$DOMAIN" > "${DOMAIN_PERSIST_FILE}" || warn "Could not persist domain to ${DOMAIN_PERSIST_FILE}"
+  success "Domain set to: $DOMAIN"
+}
+
+main() {
+  printf "\n${C_B}${C_CYN}VPS Deployment -- Docker + NPM + Runtipi + CrowdSec + Authelia${C_R}\n"
+  printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n"
 
   preflight_checks
   idempotent_cleanup
@@ -989,6 +1017,7 @@ main() {
   install_dependencies
   install_docker
   setup_docker_network
+  get_user_domain
   setup_runtipi
   setup_nginx_proxy_manager
   setup_crowdsec
