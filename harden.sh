@@ -219,7 +219,11 @@ harden_firewall() {
 harden_geoip() {
     info "=== Setting up GeoIP blocking ==="
     mkdir -p "$GEOIP_DIR"
-    command -v ipset &>/dev/null || { info "Installing ipset"; $PKG_INSTALL ipset >> "$LOGFILE" 2>&1 || warn "ipset install failed — GeoIP may not apply"; }
+    if ! command -v ipset &>/dev/null; then
+        info "Installing ipset"
+        [[ "$OS_FAMILY" == "debian" ]] && apt-get update -qq >> "$LOGFILE" 2>&1
+        $PKG_INSTALL ipset >> "$LOGFILE" 2>&1 || warn "ipset install failed — GeoIP will fall back to plain iptables (slower, still works)"
+    fi
     local c updated=0
     for c in cn ru kp ir; do
         curl -fsSL --max-time 30 "https://www.ipdeny.com/ipblocks/data/countries/${c}.zone" -o "${GEOIP_DIR}/${c}.zone" >> "$LOGFILE" 2>&1 && {
@@ -231,34 +235,46 @@ harden_geoip() {
 
     cat > "${GEOIP_DIR}/apply-geoip.sh" << 'GEOEOF'
 #!/usr/bin/env bash
-# Apply GeoIP DROP rules via ipset: one hash:net set + one iptables rule.
-# Far faster than thousands of individual -A rules. ipdeny.com zone files are
-# IPv4 CIDR lists, so this is IPv4/iptables only (no ip6tables — nothing to add).
-DIR="/usr/local/bin/geoip-block" SET="geoip_block" LOG="/var/log/harden.log"
+# Apply GeoIP DROP rules. Prefers ipset (one hash:net set + one rule = fast);
+# falls back to a plain iptables chain (one DROP per subnet) if ipset is missing,
+# so GeoIP is never silently skipped. ipdeny.com zones are IPv4 CIDR lists, so
+# this is IPv4/iptables only.
+DIR="/usr/local/bin/geoip-block" SET="geoip_block" CHAIN="GEOIP_BLOCK" LOG="/var/log/harden.log"
+COUNTRIES="cn ru kp ir"
 
-if ! command -v ipset &>/dev/null || ! command -v iptables &>/dev/null; then
-    echo "$(date '+%Y-%m-%d %H:%M:%S') GeoIP: ipset/iptables missing — skipping" >> "$LOG"
-    exit 0
+command -v iptables &>/dev/null || { echo "$(date '+%Y-%m-%d %H:%M:%S') GeoIP: iptables missing — skipping" >> "$LOG"; exit 0; }
+
+if command -v ipset &>/dev/null; then
+    # Fast path: load a temp set then atomically swap — no window where a country is unblocked.
+    ipset create "${SET}_tmp" hash:net -exist
+    ipset flush  "${SET}_tmp"
+    for c in $COUNTRIES; do
+        [[ -f "${DIR}/${c}.zone" ]] || continue
+        while IFS= read -r subnet; do
+            [[ -z "$subnet" || "$subnet" =~ ^# ]] && continue
+            ipset add "${SET}_tmp" "$subnet" -exist 2>/dev/null || true
+        done < "${DIR}/${c}.zone"
+    done
+    ipset create "$SET" hash:net -exist
+    ipset swap "${SET}_tmp" "$SET"
+    ipset destroy "${SET}_tmp" 2>/dev/null || true
+    iptables -C INPUT -m set --match-set "$SET" src -j DROP 2>/dev/null || \
+        iptables -I INPUT -m set --match-set "$SET" src -j DROP
+    echo "$(date '+%Y-%m-%d %H:%M:%S') GeoIP applied via ipset ($(ipset list "$SET" 2>/dev/null | grep -c '/') subnets)" >> "$LOG"
+else
+    # Fallback: dedicated iptables chain, one DROP per subnet (slower, larger ruleset).
+    iptables -N "$CHAIN" 2>/dev/null || iptables -F "$CHAIN"
+    iptables -C INPUT -j "$CHAIN" 2>/dev/null || iptables -I INPUT -j "$CHAIN"
+    n=0
+    for c in $COUNTRIES; do
+        [[ -f "${DIR}/${c}.zone" ]] || continue
+        while IFS= read -r subnet; do
+            [[ -z "$subnet" || "$subnet" =~ ^# ]] && continue
+            iptables -A "$CHAIN" -s "$subnet" -j DROP 2>/dev/null && n=$((n+1)) || true
+        done < "${DIR}/${c}.zone"
+    done
+    echo "$(date '+%Y-%m-%d %H:%M:%S') GeoIP applied via iptables fallback ($n rules; install ipset for efficiency)" >> "$LOG"
 fi
-
-# Load into a temp set, then atomically swap in — no window where a country is unblocked.
-ipset create "${SET}_tmp" hash:net -exist
-ipset flush  "${SET}_tmp"
-for c in cn ru kp ir; do
-    [[ -f "${DIR}/${c}.zone" ]] || continue
-    while IFS= read -r subnet; do
-        [[ -z "$subnet" || "$subnet" =~ ^# ]] && continue
-        ipset add "${SET}_tmp" "$subnet" -exist 2>/dev/null || true
-    done < "${DIR}/${c}.zone"
-done
-ipset create "$SET" hash:net -exist
-ipset swap "${SET}_tmp" "$SET"
-ipset destroy "${SET}_tmp" 2>/dev/null || true
-
-# Ensure exactly one INPUT rule referencing the set (idempotent).
-iptables -C INPUT -m set --match-set "$SET" src -j DROP 2>/dev/null || \
-    iptables -I INPUT -m set --match-set "$SET" src -j DROP
-echo "$(date '+%Y-%m-%d %H:%M:%S') GeoIP blocks applied ($(ipset list "$SET" 2>/dev/null | grep -c '/') subnets)" >> "$LOG"
 GEOEOF
     chmod +x "${GEOIP_DIR}/apply-geoip.sh"
     info "Applying GeoIP blocks (this may take a minute)..."
@@ -559,7 +575,7 @@ verify_hardening() {
 
     # 3. GeoIP
     _check "GeoIP zone files"        "[[ -f /usr/local/bin/geoip-block/cn.zone ]]"
-    _check "GeoIP ipset rule"        "iptables -C INPUT -m set --match-set geoip_block src -j DROP 2>/dev/null"
+    _check "GeoIP rule active"       "iptables -C INPUT -m set --match-set geoip_block src -j DROP 2>/dev/null || iptables -L GEOIP_BLOCK -n >/dev/null 2>&1"
 
     # 4. CrowdSec
     _check "CrowdSec installed"      "command -v cscli >/dev/null 2>&1"

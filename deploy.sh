@@ -187,14 +187,12 @@ run_tool() {
   printf "${C_CYN}> Downloading latest ${script_name}...${C_R}\n"
   if curl -fsSL -o "$tmp_script" "$url" 2>/dev/null; then
     chmod +x "$tmp_script"
-    if [[ -f "$local_script" ]] && diff -q "$tmp_script" "$local_script" >/dev/null 2>&1; then
-      printf "${C_GRN}+${C_R} ${script_name} is up to date\n"
-      rm -f "$tmp_script"
-    else
-      [[ -f "$local_script" ]] && printf "${C_YEL}!${C_R} Updating ${script_name} from GitHub\n"
-      [[ ! -f "$local_script" ]] && printf "${C_GRN}+${C_R} Downloaded ${script_name}\n"
-      mv -f "$tmp_script" "$local_script" 2>/dev/null || { cp -f "$tmp_script" "$local_script" && rm -f "$tmp_script"; }
-    fi
+    # Fresh GitHub copy ALWAYS wins: erase the local script and replace it, so a
+    # stale local file can never be reused. No diff / "up to date" shortcut.
+    rm -f "$local_script" 2>/dev/null || true
+    mv -f "$tmp_script" "$local_script" 2>/dev/null || { cp -f "$tmp_script" "$local_script"; rm -f "$tmp_script"; }
+    chmod +x "$local_script" 2>/dev/null || true
+    printf "${C_GRN}+${C_R} Fetched fresh ${script_name} from GitHub (replaced any local copy)\n"
     _run_script "$local_script"
   else
     # GitHub unreachable — fall back to local copy
