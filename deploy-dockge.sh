@@ -595,19 +595,27 @@ npm_change_password() {
     return 1
   fi
 
+  # Persist the new password BEFORE applying it, so a flaky re-auth can never
+  # leave the account on a random password we did not record (= hard lockout of
+  # the NPM admin UI). If the change PUT fails, 'changeme' still works - recoverable.
+  printf '%s' "$NEW_PASS" > "${STACK_DIR}/.npm_admin_password"
+  chmod 600 "${STACK_DIR}/.npm_admin_password"
   JSON=$(jq -nc --arg s "$NEW_PASS" '{type:"password",current:"changeme",secret:$s}')
   _npm_api "/users/1/auth" -X PUT -d "$JSON" >/dev/null 2>&1 || true
-  # Re-authenticate with new password
-  JSON=$(jq -nc --arg s "$NEW_PASS" '{identity:"admin@example.com",secret:$s}')
-  LOGIN=$(_npm_api "/tokens" -d "$JSON" 2>/dev/null) || true
-  NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty')
+  # Re-authenticate with new password (retry: NPM can briefly 401 right after the change)
+  NPM_TOKEN=""
+  for _ in 1 2 3; do
+    JSON=$(jq -nc --arg s "$NEW_PASS" '{identity:"admin@example.com",secret:$s}')
+    LOGIN=$(_npm_api "/tokens" -d "$JSON" 2>/dev/null) || true
+    NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty')
+    [[ -n "$NPM_TOKEN" ]] && break
+    sleep 2
+  done
   if [[ -n "$NPM_TOKEN" ]]; then
-    printf '%s' "$NEW_PASS" > "${STACK_DIR}/.npm_admin_password"
-    chmod 600 "${STACK_DIR}/.npm_admin_password"
     success "NPM admin password changed - saved to ${STACK_DIR}/.npm_admin_password (mode 600)"
     return 0
   else
-    warn "NPM password change failed - manual intervention required (default creds may still be active!)"
+    warn "NPM password change sent but re-auth failed. Saved candidate to ${STACK_DIR}/.npm_admin_password; if it fails, 'changeme' may still be active."
     return 1
   fi
 }
@@ -849,6 +857,21 @@ register_dockge_stacks() {
   success "Compose files available in Dockge file browser: ${DOCKGE_DATA_DIR}"
 }
 
+npm_purge_proxy_hosts() {
+  # Reconcile NPM to the deploy's intended state: delete any pre-existing proxy
+  # hosts before creating ours, so a stale host (e.g. a "crowdsec" host from a
+  # previous tool install) can never linger after a redeploy. No-op on a clean box.
+  command -v jq &>/dev/null || return 0
+  local ids id n=0
+  ids=$(_npm_api "/nginx/proxy-hosts" 2>/dev/null | jq -r '.[]?.id // empty' 2>/dev/null) || true
+  for id in $ids; do
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+    _npm_api "/nginx/proxy-hosts/${id}" -X DELETE >/dev/null 2>&1 && n=$((n+1)) || true
+  done
+  [[ "$n" -gt 0 ]] && info "Removed ${n} pre-existing NPM proxy host(s) for a clean slate" || true
+  return 0
+}
+
 automate_npm() {
   step "Automating NPM setup (proxy hosts + SSL)"
 
@@ -856,6 +879,8 @@ automate_npm() {
     warn "Could not change NPM password; manual setup needed (NPM still has DEFAULT credentials - change them NOW at :81)"
     return 0
   fi
+
+  npm_purge_proxy_hosts
 
   # Dockge: protected by Authelia auth_request. Both snippets are required:
   # the location block AND the auth_request directives.
