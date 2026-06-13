@@ -33,7 +33,9 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script depl
 | `deploy-yunohost.sh` | NPM + YunoHost + Authelia + CrowdSec | `/opt/yunohost-stack/` | Debian server distro (Debian 12 only) |
 | `deploy-freedombox.sh` | NPM + FreedomBox + Authelia + CrowdSec | `/opt/freedombox-stack/` | Debian home server (Debian 12 only) |
 
-**All scripts expose only 2 public ports: 80 (HTTP) and 443 (HTTPS).** The NPM admin panel (**81**) is bound to **`127.0.0.1` only** — it is *not* reachable from the internet and is accessed via an SSH tunnel (see [Accessing the NPM Admin Panel](#accessing-the-npm-admin-panel)). Individual tool containers have **no host ports** — they communicate internally via Docker's `proxy` network using their container hostnames.
+**All scripts expose only 3 ports: 80 (HTTP), 443 (HTTPS), 81 (NPM admin).** Individual tool containers have **no host ports** — they communicate internally via Docker's `proxy` network using their container hostnames.
+
+> **Note on port 81:** the NPM admin panel is published on `0.0.0.0:81` so you can reach it at `http://<vps-ip>:81` right after deploy to finish configuration. It is a public attack surface while open — once your proxy hosts are set up, run `harden.sh` (its `lockdown_npm_admin` step re-binds 81 to `127.0.0.1`, after which you reach it via SSH tunnel: `ssh -L 8181:127.0.0.1:81 root@<vps>` → `http://localhost:8181`).
 
 ---
 
@@ -77,10 +79,9 @@ Every script deploys the same core stack plus one platform:
 
 | Component | Container | Purpose |
 |-----------|-----------|---------|
-| **NPM** | `npm` | Reverse proxy on 80/443 (public) + admin UI on 127.0.0.1:81 (SSH tunnel only), Let's Encrypt SSL |
+| **NPM** | `npm` | Reverse proxy on 80/443/81, Let's Encrypt SSL |
 | **Authelia** | `authelia` | SSO login portal + TOTP 2FA on `authelia.YOURDOMAIN.com` |
-| **CrowdSec** | `crowdsec` | Log-based intrusion detection, SSH + NPM monitoring |
-| **CrowdSec Dashboard** | `crowdsec-dashboard` | Metabase dashboard on `crowdsec.YOURDOMAIN.com` |
+| **CrowdSec** | `crowdsec` | Log-based intrusion detection, SSH + NPM monitoring; enrolled in the CrowdSec Console (cloud) |
 | **Firewall Bouncer** | systemd service | IP ban enforcement via iptables/nftables |
 | **Your Platform** | varies | e.g. dockhand, portainer, dockge, etc. |
 
@@ -88,7 +89,7 @@ Every script deploys the same core stack plus one platform:
 
 For scripts with NPM API access, the following is done automatically:
 - NPM admin password changed to a random value
-- Proxy hosts created for platform, Authelia, and CrowdSec dashboard
+- Proxy hosts created for the platform and Authelia
 - Let's Encrypt SSL certificates requested and enforced
 - Authelia auth snippets applied to the platform proxy host
 
@@ -100,44 +101,43 @@ All credentials are **randomly generated**, stored with mode 600 under the stack
 |-----------|--------|
 | NPM admin | `STACK_DIR/.npm_admin_password` |
 | Authelia admin | `STACK_DIR/authelia/.default_password` |
-| Metabase (CrowdSec) | `STACK_DIR/.metabase_password` |
 
 ---
 
 ## Network Flow
 
 ```
-INTERNET → UFW/Firewalld → NPM (80/443 public) → Docker proxy network
+INTERNET → UFW/Firewalld → NPM (80/443/81) → Docker proxy network
                                                     │
-                    ┌───────────────────────────────┼───────────────────────┐
-                    │                               │                       │
-               dockhand:3000                  authelia:9091          crowdsec-dashboard:3000
-               (Authelia 2FA)                 (bypass - login)       (bypass - own auth)
+                    ┌───────────────────────────────┴───────────────┐
+                    │                                               │
+               <platform>:<port>                            authelia:9091
+               (Authelia 2FA)                               (bypass - login)
 
-  NPM admin UI :81  ──  bound to 127.0.0.1 only  ──  reach via SSH tunnel (localhost)
+  crowdsec (container)  →  reads NPM/SSH logs, enforces bans, enrolled in CrowdSec Console (cloud)
 ```
 
-**Only 2 public ports (80/443).** The admin UI on 81 is localhost-only. All containers communicate via the `proxy` Docker network. NPM is the single public entry point.
+**Only 3 ports exposed.** All containers communicate via the `proxy` Docker network. NPM is the single entry point.
 
 ---
 
 ## Accessing the NPM Admin Panel
 
-The NPM admin UI (port **81**) is bound to `127.0.0.1` and is **not exposed to the internet**. Reach it through an SSH tunnel from your local machine:
+The NPM admin UI is published on port **81**. After deploy, reach it at:
 
-```bash
-ssh -L 8181:127.0.0.1:81 root@<your-vps-ip>
+```
+http://<your-vps-ip>:81
 ```
 
-Leave that session open, then browse to **`http://localhost:8181`** locally. Log in with `admin@example.com` and the password stored in `STACK_DIR/.npm_admin_password`.
+Log in with `admin@example.com` and the password stored in `STACK_DIR/.npm_admin_password`. Use it to add/edit proxy hosts and SSL certs.
 
-> **Why localhost-only?** A publicly exposed admin panel is a standing attack surface. Binding to `127.0.0.1` means the panel is unreachable from the network even if a firewall rule is misconfigured — access requires SSH (key) access first. The deployment itself is unaffected: NPM's automation talks to the API over `127.0.0.1` internally.
+> **Note — port 81 is public.** While open, the admin panel is reachable from the internet and is a standing attack surface. Recommended: finish your proxy-host configuration, then run **`harden.sh`** — its `lockdown_npm_admin` step re-binds 81 to `127.0.0.1`. After that, reach the panel via SSH tunnel: `ssh -L 8181:127.0.0.1:81 root@<vps>` then `http://localhost:8181`. (Note: configuring your *apps* never needs port 81 — they're reached at their own subdomains through NPM.)
 
 ---
 
 ## Authelia 2FA — Protecting Every Subdomain
 
-Authelia is deployed with every script. By default, `authelia.YOURDOMAIN.com` is bypassed (you need to log in), `crowdsec.YOURDOMAIN.com` is bypassed (Metabase has its own login), and **every other subdomain** (`*.YOURDOMAIN.com`) requires 2FA.
+Authelia is deployed with every script. By default, `authelia.YOURDOMAIN.com` is bypassed (you need to log in), and **every other subdomain** (`*.YOURDOMAIN.com`) requires 2FA.
 
 ### Default Login
 
@@ -188,13 +188,20 @@ CrowdSec runs as a Docker container with three collections:
 
 The **firewall bouncer** runs as a systemd service and enforces bans in real time at the iptables/nftables level, including Docker-published ports via the `DOCKER-USER` chain.
 
-### Dashboard
+### Console (cloud)
 
-Access the read-only Metabase dashboard at `https://crowdsec.YOURDOMAIN.com`:
-| Field | Value |
-|-------|-------|
-| Login | `crowdsec@crowdsec.net` |
-| Password | Random — stored in `STACK_DIR/.metabase_password` (mode 600) |
+Each deploy enrolls the CrowdSec instance in the **CrowdSec Console** via `cscli console enroll --auto`. View alerts, decisions, and metrics at [app.crowdsec.net](https://app.crowdsec.net) — accept the pending enrollment there. If enrollment was skipped (LAPI not ready at deploy time), run:
+
+```bash
+docker exec crowdsec cscli console enroll --auto
+```
+
+Local CLI inspection is also available any time:
+
+```bash
+docker exec crowdsec cscli alerts list
+docker exec crowdsec cscli decisions list
+```
 
 ---
 
@@ -251,7 +258,6 @@ STACK_DIR/
 │   ├── secrets/
 │   └── snippets/
 ├── .npm_admin_password
-├── .metabase_password
 └── authelia/.default_password
 ```
 
@@ -283,7 +289,7 @@ STACK_DIR/
 |-------|-----|
 | Containers unreachable | `grep DEFAULT_FORWARD_POLICY /etc/default/ufw` — should be `ACCEPT` |
 | Containers unreachable after `harden.sh` | `sysctl net.ipv4.ip_forward` — **must be `1`** (Docker needs IP forwarding; fixed in harden.sh) |
-| Can't reach NPM admin (:81) | It's localhost-only by design — use the SSH tunnel: `ssh -L 8181:127.0.0.1:81 root@<vps>` then `http://localhost:8181` |
+| Can't reach NPM admin (:81) | Check `ss -tlnp \| grep ':81'`. If you ran `harden.sh`, 81 is now localhost-only — use the SSH tunnel: `ssh -L 8181:127.0.0.1:81 root@<vps>` then `http://localhost:8181` |
 | Port 80/443 conflict | `ss -tlnp \| grep ':80 '` — another service may still be bound |
 | New subdomain gets 403 | Verify the two include lines are in NPM's Advanced tab |
 | CrowdSec not catching | `docker exec crowdsec cscli metrics && docker exec crowdsec cscli decisions list` |

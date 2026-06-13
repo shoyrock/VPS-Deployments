@@ -97,11 +97,17 @@ _on_exit() {
   printf "${C_B}  External: %s${C_R}\n" "$ext_ip"
   printf "${C_B}  Domain:   %s${C_R}\n" "${DOMAIN:-<not set>}"
   printf "${C_B}------------------------------------------------------------------------------${C_R}\n"
-  printf "${C_B}  NPM Admin:  SSH tunnel: ssh -L 8181:127.0.0.1:81 root@%s then http://localhost:8181${C_R}\n" "$ip"
+  printf "${C_B}  NPM Admin:     http://%s:81${C_R}\n" "$ip"
   printf "${C_B}  NPM Login:     admin@example.com / %s${C_R}\n" "$npm_pass"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
     printf "${C_B}  FreedomBox:      https://freedombox.%s${C_R}\n" "$DOMAIN"
     printf "${C_B}  Authelia:      https://authelia.%s${C_R}\n" "$DOMAIN"
+    printf "${C_B}------------------------------------------------------------------------------${C_R}\n"
+    printf "${C_B}${C_YEL}  Containers (hostname = container name, via NPM proxy network):${C_R}\n"
+    printf "${C_B}    npm                  ->  ports 80, 443, 81 (admin)${C_R}\n"
+    printf "${C_B}    freedombox (native)  ->  127.0.0.1:443${C_R}\n"
+    printf "${C_B}    authelia             ->  port 9091${C_R}\n"
+    printf "${C_B}    crowdsec             ->  port 8080 (LAPI, localhost only)${C_R}\n"
     printf "${C_B}------------------------------------------------------------------------------${C_R}\n"
     printf "${C_B}  ${C_YEL}Authelia Username: admin${C_R}\n"
     printf "${C_B}  ${C_YEL}Authelia Password: %s${C_R}\n" "$authelia_pass"
@@ -114,7 +120,7 @@ _on_exit() {
     printf "\n"
     printf "${C_B}  All credentials are stored (mode 600) under: %s${C_R}\n" "$STACK_DIR"
   fi
-  printf "${C_B}  Ports: 80/443 public; 81 (NPM Admin) localhost-only (SSH tunnel)${C_R}\n"
+  printf "${C_B}  Ports: 80 (HTTP), 443 (HTTPS), 81 (NPM Admin)${C_R}\n"
   printf "${C_B}  Log: %s${C_R}\n" "$LOG_FILE"
   printf "${C_B}==============================================================================${C_R}\n\n"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
@@ -422,7 +428,7 @@ services:
     ports:
       - 0.0.0.0:80:80
       - 0.0.0.0:443:443
-      - 127.0.0.1:81:81
+      - 0.0.0.0:81:81
     volumes:
       - ./data:/data
       - ./letsencrypt:/etc/letsencrypt
@@ -547,7 +553,7 @@ COMPOSE_CROWDSEC
 
 
 
-  success "NPM admin bound to 127.0.0.1:81 (tunnel: ssh -L 8181:127.0.0.1:81 root@${ip})"
+  success "NPM: http://${ip}:81"
 }
 
 # -------------------------------------------------------------------------------
@@ -876,7 +882,7 @@ setup_firewall_debian() {
   ufw limit "${ssh_port}/tcp" 2>/dev/null || true   # rate-limit SSH brute force at the firewall too
   ufw allow 80/tcp comment 'HTTP'
   ufw allow 443/tcp comment 'HTTPS'
-  # NPM admin (81) is bound to 127.0.0.1 only -- reached via SSH tunnel, no public UFW rule
+  ufw allow 81/tcp comment 'NPM Admin'
   ufw --force enable && ufw reload
   ufw status verbose >&2
   success "UFW configured (SSH port ${ssh_port} allowed)"
@@ -892,7 +898,7 @@ setup_firewall_rhel() {
   [[ "$ssh_port" != "22" ]] && firewall-cmd --permanent --add-port="${ssh_port}/tcp"
   firewall-cmd --permanent --add-service=http
   firewall-cmd --permanent --add-service=https
-  # NPM admin (81) is bound to 127.0.0.1 only -- no public firewalld rule
+  firewall-cmd --permanent --add-port=81/tcp
   if ! firewall-cmd --get-zones 2>/dev/null | grep -q '\bdocker\b'; then
     firewall-cmd --permanent --new-zone=docker 2>/dev/null || true
   fi
@@ -1203,7 +1209,7 @@ freedombox.${DOMAIN}  ->  127.0.0.1:443   (FreedomBox/Plinth, manual first-run r
 authelia.${DOMAIN}  ->  authelia:9091
 
 ${C_B}Nginx Proxy Manager${C_R}
-  Admin:   http://localhost:8181  (tunnel: ssh -L 8181:127.0.0.1:81 root@${ip})
+  Admin:   http://${ip}:81
   Login:   admin@example.com
   Password:${C_YEL} ${npm_password}${C_R}
   HTTP:    http://${ip}:80
@@ -1288,10 +1294,16 @@ prepare_system() {
 
 
 setup_firewall_npm() {
-  step "Firewall: NPM admin (port 81)"
-  # NPM admin is published on 127.0.0.1:81 only -- not exposed to the network.
-  # Reach it via SSH tunnel: ssh -L 8181:127.0.0.1:81 root@<vps> then http://localhost:8181
-  success "NPM admin bound to 127.0.0.1:81 (SSH tunnel only -- no firewall rule needed)"
+  step "Firewall: Opening port 81 for NPM"
+
+  if command -v firewall-cmd &>/dev/null; then
+    firewall-cmd --permanent --add-port=81/tcp 2>/dev/null || true
+    firewall-cmd --reload 2>/dev/null || true
+    success "Port 81 opened in firewalld"
+  else
+    warn "firewall-cmd not available. Port 81 may need manual opening."
+    iptables -I INPUT -p tcp --dport 81 -j ACCEPT 2>/dev/null || true
+  fi
 }
 
 
