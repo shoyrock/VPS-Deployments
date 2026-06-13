@@ -117,6 +117,7 @@ user_confirm() {
 backup_file() {
     local f="$1"
     [[ -f "$f" && ! -f "${f}${BAKSUF}" ]] && cp -a "$f" "${f}${BAKSUF}" 2>/dev/null && _log "Backup: ${f} -> ${f}${BAKSUF}"
+    return 0   # best-effort: never let an absent file abort the caller under 'set -e'
 }
 
 backup_configs() {
@@ -410,8 +411,8 @@ lockdown_npm_admin() {
             sed -i '/port.*81:81/s/81:81/127.0.0.1:81:81/' "$dcf" 2>/dev/null || true
             info "Updated: $dcf"
             if command -v docker &>/dev/null; then
-                (cd "$p" && docker compose up -d >> "$LOGFILE" 2>&1) || \
-                    (cd "$p" && docker-compose up -d >> "$LOGFILE" 2>&1) || \
+                (cd "$p" && docker compose -f "$dcf" up -d >> "$LOGFILE" 2>&1) || \
+                    (cd "$p" && docker-compose -f "$dcf" up -d >> "$LOGFILE" 2>&1) || \
                     warn "Docker compose failed for $p"
             fi
         done
