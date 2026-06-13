@@ -658,26 +658,26 @@ networks:
 NETS
 
   if command -v curl &>/dev/null; then
-    DL_CMD="curl -sL -o"
+    if [ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ]; then
+      curl -sL -o /tmp/metabase_sqlite.zip https://crowdsec-statics-assets.s3-eu-west-1.amazonaws.com/metabase_sqlite.zip
+      command -v unzip &>/dev/null && unzip -o /tmp/metabase_sqlite.zip -d "$CROWDSEC_DIR" && rm -f /tmp/metabase_sqlite.zip
+      chown 1000:1000 "$CROWDSEC_DIR/metabase.db.mv.db" 2>/dev/null || true
+    fi
   elif command -v wget &>/dev/null; then
-    DL_CMD="wget -qO"
-  fi
-  if [ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ] && [ -n "$DL_CMD" ]; then
-    $DL_CMD /tmp/metabase_sqlite.zip https://crowdsec-statics-assets.s3-eu-west-1.amazonaws.com/metabase_sqlite.zip
-    command -v unzip &>/dev/null && unzip -o /tmp/metabase_sqlite.zip -d "$CROWDSEC_DIR" && rm -f /tmp/metabase_sqlite.zip
-    chown 1000:1000 "$CROWDSEC_DIR/metabase.db.mv.db" 2>/dev/null || true
+    if [ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ]; then
+      wget -qO /tmp/metabase_sqlite.zip https://crowdsec-statics-assets.s3-eu-west-1.amazonaws.com/metabase_sqlite.zip
+      command -v unzip &>/dev/null && unzip -o /tmp/metabase_sqlite.zip -d "$CROWDSEC_DIR" && rm -f /tmp/metabase_sqlite.zip
+      chown 1000:1000 "$CROWDSEC_DIR/metabase.db.mv.db" 2>/dev/null || true
+    fi
   else
-    [ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ] && warn "Metabase template not found ? dashboard may not have pre-loaded collections"
+    [ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ] && warn "Metabase template not found — dashboard may not have pre-loaded collections"
   fi
-
   info "Pulling Docker images (NPM, Authelia, CrowdSec) ? this may take a few minutes..."
   docker compose -f "${STACK_DIR}/docker-compose.npm.yml" pull
   docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" pull
   docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" pull
-
   info "Starting NPM..."
   docker compose -f "${STACK_DIR}/docker-compose.npm.yml" up -d
-
   info "Verifying NPM ports (80, 443, 81) are bound..."
   local ports_ok=false
   for i in $(seq 1 30); do
@@ -699,7 +699,6 @@ NETS
     sleep 2
   done
   printf "\n"
-
   info "Waiting for NPM container to start..."
   for i in $(seq 1 30); do
     docker ps --format '{{.Names}}' | grep -qx "npm" && { success "NPM container running"; break; }
@@ -708,7 +707,6 @@ NETS
     sleep 2
   done
   printf "\n"
-
   info "Waiting for NPM admin UI (:81)..."
   for i in $(seq 1 60); do
     curl -sf --max-time 5 http://127.0.0.1:81/ &>/dev/null && { success "NPM admin UI ready"; break; }
@@ -717,7 +715,6 @@ NETS
     sleep 2
   done
   printf "\n"
-
   info "Waiting for NPM log files..."
   for i in $(seq 1 30); do
     if ls "${NPM_LOGS_DIR}/"*_access.log "${NPM_LOGS_DIR}/"*_error.log &>/dev/null; then
@@ -735,7 +732,6 @@ NETS
     sleep 2
   done
   printf "\n"
-
   info "Starting CrowdSec..."
   docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec
   info "Waiting for CrowdSec container to be ready..."
@@ -746,7 +742,6 @@ NETS
     sleep 2
   done
   printf "\n"
-
   info "Starting CrowdSec Dashboard..."
   docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec-dashboard
   info "Waiting for CrowdSec Dashboard to be ready..."
@@ -757,22 +752,18 @@ NETS
     sleep 2
   done
   printf "\n"
-
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
   success "NPM: http://${ip}:81"
   success "Portainer ready (access via NPM proxy)"
   success "Authelia deployed (access via NPM proxy)"
 }
-
 setup_crowdsec() {
   step "CrowdSec (Docker)"
-
   local mb_pass
   mb_pass=$(rand_password 20)
   printf '%s' "$mb_pass" > "${STACK_DIR}/.metabase_password"
   chmod 600 "${STACK_DIR}/.metabase_password"
   info "Metabase dashboard password stored (crowdsec@crowdsec.net / see ${STACK_DIR}/.metabase_password)"
-
   info "Waiting for CrowdSec container to be ready..."
   local cs_ready=false
   for i in $(seq 1 30); do
@@ -782,18 +773,15 @@ setup_crowdsec() {
     fi
     sleep 2
   done
-
   if ! $cs_ready; then
     docker logs crowdsec --tail 20 2>/dev/null || true
     return 0
   fi
   success "CrowdSec container running"
-
   info "Verifying collections..."
   docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/sshd" && success "sshd collection" || warn "sshd collection not found"
   docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/nginx-proxy-manager" && success "nginx-proxy-manager collection" || warn "nginx-proxy-manager not found"
   docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/linux" && success "linux collection" || warn "linux not found"
-
   info "Configuring NPM log acquisition..."
   local npm_acquis="${CROWDSEC_DIR}/config/acquis.d/npm.yaml"
   mkdir -p "$(dirname "$npm_acquis")"

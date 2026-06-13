@@ -491,22 +491,23 @@ COMPOSE_NPM
   } > "${STACK_DIR}/docker-compose.crowdsec.yml"
 
   if command -v curl &>/dev/null; then
-    DL_CMD="curl -sL -o"
+    if [ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ]; then
+      curl -sL -o /tmp/metabase_sqlite.zip https://crowdsec-statics-assets.s3-eu-west-1.amazonaws.com/metabase_sqlite.zip
+      command -v unzip &>/dev/null && unzip -o /tmp/metabase_sqlite.zip -d "$CROWDSEC_DIR" && rm -f /tmp/metabase_sqlite.zip
+      chown 1000:1000 "$CROWDSEC_DIR/metabase.db.mv.db" 2>/dev/null || true
+    fi
   elif command -v wget &>/dev/null; then
-    DL_CMD="wget -qO"
-  fi
-  if [ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ] && [ -n "$DL_CMD" ]; then
-    $DL_CMD /tmp/metabase_sqlite.zip https://crowdsec-statics-assets.s3-eu-west-1.amazonaws.com/metabase_sqlite.zip
-    command -v unzip &>/dev/null && unzip -o /tmp/metabase_sqlite.zip -d "$CROWDSEC_DIR" && rm -f /tmp/metabase_sqlite.zip
-    chown 1000:1000 "$CROWDSEC_DIR/metabase.db.mv.db" 2>/dev/null || true
+    if [ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ]; then
+      wget -qO /tmp/metabase_sqlite.zip https://crowdsec-statics-assets.s3-eu-west-1.amazonaws.com/metabase_sqlite.zip
+      command -v unzip &>/dev/null && unzip -o /tmp/metabase_sqlite.zip -d "$CROWDSEC_DIR" && rm -f /tmp/metabase_sqlite.zip
+      chown 1000:1000 "$CROWDSEC_DIR/metabase.db.mv.db" 2>/dev/null || true
+    fi
   else
-    [ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ] && warn "Metabase template not found ? dashboard may not have pre-loaded collections"
+    [ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ] && warn "Metabase template not found — dashboard may not have pre-loaded collections"
   fi
-
   info "Pulling images..."
   docker compose -f "${STACK_DIR}/docker-compose.npm.yml" pull
   docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" pull
-
   info "Starting NPM..."
   docker compose -f "${STACK_DIR}/docker-compose.npm.yml" up -d
   local ports_ok=false
@@ -529,7 +530,6 @@ COMPOSE_NPM
     sleep 2
   done
   printf "\r"
-
   info "Deploying Authelia..."
   mkdir -p "$AUTHELIA_DIR" "$AUTHELIA_CONFIG_DIR" "$AUTHELIA_SECRETS_DIR" "$AUTHELIA_SNIPPETS_DIR"
   setup_authelia_secrets
@@ -546,7 +546,6 @@ COMPOSE_NPM
   done
   printf "\n"
   setup_authelia_users
-
   info "Waiting for NPM container..."
   for i in $(seq 1 30); do
     printf "\r  ${C_DIM}Waiting for NPM container... %d/30${C_R}" "$i"
@@ -555,7 +554,6 @@ COMPOSE_NPM
     sleep 2
   done
   printf "\r"
-
   info "Waiting for NPM admin UI (:81)..."
   for i in $(seq 1 60); do
     printf "\r  ${C_DIM}Waiting for NPM admin UI... %d/60${C_R}" "$i"
@@ -564,7 +562,6 @@ COMPOSE_NPM
     sleep 2
   done
   printf "\r"
-
   info "Waiting for NPM log files..."
   for i in $(seq 1 30); do
     printf "\r  ${C_DIM}Waiting for NPM log files... %d/30${C_R}" "$i"
@@ -584,7 +581,6 @@ COMPOSE_NPM
     sleep 2
   done
   printf "\r"
-
   info "Starting CrowdSec..."
   docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec
   info "Waiting for CrowdSec container..."
@@ -595,7 +591,6 @@ COMPOSE_NPM
     sleep 2
   done
   printf "\n"
-
   info "Starting CrowdSec Dashboard..."
   docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec-dashboard
   info "Waiting for CrowdSec Dashboard..."
@@ -606,24 +601,20 @@ COMPOSE_NPM
     sleep 2
   done
   printf "\n"
-
   success "NPM: http://${ip}:81"
   success "Dockhand: https://dockhand.${DOMAIN}"
 }
-
 # -------------------------------------------------------------------------------
 # NPM API automation ? secure password & proxy hosts
 # -------------------------------------------------------------------------------
 NPM_TOKEN=""
 NPM_API_BASE="http://127.0.0.1:81/api"
-
 _npm_api() {
   local path="$1"; shift
   local args=(-s --max-time 60 -H "Content-Type: application/json")
   [[ -n "$NPM_TOKEN" ]] && args+=(-H "Authorization: Bearer ${NPM_TOKEN}")
   curl "${args[@]}" "${NPM_API_BASE}${path}" "$@"
 }
-
 npm_change_password() {
   step "Securing NPM admin password"
   local NEW_PASS
@@ -637,7 +628,6 @@ npm_change_password() {
     warn "Could not get NPM token ? skipping automated NPM setup"
     return 1
   fi
-
   JSON=$(printf '{"type":"password","current":"changeme","secret":"%s"}' "$NEW_PASS")
   _npm_api "/users/1/auth" "json" -X PUT -d "$JSON" >/dev/null 2>&1
   # Re-authenticate with new password
@@ -653,14 +643,12 @@ npm_change_password() {
     return 1
   fi
 }
-
 npm_create_proxy_host() {
   local DOMAIN_NAME="$1"
   local FWD_HOST="$2"
   local FWD_PORT="$3"
   local WS="${4:-true}"
   local ADVANCED_CONFIG="${5:-}"
-
   local JSON
   JSON=$(jq -nc --arg domain "$DOMAIN_NAME" --arg fwd_host "$FWD_HOST" --argjson fwd_port "$FWD_PORT" \
     --argjson ws "$WS" --arg adv "$ADVANCED_CONFIG" \
@@ -680,7 +668,6 @@ npm_create_proxy_host() {
       hsts_subdomains: false,
       advanced_config: $adv
     }')
-
   local RESP ID
   RESP=$(_npm_api "/nginx/proxy-hosts" -X POST -d "$JSON")
   ID=$(echo "$RESP" | jq -r '.id // empty')
@@ -692,13 +679,11 @@ npm_create_proxy_host() {
     return 1
   fi
 }
-
 npm_enable_ssl() {
   local HOST_ID="$1"
   local DOMAIN_NAME="$2"
   local EMAIL="${3:-admin@${DOMAIN}}"
   local JSON RESP CERT_ID
-
   JSON=$(jq -nc --arg email "$EMAIL" --arg domain "$DOMAIN_NAME" '{
     provider: "letsencrypt",
     nice_name: $domain,
@@ -712,7 +697,6 @@ npm_enable_ssl() {
     warn "Certificate issuance failed for ${DOMAIN_NAME} (is DNS pointed at this server yet?). Host stays HTTP-only; add SSL in the NPM UI once DNS resolves."
     return 1
   fi
-
   JSON=$(jq -nc --argjson cert "$CERT_ID" '{
     certificate_id: $cert,
     ssl_forced: true,
@@ -727,7 +711,6 @@ npm_enable_ssl() {
     warn "Could not attach certificate ${CERT_ID} to host ${HOST_ID} - attach it manually in NPM UI"
   fi
 }
-
 # -------------------------------------------------------------------------------
 # Authelia SSO/MFA setup
 # -------------------------------------------------------------------------------
@@ -745,7 +728,6 @@ setup_authelia_secrets() {
   chown -R 1001:1001 "$AUTHELIA_SECRETS_DIR" 2>/dev/null || true
   success "Authelia secrets generated: $AUTHELIA_SECRETS_DIR"
 }
-
 setup_authelia_config() {
   step "Authelia Configuration"
   mkdir -p "$AUTHELIA_CONFIG_DIR"
@@ -792,11 +774,9 @@ AUTHELIA_CONF
   chown -R 1001:1001 "$AUTHELIA_CONFIG_DIR" 2>/dev/null || true
   success "Authelia configuration created"
 }
-
 setup_authelia_snippets() {
   step "Authelia NPM Snippets"
   mkdir -p "$AUTHELIA_SNIPPETS_DIR"
-
   cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" << 'SNIPPET'
 auth_request /internal/authelia/authz;
 auth_request_set $user $upstream_http_remote_user;
@@ -810,7 +790,6 @@ proxy_set_header Remote-Email $email;
 auth_request_set $redirection_url $upstream_http_location;
 error_page 401 =302 $redirection_url;
 SNIPPET
-
   cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" << 'SNIPPET1'
 location /internal/authelia/authz {
     internal;
@@ -822,7 +801,6 @@ location /internal/authelia/authz {
     proxy_pass_request_body off;
 }
 SNIPPET1
-
   # Also write to NPM's custom config directory so they're accessible inside the container
   local npm_custom_dir="${NPM_DATA_DIR}/nginx/custom"
   mkdir -p "$npm_custom_dir"
@@ -830,7 +808,6 @@ SNIPPET1
   cp "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" "$npm_custom_dir/"
   success "Authelia NPM snippets created"
 }
-
 setup_authelia_users() {
   step "Authelia Users"
   local default_pass hash
@@ -854,11 +831,9 @@ USERS
   chmod 600 "${AUTHELIA_DIR}/.default_password"
   success "Default user created. Login: admin / (see ${AUTHELIA_DIR}/.default_password) - change after first login"
 }
-
 register_dockhand_stacks() {
   step "Registering editable stacks in Dockhand"
   info "Creating combined compose files in Dockhand data directory..."
-
   # Combine all compose files into one for easy editing
   {
     echo "# Combined stack - NPM + Authelia + CrowdSec"
@@ -871,43 +846,34 @@ register_dockhand_stacks() {
     echo ""
     sed '1,/^services:/b;/^networks:/,$d' "${STACK_DIR}/docker-compose.crowdsec.yml" 2>/dev/null || true
   } > "${DOCKHAND_DATA_DIR}/infrastructure.yml" 2>/dev/null || true
-
   # Also copy individual compose files for reference
   cp "${STACK_DIR}/docker-compose.npm.yml" "${DOCKHAND_DATA_DIR}/npm.yml" 2>/dev/null || true
   cp "${STACK_DIR}/docker-compose.authelia.yml" "${DOCKHAND_DATA_DIR}/authelia.yml" 2>/dev/null || true
   cp "${STACK_DIR}/docker-compose.crowdsec.yml" "${DOCKHAND_DATA_DIR}/crowdsec.yml" 2>/dev/null || true
-
   success "Compose files available in Dockhand file browser: ${DOCKHAND_DATA_DIR}"
 }
-
 automate_npm() {
   step "Automating NPM setup (proxy hosts + SSL)"
-
   if ! npm_change_password; then
     warn "Could not change NPM password; manual setup needed (NPM still has DEFAULT credentials - change them NOW at :81)"
     return 0
   fi
-
   # Dockhand: protected by Authelia auth_request. Both snippets are required:
   # the location block AND the auth_request directives.
   local auth_snippet=$'include /data/nginx/custom/authelia-location.conf;\ninclude /data/nginx/custom/authelia-authrequest.conf;'
   local dockhand_id=""
   dockhand_id=$(npm_create_proxy_host "dockhand.${DOMAIN}" "dockhand" 3000 true "$auth_snippet") || true
   [[ -n "$dockhand_id" ]] && npm_enable_ssl "$dockhand_id" "dockhand.${DOMAIN}" || true
-
   # Authelia portal
   local authelia_id=""
   authelia_id=$(npm_create_proxy_host "authelia.${DOMAIN}" "authelia" 9091 true "") || true
   [[ -n "$authelia_id" ]] && npm_enable_ssl "$authelia_id" "authelia.${DOMAIN}" || true
-
   # CrowdSec dashboard (Metabase)
   local crowdsec_id=""
   crowdsec_id=$(npm_create_proxy_host "crowdsec.${DOMAIN}" "crowdsec-dashboard" 3000 false "") || true
   [[ -n "$crowdsec_id" ]] && npm_enable_ssl "$crowdsec_id" "crowdsec.${DOMAIN}" || true
-
   success "NPM automation completed"
 }
-
 # -------------------------------------------------------------------------------
 # Firewall, logrotate, CrowdSec setup
 # -------------------------------------------------------------------------------
@@ -917,7 +883,6 @@ setup_firewall() {
   if [[ "$OS_FAMILY" == "debian" ]]; then setup_firewall_debian
   else setup_firewall_rhel; fi
 }
-
 setup_firewall_debian() {
   info "Configuring UFW..."
   apt-get install -y -qq ufw
@@ -945,7 +910,6 @@ setup_firewall_debian() {
   ufw status verbose
   success "UFW configured"
 }
-
 setup_firewall_rhel() {
   info "Configuring firewalld..."
   local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
@@ -964,7 +928,6 @@ setup_firewall_rhel() {
   firewall-cmd --list-all
   success "Firewalld configured"
 }
-
 setup_logrotate() {
   step "Log Rotation"
   cat > /etc/logrotate.d/npm << EOF
@@ -984,16 +947,13 @@ ${NPM_LOGS_DIR}/*.log {
 EOF
   success "Log rotation: ${NPM_LOGS_DIR}/*.log (14 days)"
 }
-
 setup_crowdsec() {
   step "CrowdSec (Docker)"
-
   local mb_pass
   mb_pass=$(rand_password 20)
   printf '%s' "$mb_pass" > "${STACK_DIR}/.metabase_password"
   chmod 600 "${STACK_DIR}/.metabase_password"
   info "Metabase dashboard password stored (crowdsec@crowdsec.net / see ${STACK_DIR}/.metabase_password)"
-
   info "Waiting for CrowdSec container to be ready..."
   local cs_ready=false
   for i in $(seq 1 30); do

@@ -622,24 +622,25 @@ networks:
 COMPOSE_CROWDSEC
 
   if command -v curl &>/dev/null; then
-    DL_CMD="curl -sL -o"
+    if [ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ]; then
+      curl -sL -o /tmp/metabase_sqlite.zip https://crowdsec-statics-assets.s3-eu-west-1.amazonaws.com/metabase_sqlite.zip
+      command -v unzip &>/dev/null && unzip -o /tmp/metabase_sqlite.zip -d "$CROWDSEC_DIR" && rm -f /tmp/metabase_sqlite.zip
+      chown 1000:1000 "$CROWDSEC_DIR/metabase.db.mv.db" 2>/dev/null || true
+    fi
   elif command -v wget &>/dev/null; then
-    DL_CMD="wget -qO"
-  fi
-  if [ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ] && [ -n "$DL_CMD" ]; then
-    $DL_CMD /tmp/metabase_sqlite.zip https://crowdsec-statics-assets.s3-eu-west-1.amazonaws.com/metabase_sqlite.zip
-    command -v unzip &>/dev/null && unzip -o /tmp/metabase_sqlite.zip -d "$CROWDSEC_DIR" && rm -f /tmp/metabase_sqlite.zip
-    chown 1000:1000 "$CROWDSEC_DIR/metabase.db.mv.db" 2>/dev/null || true
+    if [ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ]; then
+      wget -qO /tmp/metabase_sqlite.zip https://crowdsec-statics-assets.s3-eu-west-1.amazonaws.com/metabase_sqlite.zip
+      command -v unzip &>/dev/null && unzip -o /tmp/metabase_sqlite.zip -d "$CROWDSEC_DIR" && rm -f /tmp/metabase_sqlite.zip
+      chown 1000:1000 "$CROWDSEC_DIR/metabase.db.mv.db" 2>/dev/null || true
+    fi
   else
-    [ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ] && warn "Metabase template not found ? dashboard may not have pre-loaded collections"
+    [ ! -f "$CROWDSEC_DIR/metabase.db.mv.db" ] && warn "Metabase template not found — dashboard may not have pre-loaded collections"
   fi
-
   info "Pulling Docker images ? this may take a few minutes, please wait..."
   docker compose -f "${STACK_DIR}/docker-compose.npm.yml" pull
   docker compose -f "${STACK_DIR}/docker-compose.dockge.yml" pull
   docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" pull
   docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" pull
-
   info "Starting NPM..."
   docker compose -f "${STACK_DIR}/docker-compose.npm.yml" up -d
   local ports_ok=false
@@ -662,7 +663,6 @@ COMPOSE_CROWDSEC
     sleep 2
   done
   printf "\r"
-
   info "Waiting for NPM container..."
   for i in $(seq 1 30); do
     printf "\r  ${C_DIM}Waiting for NPM container... %d/30${C_R}" "$i"
@@ -671,7 +671,6 @@ COMPOSE_CROWDSEC
     sleep 2
   done
   printf "\r"
-
   info "Waiting for NPM admin UI (:81)..."
   for i in $(seq 1 60); do
     printf "\r  ${C_DIM}Waiting for NPM admin UI... %d/60${C_R}" "$i"
@@ -680,7 +679,6 @@ COMPOSE_CROWDSEC
     sleep 2
   done
   printf "\r"
-
   info "Waiting for NPM log files..."
   for i in $(seq 1 30); do
     printf "\r  ${C_DIM}Waiting for NPM log files... %d/30${C_R}" "$i"
@@ -700,7 +698,6 @@ COMPOSE_CROWDSEC
     sleep 2
   done
   printf "\r"
-
   info "Starting Dockge..."
   docker compose -f "${STACK_DIR}/docker-compose.dockge.yml" up -d
   info "Waiting for Dockge..."
@@ -711,7 +708,6 @@ COMPOSE_CROWDSEC
     sleep 3
   done
   printf "\r"
-
   info "Starting CrowdSec..."
   docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec
   info "Waiting for CrowdSec container to be ready..."
@@ -722,7 +718,6 @@ COMPOSE_CROWDSEC
     sleep 2
   done
   printf "\n"
-
   info "Starting CrowdSec Dashboard..."
   docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec-dashboard
   info "Waiting for CrowdSec Dashboard to be ready..."
@@ -733,23 +728,19 @@ COMPOSE_CROWDSEC
     sleep 2
   done
   printf "\n"
-
   success "NPM: http://${ip}:81"
   success "Dockge ready (access via NPM proxy)"
   success "Authelia deployed (access via NPM proxy)"
 }
-
 setup_firewall() {
   step "Firewall"
   info "Configuring firewall ? please wait..."
   if [[ "$OS_FAMILY" == "debian" ]]; then setup_firewall_debian
   else setup_firewall_rhel; fi
 }
-
 setup_firewall_debian() {
   info "Configuring UFW..."
   apt-get install -y -qq ufw
-
   # CRITICAL: Docker manipulates iptables directly. UFW's DEFAULT_FORWARD_POLICY=DROP
   # blocks all container traffic. Must set ACCEPT before enabling UFW.
   local ufw_def="/etc/default/ufw"
@@ -764,33 +755,27 @@ setup_firewall_debian() {
     echo 'DEFAULT_FORWARD_POLICY="ACCEPT"' > "$ufw_def"
   fi
   success "UFW DEFAULT_FORWARD_POLICY=ACCEPT"
-
   ufw --force reset
   ufw default deny incoming
   ufw default allow outgoing
-
   local ssh_port; ssh_port=$(detect_ssh_port)
   ufw limit "${ssh_port}/tcp"
   ufw allow 80/tcp comment 'HTTP'
   ufw allow 443/tcp comment 'HTTPS'
   ufw allow 81/tcp comment 'NPM Admin'
-
   ufw --force enable && ufw reload
   ufw status verbose
   success "UFW configured"
 }
-
 setup_firewall_rhel() {
   info "Configuring firewalld..."
   local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
   $pkg install -y -q firewalld
   systemctl start firewalld && systemctl enable firewalld
-
   firewall-cmd --permanent --add-service=ssh
   firewall-cmd --permanent --add-service=http
   firewall-cmd --permanent --add-service=https
   firewall-cmd --permanent --add-port=81/tcp
-
   if ! firewall-cmd --get-zones 2>/dev/null | grep -q '\bdocker\b'; then
     firewall-cmd --permanent --new-zone=docker 2>/dev/null || true
   fi
@@ -800,7 +785,6 @@ setup_firewall_rhel() {
   firewall-cmd --list-all
   success "Firewalld configured"
 }
-
 setup_logrotate() {
   step "Log Rotation"
   cat > /etc/logrotate.d/npm << EOF
@@ -820,24 +804,20 @@ ${NPM_LOGS_DIR}/*.log {
 EOF
   success "Log rotation: ${NPM_LOGS_DIR}/*.log (14 days)"
 }
-
 verify_deployment() {
   step "Post-Deploy Verification"
   local fails=0
-
   _check() {
     local label="$1"; shift
     if "$@" &>/dev/null; then success "VERIFY: ${label}"
     else warn "VERIFY FAILED: ${label}"; fails=$((fails+1)); fi
   }
-
   # Containers
   local want="npm authelia crowdsec crowdsec-dashboard"
   local c
   for c in $want; do
     _check "container '$c' running" bash -c "docker ps --format '{{.Names}}' | grep -qx '$c'"
   done
-
   # Core service health
   _check "NPM API responding"        curl -sf --max-time 5 http://127.0.0.1:81/api/
   _check "NPM default creds REJECTED (password was changed)" bash -c \
@@ -865,18 +845,15 @@ verify_deployment() {
       if $banned; then success "VERIFY: end-to-end ban enforcement works"
       else warn "VERIFY FAILED: test ban did not appear in firewall rules"; fails=$((fails+1)); fi
     fi
-
   if [[ $fails -eq 0 ]]; then
     success "All verification checks passed"
   else
     warn "${fails} verification check(s) failed - review warnings above and ${LOG_FILE}"
   fi
 }
-
 print_summary() {
   local random_pass
   random_pass=$(_read_cred "${AUTHELIA_DIR}/.default_password")
-
   local elapsed=$(( $(date +%s) - START_TIME ))
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
   local ext_ip; ext_ip=$(get_external_ip)
@@ -884,12 +861,9 @@ print_summary() {
   local npm_password mb_pass
   npm_password=$(_read_cred "${STACK_DIR}/.npm_admin_password")
   mb_pass=$(_read_cred "${STACK_DIR}/.metabase_password")
-
   local crowdsec_display="crowdsec    crowdsec     8080 (LAPI)        crowdsec.${DOMAIN}"
-
     dns_crowdsec="  A  crowdsec.${DOMAIN}   ? ${ip}  (CrowdSec Dashboard)"
      proxy_crowdsec=$(cat << CROWDPROXY
-
      ${C_B}CrowdSec Dashboard:${C_R}
      +----------------------------------------------+
      ? Domain Names:    crowdsec.${DOMAIN}           ?
@@ -905,7 +879,6 @@ print_summary() {
      ? Dashboard is read-only ? no Authelia 2FA needed
 CROWDPROXY
 )
-
   printf "\n"
   printf "${C_B}${C_GRN}+------------------------------------------------------------------------------+${C_R}\n"
   printf "${C_B}${C_GRN}?                     ??  DEPLOYMENT COMPLETE                                  ?${C_R}\n"
@@ -913,11 +886,8 @@ CROWDPROXY
   printf "${C_B}?  ${C_CYN}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}${C_B}                                                      ?${C_R}\n"
   printf "${C_B}?  Elapsed: ${C_CYN}%dm %ds${C_R}${C_B}                                                     ?${C_R}\n" $(( elapsed / 60 )) $(( elapsed % 60 ))
   printf "${C_B}+------------------------------------------------------------------------------+${C_R}\n"
-
   cat << EOF
-
 ${C_B}Stack Directory${C_R}    ${STACK_DIR}
-
 ${C_B}Nginx Proxy Manager${C_R}
   Admin:   http://${ip}:81
   HTTP:    http://${ip}:80
@@ -926,13 +896,11 @@ ${C_B}Nginx Proxy Manager${C_R}
   Data:    ${NPM_DATA_DIR}
   SSL:     ${NPM_LE_DIR}
   Logs:    ${NPM_LOGS_DIR}
-
 ${C_B}Dockge${C_R}
   Container: dockge
   Port:      5001 (internal, no host port)
   Network:   proxy
   Stacks:    /opt/stacks
-
 ${C_B}${C_YEL}-- Container Summary ------------------------------------------------${C_R}
 ${C_B}CONTAINER  ${C_R}  ${C_B}HOSTNAME     ${C_R}  ${C_B}PORTS              ${C_R}  ${C_B}NPM DOMAIN             ${C_R}
 ${C_DIM}----------  ------------  -----------------  -----------------------${C_R}
@@ -940,51 +908,40 @@ npm         npm          80, 443, 81        ${ip}:81 (admin)
 dockge      dockge       5001               dockge.${DOMAIN}
 authelia    authelia     9091               authelia.${DOMAIN}
 ${crowdsec_display}
-
 ${C_B}${C_GRN}-- NPM Proxy Forwarding --------------------------------------${C_R}
 ${C_B}Domain${C_R}                     ${C_B}Forward to${C_R}
 ${C_DIM}--------------------------  --------------------------${C_R}
 authelia.${DOMAIN}          ? authelia:9091
 dockge.${DOMAIN}            ? dockge:5001
 crowdsec.${DOMAIN}         ? crowdsec-dashboard:3000
-
 ${C_B}${C_YEL}----------------------------------------------------------------${C_R}
 ${C_B}${C_YEL}  ??  AUTHELIA LOGIN CREDENTIALS (SAVE THESE)${C_R}
 ${C_B}${C_YEL}----------------------------------------------------------------${C_R}
-
   ${C_B}URL:${C_R}       https://authelia.${DOMAIN}
   ${C_B}Username:${C_R}  ${C_CYN}admin${C_R}
   ${C_B}Password:${C_R}  ${C_CYN}${random_pass}${C_R}
-
   ${C_RED}??  Change this password immediately after first login!${C_R}
-
 ${C_B}${C_YEL}----------------------------------------------------------------${C_R}
-
 ${C_B}Authelia${C_R}
   Portal:    https://authelia.${DOMAIN}
   Config:    ${AUTHELIA_CONFIG_DIR}/configuration.yml
   Users:     ${AUTHELIA_CONFIG_DIR}/users.yml
   Secrets:   ${AUTHELIA_SECRETS_DIR}/
   Snippets:  ${AUTHELIA_SNIPPETS_DIR}/
-
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
 ${C_B}Containers${C_R}  npm, dockge, authelia, crowdsec (separate compose files)
 ${C_B}Network${C_R}   proxy (bridge)
-
 ${C_B}CROWDSEC${C_R}  Collections: sshd, nginx-proxy-manager, linux
 ${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
-
 ${C_B}${C_YEL}Step 1 ? NPM Admin${C_R}
   Open:   http://${ip}:81
   Login:  admin@example.com / ${npm_password}
   ${C_RED}? Change password immediately${C_R}
-
 ${C_B}${C_YEL}Step 2 ? Add DNS Records${C_R}
   A  authelia.${DOMAIN}   ? ${ip}
   A  dockge.${DOMAIN}     ? ${ip}
   ${dns_crowdsec}
   A  *.${DOMAIN}          ? ${ip}  (wildcard for other services)
-
 ${C_B}${C_YEL}Step 3 ? Add Proxy Host in NPM${C_R}
   Dashboards ? Proxy Hosts ? Add Proxy Host
   +--------------------------------------+
@@ -995,7 +952,6 @@ ${C_B}${C_YEL}Step 3 ? Add Proxy Host in NPM${C_R}
   ? Block Exploits:  ON                  ?
   +--------------------------------------+
   Click Save
-
 ${C_B}${C_YEL}Step 3b ? Add Dockge Proxy Host${C_R}
   Dashboards ? Proxy Hosts ? Add Proxy Host
   +--------------------------------------+
@@ -1011,9 +967,7 @@ ${C_B}${C_YEL}Step 3b ? Add Dockge Proxy Host${C_R}
 ?   include /opt/dockge-stack/authelia/snippets/authelia-authrequest.conf; ?
    +--------------------------------------+
    Click Save
-
 ${proxy_crowdsec}
-
 ${C_B}${C_YEL}Step 4 ? SSL Certificates${C_R}
   On each proxy host ? SSL tab
   +--------------------------------------+
@@ -1024,16 +978,13 @@ ${C_B}${C_YEL}Step 4 ? SSL Certificates${C_R}
   ? Agree to TOS:    ON                  ?
   +--------------------------------------+
   Click Save
-
 ${C_B}${C_YEL}Step 5 ? Change Authelia Password${C_R}
   docker exec -it authelia authelia crypto hash generate argon2 --password 'YOUR_NEW_PASSWORD'
   # Then edit ${AUTHELIA_CONFIG_DIR}/users.yml and replace the password hash
-
 ${C_B}${C_YEL}Step 6 ? Register TOTP Device${C_R}
   1. Log in to https://authelia.${DOMAIN}
   2. Go to Settings ? Two-Factor Authentication
   3. Scan QR code with your authenticator app
-
 ${C_B}${C_YEL}Step 7 ? Protect Any Service${C_R}
   In NPM, edit the proxy host's Advanced tab:
   +----------------------------------------------------+
@@ -1044,10 +995,8 @@ ${C_B}${C_YEL}Step 7 ? Protect Any Service${C_R}
   ?   return 302 https://authelia.${DOMAIN}?rd=\$scheme://\$http_host\$request_uri; ?
   ? }                                                  ?
   +----------------------------------------------------+
-
 ${C_B}${C_YEL}Step 8 ? Secure Admin Port${C_R}
   $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "  ufw delete allow 81/tcp && ufw reload"; else echo "  firewall-cmd --permanent --remove-port=81/tcp && firewall-cmd --reload"; fi)
-
 ${C_B}Troubleshooting:${C_R}
   Logs:    docker logs -f npm    docker logs -f dockge    docker logs -f authelia
   NPM:      cd ${STACK_DIR} && docker compose -f docker-compose.npm.yml restart
@@ -1061,16 +1010,13 @@ ${C_B}Troubleshooting:${C_R}
 EOF
   _log "INFO" "=== Deployment completed in $(( elapsed / 60 ))m $(( elapsed % 60 ))s ==="
 }
-
 setup_crowdsec() {
   step "CrowdSec (Docker)"
-
   local mb_pass
   mb_pass=$(rand_password 20)
   printf '%s' "$mb_pass" > "${STACK_DIR}/.metabase_password"
   chmod 600 "${STACK_DIR}/.metabase_password"
   info "Metabase dashboard password stored (crowdsec@crowdsec.net / see ${STACK_DIR}/.metabase_password)"
-
   info "Waiting for CrowdSec container to be ready..."
   local cs_ready=false
   for i in $(seq 1 30); do
@@ -1080,19 +1026,16 @@ setup_crowdsec() {
     fi
     sleep 2
   done
-
   if ! $cs_ready; then
     docker logs crowdsec --tail 20 2>/dev/null || true
     warn "CrowdSec container not ready -- check ${LOG_FILE}. Continuing..."
     return 0
   fi
   success "CrowdSec container running"
-
   info "Verifying collections..."
   docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/sshd" && success "sshd collection" || warn "sshd collection not found"
   docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/nginx-proxy-manager" && success "nginx-proxy-manager collection" || warn "nginx-proxy-manager not found"
   docker exec crowdsec cscli collections list 2>/dev/null | grep -q "crowdsecurity/linux" && success "linux collection" || warn "linux not found"
-
   info "Configuring NPM log acquisition..."
   local npm_acquis="${CROWDSEC_DIR}/config/acquis.d/npm.yaml"
   mkdir -p "$(dirname "$npm_acquis")"
