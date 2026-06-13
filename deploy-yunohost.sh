@@ -1124,6 +1124,7 @@ verify_deployment() {
   done
 
   # Core service health
+  _check "IP forwarding ON (Docker)" bash -c '[[ $(sysctl -n net.ipv4.ip_forward) == 1 ]]'
   _check "NPM API responding"        curl -sf --max-time 5 http://127.0.0.1:81/api/
   _check "NPM default creds REJECTED (password was changed)" bash -c \
     "! curl -s --max-time 5 -X POST http://127.0.0.1:81/api/tokens -H 'Content-Type: application/json' -d '{\"identity\":\"admin@example.com\",\"secret\":\"changeme\"}' | grep -q token"
@@ -1278,6 +1279,28 @@ remove_conflicts() {
   success "Conflicts removed"
 }
 
+ensure_ip_forwarding() {
+  step "Networking Prerequisites"
+  # Docker REQUIRES IP forwarding to route host->container traffic. An older
+  # harden.sh run may have persisted net.ipv4.ip_forward=0, which silently breaks
+  # ALL published container ports (80/443/81) while leaving SSH working. Force it
+  # on, repair any leftover override, and persist so it survives reboot.
+  local f
+  for f in /etc/sysctl.conf /etc/sysctl.d/*.conf; do
+    [[ -f "$f" ]] || continue
+    if grep -qE '^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=[[:space:]]*0' "$f"; then
+      sed -i -E 's/^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=[[:space:]]*0/net.ipv4.ip_forward=1/' "$f"
+      warn "Reset net.ipv4.ip_forward=0 -> 1 in $f (was breaking container networking)"
+    fi
+  done
+  echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-zzz-docker-forward.conf
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  sysctl --system >/dev/null 2>&1 || true
+  local ipf; ipf=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "?")
+  if [[ "$ipf" == "1" ]]; then success "IP forwarding enabled (published ports reachable)"
+  else warn "IP forwarding still off (=$ipf) - published ports 80/443/81 may be unreachable"; fi
+}
+
 main() {
   printf "\n${C_B}${C_CYN}VPS Deployment -- Docker + NPM + YunoHost + Authelia + CrowdSec${C_R}\n" >&2
   printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n" >&2
@@ -1287,6 +1310,7 @@ main() {
   install_dependencies
   remove_conflicts
   install_docker
+  ensure_ip_forwarding
   setup_docker_network
   get_user_domain
   setup_yunohost
