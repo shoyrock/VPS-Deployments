@@ -64,8 +64,17 @@ sudo ./deploy-yunohost.sh     # Deploy YunoHost (Debian 12 only)
 sudo ./deploy-freedombox.sh   # Deploy FreedomBox (Debian 12 only)
 ```
 
-**Env vars:**
+**Env vars** (all optional):
 - `FORCE_CLEANUP=1` — skip the destructive-cleanup confirmation (for CI/unattended runs)
+- `CF_API_TOKEN=<token>` — Cloudflare **User** API token; enables the CrowdSec Cloudflare Worker bouncer non-interactively. If unset, the script prompts (blank = configure now, deploy later).
+- `CF_BOUNCER_ACTION=ban|captcha` — edge action for banned IPs (default `ban`; `captcha` challenges instead of blocking).
+- `LOCK_HTTP_TO_CLOUDFLARE=true` — restrict ports 80/443 to Cloudflare's published IP ranges in the firewall (default `false`; turn on once all DNS is proxied through Cloudflare).
+
+```bash
+sudo CF_API_TOKEN=xxxxx ./deploy-dockhand.sh           # non-interactive token
+sudo LOCK_HTTP_TO_CLOUDFLARE=true ./deploy-dockhand.sh # also lock 80/443 to CF
+sudo CF_BOUNCER_ACTION=captcha ./deploy-dockhand.sh    # challenge instead of block
+```
 
 **Supported OS:** Ubuntu 20.04+, Debian 11+, Rocky/AlmaLinux 8/9, Fedora 35+, Amazon Linux 2023
 
@@ -195,7 +204,18 @@ The **firewall bouncer** runs as a systemd service and enforces bans in real tim
 
 ### Cloudflare edge enforcement (optional, free)
 
-Set `CF_API_TOKEN` (a Cloudflare **User** API token) before running and the deploy installs the **CrowdSec Cloudflare Worker bouncer**, blocking banned IPs at Cloudflare's edge before traffic reaches the VPS. NPM is also configured to restore the real visitor IP from `CF-Connecting-IP` (so bans key on the true client, not Cloudflare). Re-run with `LOCK_HTTP_TO_CLOUDFLARE=true` to restrict ports 80/443 to Cloudflare's published ranges. All free, no subscription — see the post-deploy summary for the two dashboard steps (Worker Route → Fail open; enable Managed WAF).
+Set `CF_API_TOKEN` (a Cloudflare **User** API token) and the deploy installs the **CrowdSec Cloudflare Worker bouncer**, blocking banned IPs at Cloudflare's edge before traffic reaches the VPS. NPM is also configured to restore the real visitor IP from `CF-Connecting-IP` (so bans key on the true client, not Cloudflare). All free, no subscription.
+
+**Automated for you:** token discovery of zone/account IDs, the bouncer config + LAPI key, the systemd service, the Worker + KV + route deploy, real-IP restoration in NPM, and (with `LOCK_HTTP_TO_CLOUDFLARE=true`) the 80/443 origin lockdown.
+
+**No token at the prompt?** The script still installs the bouncer and writes its config, skips the live Cloudflare deploy, and prints exactly how to finish later. Nothing breaks.
+
+**Still your hands** (no Cloudflare API exists for these — the script prompts/prints them as an end-of-run checklist):
+1. **Create the User API token** (My Profile → API Tokens, *not* an Account token) with the perms the prompt lists.
+2. **Worker Route → Fail open**: `${DOMAIN} > Workers Routes > the crowdsec route > Edit > Request limit failure mode > Fail open`. Without it, a worker error shows visitors a CF 1027 page.
+3. **Enable the free Managed WAF ruleset**: `${DOMAIN} > Security > WAF > Managed rules > enable` (inline OWASP-style filtering, free plan).
+
+To deploy the bouncer on an **already-running** stack without redeploying, set the token + zone/account IDs in `/etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml`, then `systemctl enable --now crowdsec-cloudflare-worker-bouncer`.
 
 ### Console (cloud)
 
