@@ -1,4 +1,4 @@
-# VPS Deployment Scripts — v4.5.0-hardened
+# VPS Deployment Scripts — v4.6.0-hardened-cloudflare
 
 > ⚠️ **SECURITY DISCLAIMER — READ BEFORE USING**
 >
@@ -181,12 +181,21 @@ That's it — no YAML edits, no restarts. The `*.YOURDOMAIN.com` wildcard in Aut
 
 ## CrowdSec — Intrusion Prevention
 
-CrowdSec runs as a Docker container with three collections:
+CrowdSec runs as a Docker container with these free, log-based hub collections:
 - `crowdsecurity/sshd` — SSH brute force
-- `crowdsecurity/nginx-proxy-manager` — NPM attack detection
+- `crowdsecurity/nginx-proxy-manager` — NPM attack detection (probing/sqli/xss/traversal)
 - `crowdsecurity/linux` — system-wide rules
+- `crowdsecurity/http-cve` — known-CVE exploit probing (Log4j etc.)
+- `crowdsecurity/http-dos` — L7 HTTP flood/DoS detection
+- `crowdsecurity/whitelist-good-actors` — avoids banning legit crawlers (Google/Bing/etc.)
+
+> AppSec (inline WAF) collections are intentionally **not** included: they need CrowdSec's AppSec component (an in-band listener + reverse-proxy forwarding) that NPM does not provide out of the box. The free **Cloudflare Managed WAF ruleset** covers the inline-filtering role for traffic behind Cloudflare.
 
 The **firewall bouncer** runs as a systemd service and enforces bans in real time at the iptables/nftables level, including Docker-published ports via the `DOCKER-USER` chain.
+
+### Cloudflare edge enforcement (optional, free)
+
+Set `CF_API_TOKEN` (a Cloudflare **User** API token) before running and the deploy installs the **CrowdSec Cloudflare Worker bouncer**, blocking banned IPs at Cloudflare's edge before traffic reaches the VPS. NPM is also configured to restore the real visitor IP from `CF-Connecting-IP` (so bans key on the true client, not Cloudflare). Re-run with `LOCK_HTTP_TO_CLOUDFLARE=true` to restrict ports 80/443 to Cloudflare's published ranges. All free, no subscription — see the post-deploy summary for the two dashboard steps (Worker Route → Fail open; enable Managed WAF).
 
 ### Console (cloud)
 

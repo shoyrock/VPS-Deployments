@@ -7,11 +7,17 @@ fi
 # deploy-portainer.sh -- Docker + NPM + Portainer + Authelia + CrowdSec (v4.3.0-hardened)
 # One-click VPS deployment. Usage: sudo ./deploy-portainer.sh
 #   Optional env vars:
-#     FORCE_CLEANUP=1        skip the destructive-cleanup confirmation
+#     FORCE_CLEANUP=1              skip the destructive-cleanup confirmation
+#     CF_API_TOKEN=<token>         Cloudflare USER API token; enables the CrowdSec
+#                                  Cloudflare Worker bouncer (edge IP-ban enforcement).
+#                                  If unset, the script prompts; blank = configure later.
+#     CF_BOUNCER_ACTION=ban        edge action for banned IPs: ban | captcha (default ban)
+#     LOCK_HTTP_TO_CLOUDFLARE=true restrict 80/443 to Cloudflare IP ranges in the
+#                                  firewall (default false; turn on once all DNS is proxied)
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.5.0-hardened"
+readonly SCRIPT_VERSION="4.6.0-hardened-cloudflare"
 readonly SCRIPT_NAME="deploy-portainer.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/portainer-stack"
@@ -28,6 +34,13 @@ readonly DOMAIN_PERSIST_FILE="/etc/vps-deploy-domain"
 readonly LOG_FILE="/var/log/vps-deploy.log"
 
 DOMAIN=""  # Set at runtime via user prompt
+
+# --- Cloudflare integration (Worker bouncer + origin lockdown) ---------------
+CF_API_TOKEN="${CF_API_TOKEN:-}"                              # CF USER API token (prompted if empty)
+CF_BOUNCER_KEY=""                                            # generated; shared LAPI <-> CF bouncer
+CF_BOUNCER_ACTION="${CF_BOUNCER_ACTION:-ban}"                # edge action: ban | captcha
+LOCK_HTTP_TO_CLOUDFLARE="${LOCK_HTTP_TO_CLOUDFLARE:-false}"  # restrict 80/443 to Cloudflare ranges
+CF_IPS_CACHE=""                                             # filled by get_cloudflare_ips()
 
 # Deployment status tracking for guaranteed completion summary
 DEPLOY_STATUS="in_progress"
@@ -59,6 +72,46 @@ rand_password() {
   local len="${1:-24}"
   (openssl rand -base64 48 2>/dev/null || head -c 48 /dev/urandom | base64) \
     | tr -d '+/=\n' | head -c "$len"
+}
+
+# Cloudflare published edge IP ranges (v4 + v6). Fetched live, with a hardcoded
+# fallback if the network call fails. Cached after first call. Used by both the
+# firewall lockdown and the NPM real-IP restoration.
+get_cloudflare_ips() {
+  [[ -n "$CF_IPS_CACHE" ]] && { printf '%s\n' "$CF_IPS_CACHE"; return 0; }
+  local v4 v6 all
+  v4=$(curl -sf --max-time 10 https://www.cloudflare.com/ips-v4 2>/dev/null || true)
+  v6=$(curl -sf --max-time 10 https://www.cloudflare.com/ips-v6 2>/dev/null || true)
+  all=$(printf '%s\n%s\n' "$v4" "$v6" | grep -E '^[0-9a-fA-F:.]+/[0-9]+$' || true)
+  if [[ -z "$all" ]]; then
+    all=$(cat <<'CFIPS'
+173.245.48.0/20
+103.21.244.0/22
+103.22.200.0/22
+103.31.4.0/22
+141.101.64.0/18
+108.162.192.0/18
+190.93.240.0/20
+188.114.96.0/20
+197.234.240.0/22
+198.41.128.0/17
+162.158.0.0/15
+104.16.0.0/13
+104.24.0.0/14
+172.64.0.0/13
+131.0.72.0/22
+2400:cb00::/32
+2606:4700::/32
+2803:f800::/32
+2405:b500::/32
+2405:8100::/32
+2a06:98c0::/29
+2c0f:f248::/32
+CFIPS
+)
+  fi
+  CF_IPS_CACHE="$all"
+  printf '%s\n' "$all"
 }
 
 # -------------------------------------------------------------------------------
@@ -217,13 +270,21 @@ idempotent_cleanup() {
 
   # Stop and remove ALL previously deployed platform systemd services
   info "Removing ALL previous platform services..."
-  for svc in casaos-gateway casaos-user-service casaos-local-storage casaos-message-bus runtipi crowdsec-firewall-bouncer; do
+  # Tear down any existing Cloudflare Worker bouncer infra on Cloudflare's side
+  # BEFORE deleting its config, so we don't orphan Workers/KV on the CF account.
+  if command -v crowdsec-cloudflare-worker-bouncer &>/dev/null \
+     && [[ -f /etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml ]]; then
+    info "Removing Cloudflare Worker bouncer infrastructure from Cloudflare..."
+    crowdsec-cloudflare-worker-bouncer -d \
+      -c /etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml &>/dev/null || true
+  fi
+  for svc in casaos-gateway casaos-user-service casaos-local-storage casaos-message-bus runtipi crowdsec-firewall-bouncer crowdsec-cloudflare-worker-bouncer; do
     systemctl stop "$svc" 2>/dev/null || true
     systemctl disable "$svc" 2>/dev/null || true
     systemctl mask "$svc" 2>/dev/null || true
     rm -f "/etc/systemd/system/${svc}.service" "/etc/systemd/system/${svc}" 2>/dev/null || true
   done
-  for svc in casaos-gateway casaos-user-service casaos-local-storage casaos-message-bus runtipi crowdsec-firewall-bouncer; do
+  for svc in casaos-gateway casaos-user-service casaos-local-storage casaos-message-bus runtipi crowdsec-firewall-bouncer crowdsec-cloudflare-worker-bouncer; do
     systemctl unmask "$svc" 2>/dev/null || true   # unmask so this run can re-create them
   done
   systemctl daemon-reload 2>/dev/null || true
@@ -235,11 +296,11 @@ idempotent_cleanup() {
 
   # Remove native crowdsec packages
   if [[ "$OS_FAMILY" == "debian" ]]; then
-    apt-get remove -y -qq crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables 2>/dev/null || true
+    apt-get remove -y -qq crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
     apt-get autoremove -y -qq 2>/dev/null || true
   else
     local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
-    $pkg remove -y -q crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables 2>/dev/null || true
+    $pkg remove -y -q crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
   fi
 
   # Also handle snap-installed Docker (Ubuntu)
@@ -404,6 +465,9 @@ COMPOSE_PORTAINER
 setup_stack() {
   step "Deploying NPM, Authelia and CrowdSec"
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<VPS_IP>")
+  # Shared key: CrowdSec pre-registers it as a bouncer (BOUNCER_KEY_* env below),
+  # and setup_cloudflare_bouncer writes the SAME key into the CF bouncer config.
+  CF_BOUNCER_KEY=$(rand_password 48)
   mkdir -p "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR"
 
   cat > "${STACK_DIR}/docker-compose.authelia.yml" << 'COMPOSE_AUTHELIA'
@@ -467,7 +531,15 @@ services:
       - ./data/logs:/npm-logs:ro
       - /var/log:/var/log:ro
     environment:
-      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux
+      # http-cve adds known-CVE exploit-probing detection (Log4j etc). The base
+      # http scenarios (probing/sqli/xss/traversal) already ship WITH the
+      # nginx-proxy-manager collection, so they are not listed again.
+      # http-dos = L7 flood detection; whitelist-good-actors = avoid banning
+      # legit crawlers (Google/Bing/etc). All free hub collections, log-based.
+      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux crowdsecurity/http-cve crowdsecurity/http-dos crowdsecurity/whitelist-good-actors
+      # Pre-register the Cloudflare Worker bouncer so it authenticates to LAPI
+      # with this exact key (setup_cloudflare_bouncer writes it into the config).
+      - BOUNCER_KEY_cloudflarebouncer=${CF_BOUNCER_KEY}
       - TZ=UTC
     networks:
       - proxy
@@ -941,8 +1013,17 @@ setup_firewall_debian() {
   ufw default allow outgoing
   ufw allow "${ssh_port}/tcp" comment 'SSH'
   ufw limit "${ssh_port}/tcp" 2>/dev/null || true   # rate-limit SSH brute force at the firewall too
-  ufw allow 80/tcp comment 'HTTP'
-  ufw allow 443/tcp comment 'HTTPS'
+  if [[ "$LOCK_HTTP_TO_CLOUDFLARE" == "true" ]]; then
+    info "Locking 80/443 to Cloudflare IP ranges (LOCK_HTTP_TO_CLOUDFLARE=true)..."
+    local cidr
+    while IFS= read -r cidr; do
+      [[ -n "$cidr" ]] && ufw allow from "$cidr" to any port 80,443 proto tcp comment 'Cloudflare' >/dev/null 2>&1 || true
+    done < <(get_cloudflare_ips)
+    success "80/443 restricted to Cloudflare edge"
+  else
+    ufw allow 80/tcp comment 'HTTP'
+    ufw allow 443/tcp comment 'HTTPS'
+  fi
   ufw allow 81/tcp comment 'NPM Admin'
   ufw --force enable && ufw reload
   ufw status verbose >&2
@@ -957,8 +1038,20 @@ setup_firewall_rhel() {
   local ssh_port; ssh_port=$(detect_ssh_port)
   firewall-cmd --permanent --add-service=ssh
   [[ "$ssh_port" != "22" ]] && firewall-cmd --permanent --add-port="${ssh_port}/tcp"
-  firewall-cmd --permanent --add-service=http
-  firewall-cmd --permanent --add-service=https
+  if [[ "$LOCK_HTTP_TO_CLOUDFLARE" == "true" ]]; then
+    info "Locking 80/443 to Cloudflare IP ranges (LOCK_HTTP_TO_CLOUDFLARE=true)..."
+    local cidr fam
+    while IFS= read -r cidr; do
+      [[ -z "$cidr" ]] && continue
+      [[ "$cidr" == *:* ]] && fam="ipv6" || fam="ipv4"
+      firewall-cmd --permanent --add-rich-rule="rule family=${fam} source address=${cidr} port port=80 protocol=tcp accept" >/dev/null 2>&1 || true
+      firewall-cmd --permanent --add-rich-rule="rule family=${fam} source address=${cidr} port port=443 protocol=tcp accept" >/dev/null 2>&1 || true
+    done < <(get_cloudflare_ips)
+    success "80/443 restricted to Cloudflare edge"
+  else
+    firewall-cmd --permanent --add-service=http
+    firewall-cmd --permanent --add-service=https
+  fi
   firewall-cmd --permanent --add-port=81/tcp
   if ! firewall-cmd --get-zones 2>/dev/null | grep -q '\bdocker\b'; then
     firewall-cmd --permanent --new-zone=docker 2>/dev/null || true
@@ -1149,6 +1242,168 @@ BOUNCER
   fi
 }
 
+# -------------------------------------------------------------------------------
+# Cloudflare real visitor IP restoration (NPM)
+# Behind Cloudflare, every request arrives FROM a Cloudflare edge IP. Without
+# this, NPM logs the CF IP, CrowdSec keys its bans on CF IPs, and you end up
+# banning Cloudflare itself. These directives trust the CF ranges and read the
+# true client IP from the CF-Connecting-IP header.
+# -------------------------------------------------------------------------------
+setup_cloudflare_realip() {
+  step "Cloudflare real-IP restoration (NPM)"
+  local custom_dir="${NPM_DATA_DIR}/nginx/custom"
+  mkdir -p "$custom_dir"
+  local conf="${custom_dir}/http.conf"   # included inside NPM's http{} block
+  {
+    echo "# Managed by ${SCRIPT_NAME} - restore real visitor IP behind Cloudflare"
+    echo "real_ip_header CF-Connecting-IP;"
+    echo "real_ip_recursive on;"
+    local cidr
+    while IFS= read -r cidr; do
+      [[ -n "$cidr" ]] && echo "set_real_ip_from ${cidr};"
+    done < <(get_cloudflare_ips)
+  } > "$conf"
+  success "Wrote ${conf} ($(grep -c set_real_ip_from "$conf" 2>/dev/null || echo 0) CF ranges)"
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx npm; then
+    if docker exec npm nginx -t &>/dev/null && docker exec npm nginx -s reload &>/dev/null; then
+      success "NPM reloaded with real-IP config"
+    else
+      docker restart npm &>/dev/null || true
+      warn "NPM reloaded via restart (nginx -s reload unavailable)"
+    fi
+  fi
+}
+
+# -------------------------------------------------------------------------------
+# CrowdSec Cloudflare Worker bouncer - enforces CrowdSec ban decisions at the
+# Cloudflare edge (real client IP, before traffic reaches this VPS). Installed
+# as a host package; talks to the dockerized LAPI on 127.0.0.1:8080. Deploys a
+# Cloudflare Worker + KV to your account (only if a token is supplied).
+# -------------------------------------------------------------------------------
+setup_cloudflare_bouncer() {
+  step "CrowdSec Cloudflare Worker bouncer"
+  local cfg_dir="/etc/crowdsec/bouncers"
+  local cfg="${cfg_dir}/crowdsec-cloudflare-worker-bouncer.yaml"
+  mkdir -p "$cfg_dir"
+
+  # 1. Token: from env, else prompt. Blank = configure now, deploy later.
+  if [[ -z "$CF_API_TOKEN" ]]; then
+    printf "\n${C_B}Cloudflare Worker bouncer${C_R} blocks banned IPs at Cloudflare's edge.\n" >&2
+    printf "It needs a Cloudflare ${C_B}User${C_R} API token (My Profile > API Tokens, NOT an\n" >&2
+    printf "Account token). Supplying it now will deploy a Worker + KV to your account.\n" >&2
+    printf "Required perms: Account(Workers KV Storage:Edit, Workers Scripts:Edit,\n" >&2
+    printf "  Turnstile:Edit, Account Settings:Read, Account Analytics:Read),\n" >&2
+    printf "  User(User Details:Read), Zone(DNS:Read, Workers Routes:Edit, Zone:Read)\n" >&2
+    printf "Leave blank to skip the live deploy and finish later.\n" >&2
+    read -rsp "Cloudflare API token (hidden, Enter to skip): " CF_API_TOKEN >&2 || true
+    printf "\n" >&2
+  fi
+
+  # 2. Install the bouncer (CrowdSec repo + package manager, graceful fallback).
+  local have_bin=false
+  if command -v crowdsec-cloudflare-worker-bouncer &>/dev/null; then
+    have_bin=true
+  elif [[ "$OS_FAMILY" == "debian" ]]; then
+    info "Adding CrowdSec repository + installing the worker bouncer..."
+    curl -s https://packagecloud.io/install/repositories/crowdsec/crowdsec/script.deb.sh | bash >>"$LOG_FILE" 2>&1 || true
+    apt-get install -y -qq crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 || true
+    command -v crowdsec-cloudflare-worker-bouncer &>/dev/null && have_bin=true
+  else
+    info "Adding CrowdSec repository + installing the worker bouncer..."
+    curl -s https://packagecloud.io/install/repositories/crowdsec/crowdsec/script.rpm.sh | bash >>"$LOG_FILE" 2>&1 || true
+    local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
+    $pkg install -y -q crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 || true
+    command -v crowdsec-cloudflare-worker-bouncer &>/dev/null && have_bin=true
+  fi
+  $have_bin && success "Worker bouncer binary present" || warn "Worker bouncer package not installed - writing config for manual install"
+
+  # 3. Discover the Cloudflare zone + account for $DOMAIN via the CF API.
+  local zone_id="" account_id="" account_name=""
+  if [[ -n "$CF_API_TOKEN" && -n "$DOMAIN" ]]; then
+    local zjson
+    zjson=$(curl -s --max-time 15 -H "Authorization: Bearer ${CF_API_TOKEN}" \
+      "https://api.cloudflare.com/client/v4/zones?name=${DOMAIN}" 2>/dev/null || true)
+    zone_id=$(echo "$zjson" | jq -r '.result[0].id // empty' 2>/dev/null || true)
+    account_id=$(echo "$zjson" | jq -r '.result[0].account.id // empty' 2>/dev/null || true)
+    account_name=$(echo "$zjson" | jq -r '.result[0].account.name // empty' 2>/dev/null || true)
+    if [[ -n "$zone_id" ]]; then
+      success "Found Cloudflare zone for ${DOMAIN} (zone ${zone_id:0:8}...)"
+    else
+      warn "No Cloudflare zone found for ${DOMAIN} (check token scope / domain). Writing template; finish manually."
+    fi
+  fi
+
+  # 4. Write the bouncer config (free-plan-safe). Heredoc is unquoted so the
+  #    ${...} variables below are filled in at runtime.
+  : "${CF_BOUNCER_KEY:=$(rand_password 48)}"
+  cat > "$cfg" << CFWB
+crowdsec_config:
+  lapi_key: ${CF_BOUNCER_KEY}
+  lapi_url: http://127.0.0.1:8080/
+  update_frequency: 10s
+  include_scenarios_containing: []
+  exclude_scenarios_containing: []
+  # Cloudflare FREE plan: only sync this engine's + manual bans (free KV write
+  # cap is ~1K/day). On a paid Workers plan you can remove this to push blocklists.
+  only_include_decisions_from: ["cscli", "crowdsec"]
+  insecure_skip_verify: false
+
+cloudflare_config:
+  accounts:
+    - id: ${account_id:-<ACCOUNT_ID>}
+      account_name: ${account_name:-<CF_ACCOUNT_EMAIL>}
+      token: ${CF_API_TOKEN:-<CLOUDFLARE_USER_API_TOKEN>}
+      zones:
+        - zone_id: ${zone_id:-<ZONE_ID>}
+          routes_to_protect:
+            - "*${DOMAIN:-example.com}/*"
+          actions: ["${CF_BOUNCER_ACTION}"]
+          default_action: ${CF_BOUNCER_ACTION}
+          turnstile:
+            enabled: false
+  worker:
+    log_only: false
+
+log_level: info
+log_media: stdout
+
+prometheus:
+  enabled: true
+  listen_addr: 127.0.0.1
+  listen_port: "2112"
+CFWB
+  chmod 600 "$cfg"
+  success "Wrote ${cfg}"
+
+  # 5. Deploy: starting the daemon creates the CF Worker + KV + route from config.
+  if $have_bin && [[ -n "$zone_id" && -n "$account_id" ]]; then
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 || true
+    systemctl restart crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 || true
+    local ok=false i
+    for i in $(seq 1 10); do
+      systemctl is-active --quiet crowdsec-cloudflare-worker-bouncer && { ok=true; break; }
+      sleep 2
+    done
+    if $ok; then
+      success "Cloudflare Worker bouncer ACTIVE - edge enforcement is live"
+      warn "ACTION REQUIRED (no Cloudflare API for this): set the Worker Route to FAIL OPEN -> CF dashboard > ${DOMAIN} > Workers Routes > edit the crowdsec route > Request limit failure mode > Fail open. Without it a worker error shows visitors a CF 1027 page."
+    else
+      journalctl -u crowdsec-cloudflare-worker-bouncer -n 20 --no-pager >>"$LOG_FILE" 2>&1 || true
+      warn "Worker bouncer not active - see ${LOG_FILE}. Debug: journalctl -u crowdsec-cloudflare-worker-bouncer -n 30"
+    fi
+  else
+    systemctl stop crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
+    systemctl disable crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
+    warn "Cloudflare Worker bouncer configured but NOT deployed (no token/zone, or package missing)."
+    info "Finish later: ensure the package is installed, set token + IDs in ${cfg}, then: systemctl enable --now crowdsec-cloudflare-worker-bouncer"
+  fi
+}
+
+# -------------------------------------------------------------------------------
+# CrowdSec Console (https://app.crowdsec.net) enrollment.
+# The Console is the cloud-based dashboard for alerts, decisions and metrics.
+# -------------------------------------------------------------------------------
 setup_crowdsec_console() {
   step "CrowdSec Console enrollment"
   info "Enrolling this CrowdSec instance in the CrowdSec Console (https://app.crowdsec.net)..."
@@ -1159,12 +1414,10 @@ setup_crowdsec_console() {
       console_ready=true
       break
     fi
-    printf "
-  ${C_DIM}Waiting for CrowdSec LAPI... %d/30${C_R}" "$i" >&2
+    printf "\r  ${C_DIM}Waiting for CrowdSec LAPI... %d/30${C_R}" "$i" >&2
     sleep 2
   done
-  printf "
-" >&2
+  printf "\r" >&2
 
   if ! $console_ready; then
     warn "CrowdSec LAPI not ready - Console enrollment skipped. Enroll manually later with: docker exec crowdsec cscli console enroll --auto"
@@ -1218,6 +1471,10 @@ verify_deployment() {
     "docker exec crowdsec cscli collections list 2>/dev/null | grep -q crowdsecurity/nginx-proxy-manager"
   _check "bouncer registered in LAPI" bash -c \
     "docker exec crowdsec cscli bouncers list 2>/dev/null | grep -q npm-bouncer"
+  _check "http-cve collection installed" bash -c \
+    "docker exec crowdsec cscli collections list 2>/dev/null | grep -q crowdsecurity/http-cve"
+  _check "Cloudflare real-IP config present in NPM" bash -c \
+    "test -f '${NPM_DATA_DIR}/nginx/custom/http.conf' && grep -q CF-Connecting-IP '${NPM_DATA_DIR}/nginx/custom/http.conf'"
   _check "firewall bouncer service ACTIVE" systemctl is-active --quiet crowdsec-firewall-bouncer
   # Live end-to-end ban test: ban a TEST-NET IP, confirm it lands in the
   # firewall via the bouncer, then remove it. TEST-NET-1 (192.0.2.0/24) is
@@ -1303,6 +1560,13 @@ ${C_B}CrowdSec Console${C_R}
             If enrollment failed, run: docker exec crowdsec cscli console enroll --auto
 
 
+${C_B}Cloudflare Worker bouncer${C_R}
+  Role:     Blocks CrowdSec-banned IPs at Cloudflare's edge (before your VPS).
+  Config:   /etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml
+  Status:   $(systemctl is-active crowdsec-cloudflare-worker-bouncer 2>/dev/null || echo "not deployed (no token supplied)")
+  Action:   $(echo "${CF_BOUNCER_ACTION}") on banned IPs   Plan-safe: only_include_decisions_from=[cscli,crowdsec]
+
+
 ${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
 ${C_B}Containers${C_R}  npm, portainer, authelia, crowdsec
@@ -1316,6 +1580,21 @@ ${C_B}${C_YEL}Done automatically:${C_R}
   - CrowdSec Console enrollment attempted
   - Authelia 2FA protecting Portainer
   - CrowdSec bans enforced incl. Docker-published ports (DOCKER-USER chain)
+  - CrowdSec http-cve collection installed (CVE-exploit probing detection)
+  - Cloudflare real visitor IPs restored in NPM (CF-Connecting-IP header)
+  - Cloudflare Worker bouncer deployed for edge IP-ban enforcement (if token supplied)
+
+${C_B}${C_YEL}Cloudflare - finish in the dashboard (no public API exists for these):${C_R}
+  1. Worker Route -> FAIL OPEN:  ${DOMAIN} > Workers Routes > the crowdsec route
+     > Edit > Request limit failure mode > Fail open   (else worker errors = CF 1027 page)
+  2. Managed WAF ruleset (request-inspection / OWASP layer):
+     ${DOMAIN} > Security > WAF > Managed rules > enable   (free plan = free ruleset)
+  3. If you skipped the API token: add it + zone/account IDs in
+     /etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml, then
+     systemctl enable --now crowdsec-cloudflare-worker-bouncer
+  Test edge ban: docker exec crowdsec cscli decisions add --ip 1.2.3.4 --type ban
+                 (then: docker exec crowdsec cscli decisions delete --ip 1.2.3.4)
+  Origin lockdown: re-run with LOCK_HTTP_TO_CLOUDFLARE=true to restrict 80/443 to CF ranges
 
 ${C_B}${C_YEL}Credential files (root-only, mode 600):${C_R}
   ${STACK_DIR}/.npm_admin_password
@@ -1367,6 +1646,8 @@ main() {
   setup_stack
   setup_firewall
   setup_crowdsec
+  setup_cloudflare_realip
+  setup_cloudflare_bouncer
   setup_crowdsec_console
   setup_logrotate
   automate_npm
