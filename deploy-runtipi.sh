@@ -249,16 +249,38 @@ idempotent_cleanup() {
   # SAFETY GATE: this step destroys ALL Docker containers and volumes on the
   # host, not just ones from a previous run of this script. Require explicit
   # confirmation unless FORCE_CLEANUP=1 (for unattended/CI use).
-  if command -v docker &>/dev/null && [[ -n "$(docker ps -aq 2>/dev/null)" ]]; then
-    if [[ "${FORCE_CLEANUP:-0}" != "1" ]]; then
-      printf "\n${C_RED}${C_B}WARNING:${C_R}${C_RED} This will STOP and DELETE ALL Docker containers and ALL Docker volumes on this host (irreversible).${C_R}\n" >&2
-      read -rp "Continue? [yes/no]: " _confirm
-      [[ "$_confirm" =~ ^[Yy]([Ee][Ss])?$ ]] || fatal "Aborted by user before destructive cleanup. Re-run with FORCE_CLEANUP=1 to skip this prompt."
+  if command -v docker &>/dev/null && docker info &>/dev/null; then
+    if [[ -n "$(docker ps -aq 2>/dev/null)" || -n "$(docker volume ls -q 2>/dev/null)" || -n "$(docker images -aq 2>/dev/null)" ]]; then
+      if [[ "${FORCE_CLEANUP:-0}" != "1" ]]; then
+        printf "\n${C_RED}${C_B}WARNING:${C_R}${C_RED} This will STOP and DELETE ALL Docker containers, volumes, images and custom networks on this host (irreversible).${C_R}\n" >&2
+        read -rp "Continue? [yes/no]: " _confirm
+        [[ "$_confirm" =~ ^[Yy]([Ee][Ss])?$ ]] || fatal "Aborted by user before destructive cleanup. Re-run with FORCE_CLEANUP=1 to skip this prompt."
+      fi
+      info "Removing ALL existing containers, volumes, images and custom networks..."
+      # 1. Leave any Swarm FIRST. Prior dokploy/coolify installs run Swarm, which
+      #    reschedules task containers the instant you remove them -> the classic
+      #    "leftovers keep coming back". Leaving the swarm tears down its services.
+      docker swarm leave --force &>/dev/null || true
+      # 2. Force-remove every container (rm -f also stops running ones). Two passes
+      #    catch anything a restart policy or a late Swarm task brought back.
+      local _pass
+      for _pass in 1 2; do
+        docker ps -aq 2>/dev/null | xargs -r docker rm -f &>/dev/null || true
+      done
+      # 3. Volumes (now unmounted -> removable), then ALL images.
+      docker volume ls -q 2>/dev/null | xargs -r docker volume rm -f &>/dev/null || true
+      docker images -aq 2>/dev/null | xargs -r docker rmi -f &>/dev/null || true
+      # 4. Final sweep: any straggler containers/images/volumes + unused custom
+      #    networks (e.g. an old 'proxy' net) + dangling build cache.
+      docker system prune -af --volumes &>/dev/null || true
+      # 5. Verify nothing survived; warn loudly if it did (e.g. a re-arming Swarm).
+      local _left; _left="$(docker ps -aq 2>/dev/null | wc -l | tr -d ' ')"
+      if [[ "${_left:-0}" != "0" ]]; then
+        warn "${_left} container(s) survived cleanup -- a Swarm service may be re-arming. Run: docker swarm leave --force; docker rm -f \$(docker ps -aq)"
+      else
+        success "Docker fully reset (containers, volumes, images, networks)"
+      fi
     fi
-    info "Removing ALL existing containers and volumes..."
-    docker ps -aq 2>/dev/null | xargs -r docker stop &>/dev/null || true
-    docker ps -aq 2>/dev/null | xargs -r docker rm -f &>/dev/null || true
-    docker volume ls -q 2>/dev/null | xargs -r docker volume rm -f &>/dev/null || true
   fi
 
   # Remove ALL previously deployed platform data directories
