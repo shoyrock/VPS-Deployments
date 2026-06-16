@@ -23,6 +23,7 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script depl
 | Script | Deploys | Stack Dir | Notes |
 |--------|---------|-----------|-------|
 | `deploy-dockhand.sh` | NPM + Dockhand + Authelia + CrowdSec | `/opt/dockhand-stack/` | Docker manager with host file access |
+| `deploy-netbird.sh` | Traefik + Authentik + NetBird + Dockhand + CrowdSec | `/opt/netbird-stack/` | ⚠️ Zero-trust variant (Authentik IdP + NetBird mesh). **Staging — test in a VM first** |
 | `deploy-portainer.sh` | NPM + Portainer + Authelia + CrowdSec | `/opt/portainer-stack/` | Visual container management |
 | `deploy-dockge.sh` | NPM + Dockge + Authelia + CrowdSec | `/opt/dockge-stack/` | Compose stack manager |
 | `deploy-cosmos.sh` | NPM + Cosmos + Authelia + CrowdSec | `/opt/cosmos-stack/` | All-in-one homelab |
@@ -333,6 +334,7 @@ STACK_DIR/
 ├── harden.sh                  ← Security hardening (run after deploy; LOCKDOWN_NPM_ADMIN toggle)
 ├── add-domain.sh              ← Additively attach another domain (NPM hosts + Authelia realm)
 ├── deploy-dockhand.sh         ← NPM + Dockhand + Authelia + CrowdSec
+├── deploy-netbird.sh          ← Traefik + Authentik + NetBird + Dockhand (zero-trust; staging)
 ├── deploy-portainer.sh        ← NPM + Portainer + Authelia + CrowdSec
 ├── deploy-dockge.sh           ← NPM + Dockge + Authelia + CrowdSec
 ├── deploy-cosmos.sh           ← NPM + Cosmos + Authelia + CrowdSec
