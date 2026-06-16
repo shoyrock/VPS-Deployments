@@ -11,6 +11,13 @@ IFS=$'\n\t'
 readonly LOGFILE="/var/log/harden.log"
 readonly BAKSUF=".harden-backup-$(date +%Y%m%d-%H%M%S)"
 readonly GEOIP_DIR="/usr/local/bin/geoip-block"
+# NPM admin panel (port 81) exposure:
+#   0 = publish on 0.0.0.0:81  -> reachable at http://<vps-ip>:81 (convenient; the
+#       login is exposed to the internet, so set a STRONG password + keep CrowdSec).
+#   1 = bind to 127.0.0.1:81   -> admin reachable ONLY via SSH tunnel (most secure):
+#       ssh -L 8181:127.0.0.1:81 root@<vps-ip>  then open http://localhost:8181
+# Override per run, e.g.:  LOCKDOWN_NPM_ADMIN=1 bash harden.sh
+LOCKDOWN_NPM_ADMIN="${LOCKDOWN_NPM_ADMIN:-0}"
 # Colors (TTY only)
 if [[ -t 1 ]]; then
   readonly C_RST='\033[0m' C_BLD='\033[1m' C_GRN='\033[1;32m'
@@ -78,7 +85,7 @@ preflight() {
         echo ""
         warn "No deployment detected. Have you run a deploy script first?"
         printf "  ${C_YLW}harden.sh should be run AFTER deploying your tool.${C_RST}\n"
-        printf "  ${C_YLW}It locks down port 81 — you'll need NPM set up first.${C_RST}\n"
+        printf "  ${C_YLW}It manages the NPM admin port (81) binding — you'll need NPM set up first.${C_RST}\n"
         printf "  ${C_BLU}Run: ./deploy.sh  → pick a tool  → then run: ./deploy.sh harden${C_RST}\n"
         echo ""
         read -rp "Continue anyway? [y/N]: " force
@@ -104,7 +111,7 @@ user_confirm() {
     printf "Measures:\n"
     printf "  Kernel sysctl         Firewall rate limit   GeoIP blocking\n"
     printf "  CrowdSec (local)      AIDE file integrity   Auto security updates\n"
-    printf "  NPM admin lockdown    Docker hardening      Daily local backups\n"
+    printf "  NPM admin port (81)   Docker hardening      Daily local backups\n"
     printf "  SSH daemon hardening  (key-only root, password auth off if key present)\n\n"
     read -rp $'Proceed? [y/N]: ' ans
     [[ "$ans" =~ ^[Yy]$ ]] || { info "Aborted."; exit 0; }
@@ -391,27 +398,39 @@ DNFAUTO
 }
 
 # ---------------------------------------------------------------------------
-# 8. NPM Admin Lockdown — rollback: restore docker-compose.yml backup
+# 8. NPM Admin port-81 binding — rollback: restore docker-compose.yml backup
+#    LOCKDOWN_NPM_ADMIN=1 -> bind 127.0.0.1:81 (admin via SSH tunnel only)
+#    LOCKDOWN_NPM_ADMIN=0 -> bind 0.0.0.0:81   (admin at http://<vps-ip>:81)
+#    Idempotent and reversible: re-running with the other value flips it back.
 # ---------------------------------------------------------------------------
 lockdown_npm_admin() {
-    info "=== Locking down NPM admin panel ==="
-    local dcf="${NPM_DIR:-/opt/npm}/docker-compose.npm.yml"
-    if [[ ! -f "$dcf" ]]; then dcf="${NPM_DIR:-/opt/npm}/docker-compose.yml"; fi
-    if grep -q '127\.0\.0\.1:81:81' "$dcf" 2>/dev/null; then
-        info "NPM admin already locked to localhost"; return 0
+    local lock="${LOCKDOWN_NPM_ADMIN:-0}" target want
+    if [[ "$lock" == "1" ]]; then
+        info "=== Locking NPM admin panel to 127.0.0.1:81 ==="
+        target='127.0.0.1:81:81'; want='127\.0\.0\.1:81:81'
+    else
+        info "=== Exposing NPM admin panel on 0.0.0.0:81 ==="
+        target='0.0.0.0:81:81';   want='0\.0\.0\.0:81:81'
     fi
     local paths=(/opt/dockhand-stack /opt/portainer-stack /opt/dockge-stack /opt/cosmos-stack /opt/coolify-stack /opt/dokploy-stack /opt/casaos-stack /opt/runtipi-stack /opt/yunohost-stack /opt/freedombox-stack /opt/npm /root/npm /home/*/npm /opt/nginx-proxy-manager)
-    local found=0
+    [[ -n "${NPM_DIR:-}" ]] && paths=("$NPM_DIR" "${paths[@]}")
+    local found=0 p dcf
     for p in "${paths[@]}"; do
         for dcf in "$p"/docker-compose.npm.yml "$p"/docker-compose.npm.yaml "$p"/docker-compose.yml "$p"/docker-compose.yaml; do
             [[ -f "$dcf" ]] || continue
-            found=1; backup_file "$dcf"
-            # Normalize any host prefix(es) off the 81:81 mapping (handles 0.0.0.0:,
-            # an already-applied 127.0.0.1:, or a doubled/corrupted prefix), then bind
-            # to loopback. Two idempotent passes — safe to re-run, never compounds.
+            # Only touch files that actually publish NPM's admin port 81.
+            grep -qE '(^|[^0-9])81:81([^0-9]|$)' "$dcf" 2>/dev/null || continue
+            found=1
+            if grep -q "$want" "$dcf" 2>/dev/null; then
+                info "Already correct: $dcf"; continue
+            fi
+            backup_file "$dcf"
+            # Strip any host prefix(es) off the 81:81 mapping (handles 0.0.0.0:,
+            # 127.0.0.1:, or a doubled/corrupted prefix), then bind to the target.
+            # Two idempotent passes — safe to re-run, never compounds.
             sed -i -E 's#([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)+81:81#81:81#g' "$dcf" 2>/dev/null || true
-            sed -i -E 's#(^[[:space:]]*-[[:space:]]*"?)81:81#\1127.0.0.1:81:81#' "$dcf" 2>/dev/null || true
-            info "Updated: $dcf"
+            sed -i -E "s#(^[[:space:]]*-[[:space:]]*\"?)81:81#\1${target}#" "$dcf" 2>/dev/null || true
+            info "Updated: $dcf -> ${target}"
             if command -v docker &>/dev/null; then
                 (cd "$p" && docker compose -f "$dcf" up -d >> "$LOGFILE" 2>&1) || \
                     (cd "$p" && docker-compose -f "$dcf" up -d >> "$LOGFILE" 2>&1) || \
@@ -419,8 +438,14 @@ lockdown_npm_admin() {
             fi
         done
     done
-    [[ "$found" -eq 0 ]] && warn "No NPM docker-compose file found — manual lockdown needed" || ok "NPM admin locked to 127.0.0.1:81"
-    _log "NPM lockdown: found=$found"
+    if [[ "$found" -eq 0 ]]; then
+        warn "No NPM docker-compose file found — manual change needed"
+    elif [[ "$lock" == "1" ]]; then
+        ok "NPM admin bound to 127.0.0.1:81 (tunnel: ssh -L 8181:127.0.0.1:81 root@<vps-ip>)"
+    else
+        ok "NPM admin published on 0.0.0.0:81 (http://<vps-ip>:81 — use a strong password)"
+    fi
+    _log "NPM admin binding: lock=$lock target=$target found=$found"
 }
 
 # ---------------------------------------------------------------------------
@@ -595,10 +620,14 @@ verify_hardening() {
         _check "Auto-updates active" "systemctl is-active --quiet dnf-automatic.timer 2>/dev/null"
     fi
 
-    # 7. NPM lockdown
+    # 7. NPM admin port-81 binding (matches LOCKDOWN_NPM_ADMIN)
     # Prefer 'docker port' — robust even with userland-proxy disabled (no host
     # listener socket shows in ss when docker-proxy is off; DNAT lives in iptables).
-    _check "NPM admin bound to localhost" "if command -v docker >/dev/null 2>&1 && docker port npm 81 >/dev/null 2>&1; then docker port npm 81 2>/dev/null | grep -q '127.0.0.1'; else ss -tln 2>/dev/null | grep -q '127.0.0.1:81'; fi"
+    if [[ "${LOCKDOWN_NPM_ADMIN:-0}" == "1" ]]; then
+        _check "NPM admin bound to localhost" "if command -v docker >/dev/null 2>&1 && docker port npm 81 >/dev/null 2>&1; then docker port npm 81 2>/dev/null | grep -q '127.0.0.1'; else ss -tln 2>/dev/null | grep -q '127.0.0.1:81'; fi"
+    else
+        _check "NPM admin reachable on :81" "if command -v docker >/dev/null 2>&1 && docker port npm 81 >/dev/null 2>&1; then docker port npm 81 2>/dev/null | grep -qE '0\.0\.0\.0|\[::\]'; else ss -tln 2>/dev/null | grep -qE '(0\.0\.0\.0|\*|\[::\]):81'; fi"
+    fi
 
     # 8. Docker
     _check "Docker daemon.json"      "[[ -f /etc/docker/daemon.json ]]"
@@ -624,8 +653,12 @@ verify_hardening() {
         ok "All $total checks passed"
     fi
 
-    echo "  ${C_YLW}Access NPM Admin:${C_RST}  ssh -L 8181:127.0.0.1:81 root@<vps-ip>"
-    echo "                    Then open http://localhost:8181"
+    if [[ "${LOCKDOWN_NPM_ADMIN:-0}" == "1" ]]; then
+        echo "  ${C_YLW}Access NPM Admin:${C_RST}  ssh -L 8181:127.0.0.1:81 root@<vps-ip>"
+        echo "                    Then open http://localhost:8181"
+    else
+        echo "  ${C_YLW}Access NPM Admin:${C_RST}  http://<vps-ip>:81  (exposed — set a strong password)"
+    fi
     echo ""
     _log "=== Verification: $pass/$total passed ==="
     # Clear abort trap on successful completion
@@ -652,8 +685,13 @@ print_summary() {
     printf "${C_BLD}║    • Auto security updates    • AIDE file integrity                          ║${C_RST}\n"
     printf "${C_BLD}║    • Firewall rate limiting   • Docker log rotation                          ║${C_RST}\n"
     printf "${C_BLD}╠══════════════════════════════════════════════════════════════════════════════╣${C_RST}\n"
+    if [[ "${LOCKDOWN_NPM_ADMIN:-0}" == "1" ]]; then
     printf "${C_BLD}║  ${C_RED}⚠️  IMPORTANT:${C_RST} NPM admin (port 81) now restricted to localhost.           ${C_BLD}║${C_RST}\n"
     printf "${C_BLD}║     Tunnel:  ssh -L 8181:127.0.0.1:81 root@${ext_ip}  -> http://localhost:8181   ${C_BLD}║${C_RST}\n"
+    else
+    printf "${C_BLD}║  ${C_RED}⚠️  IMPORTANT:${C_RST} NPM admin (port 81) is EXPOSED at http://<vps-ip>:81.        ${C_BLD}║${C_RST}\n"
+    printf "${C_BLD}║     Open:    ${C_BLU}http://${ext_ip}:81${C_RST}  — set a STRONG admin password now.        ${C_BLD}║${C_RST}\n"
+    fi
     printf "${C_BLD}╚══════════════════════════════════════════════════════════════════════════════╝${C_RST}\n"
     printf "\n"
     printf "  Log:     %s\n" "$LOGFILE"

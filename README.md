@@ -35,7 +35,7 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script depl
 
 **All scripts expose only 3 ports: 80 (HTTP), 443 (HTTPS), 81 (NPM admin).** Individual tool containers have **no host ports** — they communicate internally via Docker's `proxy` network using their container hostnames.
 
-> **Note on port 81:** the NPM admin panel is published on `0.0.0.0:81` so you can reach it at `http://<vps-ip>:81` right after deploy to finish configuration. It is a public attack surface while open — once your proxy hosts are set up, run `harden.sh` (its `lockdown_npm_admin` step re-binds 81 to `127.0.0.1`, after which you reach it via SSH tunnel: `ssh -L 8181:127.0.0.1:81 root@<vps>` → `http://localhost:8181`).
+> **Note on port 81:** the NPM admin panel is published on `0.0.0.0:81` so you can reach it at `http://<vps-ip>:81` right after deploy to finish configuration. `harden.sh` leaves it exposed **by default** (`LOCKDOWN_NPM_ADMIN=0`) because it's needed during setup. To bind it to `127.0.0.1` (SSH-tunnel-only) once your proxy hosts are set up, run `LOCKDOWN_NPM_ADMIN=1 ./harden.sh`, then reach it via `ssh -L 8181:127.0.0.1:81 root@<vps>` → `http://localhost:8181`. Re-running with the other value flips it back (idempotent).
 
 ---
 
@@ -140,7 +140,7 @@ http://<your-vps-ip>:81
 
 Log in with `admin@example.com` and the password stored in `STACK_DIR/.npm_admin_password`. Use it to add/edit proxy hosts and SSL certs.
 
-> **Note — port 81 is public.** While open, the admin panel is reachable from the internet and is a standing attack surface. Recommended: finish your proxy-host configuration, then run **`harden.sh`** — its `lockdown_npm_admin` step re-binds 81 to `127.0.0.1`. After that, reach the panel via SSH tunnel: `ssh -L 8181:127.0.0.1:81 root@<vps>` then `http://localhost:8181`. (Note: configuring your *apps* never needs port 81 — they're reached at their own subdomains through NPM.)
+> **Note — port 81 is public.** While open, the admin panel is reachable from the internet and is a standing attack surface. `harden.sh` leaves 81 exposed **by default** (`LOCKDOWN_NPM_ADMIN=0`) since it's needed during setup. Recommended: finish your proxy-host configuration, then lock it down with **`LOCKDOWN_NPM_ADMIN=1 ./harden.sh`** — its `lockdown_npm_admin` step re-binds 81 to `127.0.0.1`. After that, reach the panel via SSH tunnel: `ssh -L 8181:127.0.0.1:81 root@<vps>` then `http://localhost:8181`. Re-run with `LOCKDOWN_NPM_ADMIN=0` to re-expose. (Note: configuring your *apps* never needs port 81 — they're reached at their own subdomains through NPM.)
 
 ---
 
@@ -185,6 +185,41 @@ For any new container you deploy after the initial setup:
 4. Save
 
 That's it — no YAML edits, no restarts. The `*.YOURDOMAIN.com` wildcard in Authelia's access control covers every subdomain automatically.
+
+---
+
+## Adding Another Domain — `add-domain.sh`
+
+Attach a **second (or third) root domain** to an already-running stack — additively and safely. Two domains can run side by side indefinitely, or you can add the new one, verify it, then delete the old hosts/certs in the NPM UI at your leisure.
+
+```bash
+# New domain + its Authelia SSO realm + a protected app, all SSL'd:
+sudo ./add-domain.sh newdomain.com --app portainer:portainer:9000
+
+# Public app (no 2FA):
+sudo ./add-domain.sh newdomain.com --open status:uptime-kuma:3001
+
+# Domain that doesn't need SSO at all:
+sudo ./add-domain.sh newdomain.com --no-authelia --open www:myapp:8080
+
+# Preview only — change nothing:
+sudo ./add-domain.sh newdomain.com --app portainer:portainer:9000 --dry-run
+```
+
+| Option | Effect |
+|--------|--------|
+| `--app SUB:HOST:PORT` | Create `SUB.<domain>` → `HOST:PORT`, **Authelia-protected**. Repeatable. |
+| `--open SUB:HOST:PORT` | Same, but **public** (no Authelia). Repeatable. |
+| `--no-authelia` | Skip wiring an Authelia realm for this domain. |
+| `--email ADDR` | Let's Encrypt email (default `admin@<domain>`). |
+| `--stack DIR` | NPM stack dir (default: auto-detect under `/opt`). |
+| `--dry-run` | Print the plan, change nothing. |
+
+**Safe on a live system by design:** it never purges or edits existing proxy hosts/certs, is idempotent (skips anything already in place), and edits Authelia behind a backup — if the container fails its health check after the edit, the config is **automatically rolled back**. It auto-creates `authelia.<domain>` and reuses the existing domain-agnostic Authelia nginx snippets (no per-domain nginx changes).
+
+> **DNS first:** point `*.newdomain.com → <vps-ip>` before running, so Let's Encrypt can validate. If DNS isn't ready, the host is created HTTP-only and warns you — re-run later (idempotent) or finish SSL in the NPM UI.
+>
+> Wiring Authelia restarts the `authelia` container (~3-5s); existing sessions re-validate — not an outage. `--no-authelia` avoids it. Each cookie domain is its own SSO realm (a login on domain A does not carry to domain B — cookies can't cross domains).
 
 ---
 
@@ -295,7 +330,8 @@ STACK_DIR/
 ```
 .
 ├── deploy.sh                  ← Unified menu
-├── harden.sh                  ← Security hardening (run after deploy)
+├── harden.sh                  ← Security hardening (run after deploy; LOCKDOWN_NPM_ADMIN toggle)
+├── add-domain.sh              ← Additively attach another domain (NPM hosts + Authelia realm)
 ├── deploy-dockhand.sh         ← NPM + Dockhand + Authelia + CrowdSec
 ├── deploy-portainer.sh        ← NPM + Portainer + Authelia + CrowdSec
 ├── deploy-dockge.sh           ← NPM + Dockge + Authelia + CrowdSec
@@ -318,7 +354,7 @@ STACK_DIR/
 |-------|-----|
 | Containers unreachable | `grep DEFAULT_FORWARD_POLICY /etc/default/ufw` — should be `ACCEPT` |
 | Containers unreachable after `harden.sh` | `sysctl net.ipv4.ip_forward` — **must be `1`** (Docker needs IP forwarding; fixed in harden.sh) |
-| Can't reach NPM admin (:81) | Check `ss -tlnp \| grep ':81'`. If you ran `harden.sh`, 81 is now localhost-only — use the SSH tunnel: `ssh -L 8181:127.0.0.1:81 root@<vps>` then `http://localhost:8181` |
+| Can't reach NPM admin (:81) | Check `ss -tlnp \| grep ':81'`. If you ran `harden.sh` with `LOCKDOWN_NPM_ADMIN=1`, 81 is localhost-only — use the SSH tunnel: `ssh -L 8181:127.0.0.1:81 root@<vps>` then `http://localhost:8181`. Re-expose with `LOCKDOWN_NPM_ADMIN=0 ./harden.sh` |
 | Port 80/443 conflict | `ss -tlnp \| grep ':80 '` — another service may still be bound |
 | New subdomain gets 403 | Verify the two include lines are in NPM's Advanced tab |
 | CrowdSec not catching | `docker exec crowdsec cscli metrics && docker exec crowdsec cscli decisions list` |
