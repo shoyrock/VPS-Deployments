@@ -9,17 +9,17 @@ fi
 #
 # This is the deploy-dockhand.sh stack with the proxy/auth layer swapped:
 #     NPM        -> Traefik (single TLS edge on 80/443, Let's Encrypt)
-#     Authelia   -> Authentik (OIDC IdP for NetBird; forward-auth for apps)
-#     (added)    -> NetBird self-hosted (management + signal + relay + coturn +
-#                   dashboard), sitting BEHIND the Traefik edge, using Authentik
-#                   as its OIDC identity provider.
+#     Authelia   -> Authentik (forward-auth/SSO for web apps only)
+#     (added)    -> NetBird self-hosted COMBINED server (netbirdio/netbird-server:
+#                   mgmt+signal+relay+STUN) + dashboard, behind the Traefik edge,
+#                   using NetBird's OWN EMBEDDED IdP (at /oauth2). Config + Traefik
+#                   labels are taken verbatim from NetBird's official installer.
 #
-# Topology: one Traefik owns 80/443 and routes by subdomain:
-#     authentik.<domain> -> authentik-server     (IdP, public)
-#     netbird.<domain>   -> netbird-dashboard / management(gRPC) / signal(gRPC)
-#     dockhand.<domain>  -> dockhand             (protected by Authentik forward-auth)
-#   NetBird peer-to-peer ports stay host-published: 3478/udp (STUN/TURN),
-#   49152-65535/udp (TURN relay), 33080/tcp (relay).
+# Topology: one Traefik (ours, named to match NetBird's labels) owns 80/443:
+#     authentik.<domain> -> authentik-server     (forward-auth IdP for web apps)
+#     netbird.<domain>   -> netbird-server (gRPC h2c via NetBird's labels) + dashboard
+#     dockhand.<domain>  -> dockhand             (gated by Authentik forward-auth)
+#   NetBird STUN stays host-published: 3478/udp. Relay rides Traefik on /relay.
 #
 # One-click VPS deployment. Usage: sudo ./deploy-netbird.sh
 #   Optional env vars:
@@ -190,7 +190,7 @@ _on_exit() {
     printf "${C_B}${C_YEL}  Containers (behind the Traefik edge on the proxy network):${C_R}\n"
     printf "${C_B}    traefik              ->  ports 80, 443 (single TLS edge)${C_R}\n"
     printf "${C_B}    authentik-server     ->  port 9000 (IdP + forward-auth outpost)${C_R}\n"
-    printf "${C_B}    netbird-management   ->  gRPC h2c (behind Traefik /api, /management.*)${C_R}\n"
+    printf "${C_B}    netbird-server       ->  combined mgmt/signal/relay + gRPC (NetBird labels)${C_R}\n"
     printf "${C_B}    netbird-dashboard    ->  port 80 (UI behind Traefik)${C_R}\n"
     printf "${C_B}    dockhand             ->  port 3000${C_R}\n"
     printf "${C_B}    crowdsec             ->  port 8080 (LAPI, localhost only)${C_R}\n"
@@ -202,7 +202,7 @@ _on_exit() {
     printf "${C_B}  NetBird logs in via Authentik OIDC. Create more users in the Authentik UI.${C_R}\n"
     printf "${C_B}  All credentials are stored (mode 600) under: %s${C_R}\n" "$STACK_DIR"
   fi
-  printf "${C_B}  Ports: 80 (HTTP), 443 (HTTPS); NetBird P2P: 3478/udp, 49152-65535/udp, 33080/tcp${C_R}\n"
+  printf "${C_B}  Ports: 80 (HTTP), 443 (HTTPS); NetBird STUN: 3478/udp${C_R}\n"
   printf "${C_B}  Log: %s${C_R}\n" "$LOG_FILE"
   printf "${C_B}==============================================================================${C_R}\n\n"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
@@ -498,7 +498,7 @@ services:
       - "traefik.enable=true"
       - "traefik.http.routers.dockhand.rule=Host(\`dockhand.${DOMAIN}\`)"
       - "traefik.http.routers.dockhand.entrypoints=websecure"
-      - "traefik.http.routers.dockhand.tls.certresolver=le"
+      - "traefik.http.routers.dockhand.tls.certresolver=letsencrypt"
       - "traefik.http.routers.dockhand.middlewares=authentik@file"
       - "traefik.http.services.dockhand.loadbalancer.server.port=3000"
     networks:
@@ -536,7 +536,7 @@ setup_stack() {
   # Per-deploy secrets for the new stack.
   AUTHENTIK_BOOTSTRAP_TOKEN=$(rand_password 48)       # akadmin API token (blueprint/API)
   AUTHENTIK_BOOTSTRAP_PASSWORD=$(rand_password 24)    # akadmin initial UI password
-  NETBIRD_DATAREPLICA_SECRET=$(rand_secret)           # coturn/relay shared secret
+  NETBIRD_DATAREPLICA_SECRET=$(rand_secret)           # NetBird relay authSecret (config.yaml)
 
   mkdir -p "$TRAEFIK_DIR" "$TRAEFIK_DYNAMIC_DIR" "$TRAEFIK_LE_DIR" "$TRAEFIK_LOG_DIR" \
            "$AUTHENTIK_DIR" "$AUTHENTIK_MEDIA_DIR" "$AUTHENTIK_TEMPLATES_DIR" \
@@ -582,21 +582,20 @@ setup_stack() {
   done; printf "\r" >&2
   $ak_ok && success "Authentik ready" || warn "Authentik not healthy yet. Check: docker logs authentik-server"
 
-  # Apply blueprint + read back the NetBird OIDC client (public client; PKCE).
+  # Apply the Authentik blueprint (Dockhand forward-auth) before NetBird.
   bootstrap_authentik
 
-  # --- NetBird (behind the Traefik edge) -----------------------------------
-  # NOTE (staging): NetBird management/signal are gRPC (h2c). Traefik routes them
-  # by path on netbird.<domain> (see gen_traefik_files). If the dashboard can't
-  # reach the API, verify those routers + the h2c service scheme against your
-  # NetBird version: https://docs.netbird.io/selfhosted/external-reverse-proxy
-  info "Pulling + starting NetBird (management + signal + relay + coturn + dashboard)..."
+  # --- NetBird (combined server, behind the Traefik edge) ------------------
+  # The netbird-server + dashboard carry NetBird's OFFICIAL Traefik labels, so the
+  # gRPC h2c routing is upstream-maintained. If the dashboard can't reach the API,
+  # check: https://docs.netbird.io/selfhosted/external-reverse-proxy
+  info "Pulling + starting NetBird (combined server + dashboard)..."
   docker compose -f "${STACK_DIR}/docker-compose.netbird.yml" pull || true
   docker compose -f "${STACK_DIR}/docker-compose.netbird.yml" up -d
   for i in $(seq 1 30); do
-    docker ps --format '{{.Names}}' | grep -qx "netbird-management" && { success "NetBird containers up"; break; }
+    docker ps --format '{{.Names}}' | grep -qx "netbird-server" && { success "NetBird containers up"; break; }
     printf "\r  ${C_DIM}Waiting for NetBird... %d/30${C_R}" "$i" >&2
-    [[ $i -eq 30 ]] && warn "NetBird management not detected. Check: docker logs netbird-management"
+    [[ $i -eq 30 ]] && warn "netbird-server not detected. Check: docker logs netbird-server"
     sleep 2
   done; printf "\r" >&2
 
@@ -620,10 +619,14 @@ setup_stack() {
 # ---- Traefik ------------------------------------------------------------------
 gen_traefik_files() {
   local le_email="$1"
+  # Single Traefik edge. Entrypoint + resolver names (websecure / letsencrypt) and
+  # the gRPC stream-timeout flags are taken from NetBird's official installer, so
+  # NetBird's own container labels (netbird-grpc / netbird-backend / *-h2c) route
+  # correctly WITHOUT any hand-written routers. Also fronts Authentik + Dockhand.
   cat > "${STACK_DIR}/docker-compose.traefik.yml" << COMPOSE_TRAEFIK
 services:
   traefik:
-    image: traefik:v3.3
+    image: traefik:v3.6
     container_name: traefik
     hostname: traefik
     restart: always
@@ -648,9 +651,15 @@ services:
       - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
       - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
       - "--entrypoints.websecure.address=:443"
-      - "--certificatesresolvers.le.acme.email=${le_email}"
-      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
-      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
+      # gRPC streams (NetBird mgmt/signal/relay) must never time out.
+      - "--entrypoints.websecure.transport.respondingTimeouts.readTimeout=0"
+      - "--entrypoints.websecure.transport.respondingTimeouts.writeTimeout=0"
+      - "--entrypoints.websecure.transport.respondingTimeouts.idleTimeout=0"
+      - "--serverstransport.forwardingtimeouts.responseheadertimeout=0s"
+      - "--serverstransport.forwardingtimeouts.idleconntimeout=0s"
+      - "--certificatesresolvers.letsencrypt.acme.email=${le_email}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./traefik/dynamic:/dynamic:ro
@@ -664,6 +673,9 @@ networks:
 COMPOSE_TRAEFIK
 
   # Forward-auth middleware -> Authentik embedded outpost (standard integration).
+  # NetBird routing is NOT here -- the netbird-server/dashboard containers carry
+  # NetBird's official Traefik labels (see gen_netbird_files), so the h2c/gRPC
+  # routing is upstream-maintained, not reinvented.
   cat > "${TRAEFIK_DYNAMIC_DIR}/authentik.yml" << 'DYN_AK'
 http:
   middlewares:
@@ -684,55 +696,7 @@ http:
           - X-authentik-meta-app
           - X-authentik-meta-version
 DYN_AK
-
-  # NetBird routing behind the edge. management + signal are gRPC over h2c.
-  # STAGING: validate these path rules / h2c scheme against your NetBird version.
-  cat > "${TRAEFIK_DYNAMIC_DIR}/netbird.yml" << DYN_NB
-http:
-  routers:
-    netbird-dashboard:
-      rule: "Host(\`netbird.${DOMAIN}\`)"
-      entryPoints: [websecure]
-      service: netbird-dashboard
-      priority: 1
-      tls:
-        certResolver: le
-    netbird-api:
-      rule: "Host(\`netbird.${DOMAIN}\`) && PathPrefix(\`/api\`)"
-      entryPoints: [websecure]
-      service: netbird-management
-      priority: 10
-      tls:
-        certResolver: le
-    netbird-mgmt-grpc:
-      rule: "Host(\`netbird.${DOMAIN}\`) && PathPrefix(\`/management.ManagementService\`)"
-      entryPoints: [websecure]
-      service: netbird-management
-      priority: 20
-      tls:
-        certResolver: le
-    netbird-signal-grpc:
-      rule: "Host(\`netbird.${DOMAIN}\`) && PathPrefix(\`/signalexchange.SignalExchange\`)"
-      entryPoints: [websecure]
-      service: netbird-signal
-      priority: 20
-      tls:
-        certResolver: le
-  services:
-    netbird-dashboard:
-      loadBalancer:
-        servers:
-          - url: "http://netbird-dashboard:80"
-    netbird-management:
-      loadBalancer:
-        servers:
-          - url: "h2c://netbird-management:80"
-    netbird-signal:
-      loadBalancer:
-        servers:
-          - url: "h2c://netbird-signal:80"
-DYN_NB
-  success "Traefik edge + dynamic routes written"
+  success "Traefik edge written (NetBird-compatible: websecure/letsencrypt, gRPC timeouts off)"
 }
 
 # ---- Authentik ----------------------------------------------------------------
@@ -809,7 +773,7 @@ services:
       - "traefik.enable=true"
       - "traefik.http.routers.authentik.rule=Host(\`authentik.${DOMAIN}\`)"
       - "traefik.http.routers.authentik.entrypoints=websecure"
-      - "traefik.http.routers.authentik.tls.certresolver=le"
+      - "traefik.http.routers.authentik.tls.certresolver=letsencrypt"
       - "traefik.http.services.authentik.loadbalancer.server.port=9000"
     networks:
       - proxy
@@ -839,51 +803,17 @@ networks:
     external: true
 COMPOSE_AK
 
-  # Blueprint: declaratively create the NetBird OIDC provider/app + the Dockhand
-  # forward-auth proxy provider/app, bound to the embedded outpost. Authentik
-  # auto-applies blueprints found under /blueprints. STAGING: verify object refs
-  # against your Authentik version (2024.12 here).
-  cat > "${AUTHENTIK_BLUEPRINTS_DIR}/netbird-dockhand.yaml" << AK_BP
+  # Blueprint: declaratively create ONLY the Dockhand forward-auth proxy provider/app,
+  # bound to the embedded outpost. NetBird uses its OWN embedded IdP, so there is NO
+  # NetBird OIDC provider here. Authentik auto-applies blueprints under /blueprints.
+  # STAGING: verify object refs (flow/cert names) against your Authentik version (2024.12).
+  cat > "${AUTHENTIK_BLUEPRINTS_DIR}/dockhand-forwardauth.yaml" << AK_BP
 version: 1
 metadata:
-  name: netbird-dockhand-stack
+  name: dockhand-forwardauth
 context:
   domain: ${DOMAIN}
 entries:
-  # ---- NetBird OIDC (public client, PKCE + device flow) ----
-  - model: authentik_providers_oauth2.oauth2provider
-    id: provider-netbird
-    identifiers:
-      name: NetBird
-    attrs:
-      name: NetBird
-      client_type: public
-      client_id: ${OIDC_NETBIRD_CLIENT_ID}
-      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
-      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
-      signing_key: !Find [authentik_crypto.certificatekeypair, [name, authentik Self-signed Certificate]]
-      sub_mode: user_id
-      include_claims_in_id_token: true
-      redirect_uris:
-        - matching_mode: strict
-          url: https://netbird.${DOMAIN}/
-        - matching_mode: strict
-          url: https://netbird.${DOMAIN}/peers
-        - matching_mode: strict
-          url: http://localhost:53000
-      property_mappings:
-        - !Find [authentik_providers_oauth2.scopemapping, [scope_name, openid]]
-        - !Find [authentik_providers_oauth2.scopemapping, [scope_name, email]]
-        - !Find [authentik_providers_oauth2.scopemapping, [scope_name, profile]]
-        - !Find [authentik_providers_oauth2.scopemapping, [scope_name, offline_access]]
-  - model: authentik_core.application
-    id: app-netbird
-    identifiers:
-      slug: netbird
-    attrs:
-      name: NetBird
-      slug: netbird
-      provider: !KeyOf provider-netbird
   # ---- Dockhand forward-auth (proxy provider, embedded outpost) ----
   - model: authentik_providers_proxy.proxyprovider
     id: provider-dockhand
@@ -925,182 +855,143 @@ _ak_api() {
 
 bootstrap_authentik() {
   step "Bootstrapping Authentik (blueprint apply + verify)"
-  # The blueprint is auto-discovered + applied by the worker. Poll the API until
-  # the NetBird OAuth2 provider exists (confirms the blueprint applied).
+  # The blueprint is auto-discovered + applied by the worker. Poll the API until the
+  # Dockhand forward-auth (proxy) provider exists (confirms the blueprint applied).
   local ok=false i resp
   for i in $(seq 1 45); do
-    resp=$(_ak_api "/providers/oauth2/?client_id=${OIDC_NETBIRD_CLIENT_ID}" 2>/dev/null) || true
-    if echo "$resp" | jq -e '.results[0].client_id' >/dev/null 2>&1; then ok=true; break; fi
+    resp=$(_ak_api "/providers/proxy/?search=Dockhand" 2>/dev/null) || true
+    if echo "$resp" | jq -e '.results[] | select(.name=="Dockhand")' >/dev/null 2>&1; then ok=true; break; fi
     printf "\r  ${C_DIM}Waiting for Authentik blueprint to apply... %d/45${C_R}" "$i" >&2
     sleep 4
   done; printf "\r" >&2
   if $ok; then
-    success "Authentik blueprint applied (NetBird + Dockhand providers present)"
+    success "Authentik blueprint applied (Dockhand forward-auth provider present)"
   else
     warn "Could not confirm the Authentik blueprint via API. Finish in the UI:"
     warn "  https://authentik.${DOMAIN}  (login: akadmin / ${AUTHENTIK_DIR}/.akadmin_password)"
-    warn "  Create an OAuth2 provider 'netbird' (public, client_id=netbird) + app, and a"
-    warn "  forward-auth proxy provider for dockhand bound to the embedded outpost."
+    warn "  Create a forward-auth proxy provider for dockhand (external_host https://dockhand.${DOMAIN})"
+    warn "  bound to the embedded outpost."
   fi
 }
 
 # ---- NetBird ------------------------------------------------------------------
 gen_netbird_files() {
-  local ip="$1"
-  local issuer="https://authentik.${DOMAIN}/application/o/netbird/"
-  local turn_secret="$NETBIRD_DATAREPLICA_SECRET"
+  local _ip="${1:-}"   # unused (combined server has built-in STUN/relay)
+  local relay_secret="$NETBIRD_DATAREPLICA_SECRET" enc_key
+  enc_key=$(openssl rand -base64 32)
+  mkdir -p "${NETBIRD_DIR}/data"
 
-  # management.json -- OIDC pointed at Authentik. STAGING: validate against your
-  # NetBird management version (keys are from infrastructure_files/management.json.tmpl).
-  cat > "${NETBIRD_MGMT_DIR}/management.json" << MGMT
-{
-  "Stuns": [{ "Proto": "udp", "URI": "stun:netbird.${DOMAIN}:3478", "Username": "", "Password": "" }],
-  "TURNConfig": {
-    "Turns": [{ "Proto": "udp", "URI": "turn:netbird.${DOMAIN}:3478", "Username": "netbird", "Password": "" }],
-    "CredentialsTTL": "12h",
-    "Secret": "${turn_secret}",
-    "TimeBasedCredentials": false
-  },
-  "Signal": { "Proto": "https", "URI": "netbird.${DOMAIN}:443", "Username": "", "Password": "" },
-  "ReverseProxy": { "TrustedHTTPProxies": [], "TrustedHTTPProxiesCount": 1 },
-  "Datadir": "/var/lib/netbird/",
-  "DataStoreEncryptionKey": "${turn_secret}",
-  "StoreConfig": { "Engine": "sqlite" },
-  "HttpConfig": {
-    "Address": "0.0.0.0:80",
-    "AuthIssuer": "${issuer}",
-    "AuthAudience": "${OIDC_NETBIRD_AUDIENCE}",
-    "AuthKeysLocation": "${issuer}jwks/",
-    "OIDCConfigEndpoint": "${issuer}.well-known/openid-configuration",
-    "IdpSignKeyRefreshEnabled": true
-  },
-  "IdpManagerConfig": { "ManagerType": "none" },
-  "DeviceAuthorizationFlow": {
-    "Provider": "hosted",
-    "ProviderConfig": {
-      "Audience": "${OIDC_NETBIRD_AUDIENCE}",
-      "ClientID": "${OIDC_NETBIRD_CLIENT_ID}",
-      "Scope": "openid profile email offline_access",
-      "UseIDToken": false,
-      "TokenEndpoint": "https://authentik.${DOMAIN}/application/o/token/",
-      "DeviceAuthEndpoint": "https://authentik.${DOMAIN}/application/o/device/"
-    }
-  },
-  "PKCEAuthorizationFlow": {
-    "ProviderConfig": {
-      "Audience": "${OIDC_NETBIRD_AUDIENCE}",
-      "ClientID": "${OIDC_NETBIRD_CLIENT_ID}",
-      "Scope": "openid profile email offline_access",
-      "TokenEndpoint": "https://authentik.${DOMAIN}/application/o/token/",
-      "AuthorizationEndpoint": "https://authentik.${DOMAIN}/application/o/authorize/",
-      "RedirectURLs": ["http://localhost:53000"],
-      "UseIDToken": false
-    }
-  }
-}
-MGMT
+  # config.yaml -- VERBATIM from NetBird's official installer render_combined_yaml()
+  # (combined netbird-server, EMBEDDED IdP at /oauth2, sqlite store). No external
+  # OIDC: NetBird logs in via its own built-in IdP. Authentik gates the WEB apps.
+  cat > "${NETBIRD_DIR}/config.yaml" << NBCFG
+server:
+  listenAddress: ":80"
+  exposedAddress: "https://netbird.${DOMAIN}:443"
+  stunPorts:
+    - 3478
+  metricsPort: 9090
+  healthcheckAddress: ":9000"
+  logLevel: "info"
+  logFile: "console"
 
-  # coturn (STUN/TURN) config.
-  cat > "${NETBIRD_DIR}/turnserver.conf" << TURN
-listening-port=3478
-tls-listening-port=5349
-min-port=49152
-max-port=65535
-fingerprint
-lt-cred-mech
-use-auth-secret
-static-auth-secret=${turn_secret}
-realm=netbird.${DOMAIN}
-external-ip=${ip}
-no-cli
-no-tlsv1
-no-tlsv1_1
-TURN
+  authSecret: "${relay_secret}"
+  dataDir: "/var/lib/netbird"
 
+  auth:
+    issuer: "https://netbird.${DOMAIN}/oauth2"
+    signKeyRefreshEnabled: true
+    dashboardRedirectURIs:
+      - "https://netbird.${DOMAIN}/nb-auth"
+      - "https://netbird.${DOMAIN}/nb-silent-auth"
+    cliRedirectURIs:
+      - "http://localhost:53000/"
+
+  reverseProxy:
+    trustedHTTPProxies:
+      - "172.16.0.0/12"
+      - "10.0.0.0/8"
+      - "192.168.0.0/16"
+
+  store:
+    engine: "sqlite"
+    encryptionKey: "${enc_key}"
+NBCFG
+
+  # dashboard.env -- VERBATIM from the installer render_dashboard_env(): points the
+  # dashboard at NetBird's embedded IdP (/oauth2), client id netbird-dashboard.
+  cat > "${NETBIRD_DIR}/dashboard.env" << NBDASH
+NETBIRD_MGMT_API_ENDPOINT=https://netbird.${DOMAIN}
+NETBIRD_MGMT_GRPC_API_ENDPOINT=https://netbird.${DOMAIN}
+AUTH_AUDIENCE=netbird-dashboard
+AUTH_CLIENT_ID=netbird-dashboard
+AUTH_CLIENT_SECRET=
+AUTH_AUTHORITY=https://netbird.${DOMAIN}/oauth2
+USE_AUTH0=false
+AUTH_SUPPORTED_SCOPES=openid profile email groups
+AUTH_REDIRECT_URI=/nb-auth
+AUTH_SILENT_REDIRECT_URI=/nb-silent-auth
+NBDASH
+
+  # Combined netbird-server + dashboard. Traefik labels are VERBATIM from NetBird's
+  # installer (netbird-grpc / netbird-backend / netbird-server-h2c, dashboard) so the
+  # gRPC h2c routing is upstream-maintained. STUN published on 3478/udp; relay rides
+  # Traefik on /relay (no extra host port). One Traefik (ours) routes all of it.
   cat > "${STACK_DIR}/docker-compose.netbird.yml" << COMPOSE_NB
 services:
+  netbird-server:
+    image: netbirdio/netbird-server:latest
+    container_name: netbird-server
+    hostname: netbird-server
+    restart: unless-stopped
+    ports:
+      - 0.0.0.0:3478:3478/udp
+    volumes:
+      - ./netbird/data:/var/lib/netbird
+      - ./netbird/config.yaml:/etc/netbird/config.yaml
+    command: ["--config", "/etc/netbird/config.yaml"]
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.netbird-grpc.rule=Host(\`netbird.${DOMAIN}\`) && (PathPrefix(\`/signalexchange.SignalExchange/\`) || PathPrefix(\`/management.ManagementService/\`) || PathPrefix(\`/management.ProxyService/\`))"
+      - traefik.http.routers.netbird-grpc.entrypoints=websecure
+      - traefik.http.routers.netbird-grpc.tls=true
+      - traefik.http.routers.netbird-grpc.tls.certresolver=letsencrypt
+      - traefik.http.routers.netbird-grpc.service=netbird-server-h2c
+      - traefik.http.routers.netbird-grpc.priority=100
+      - "traefik.http.routers.netbird-backend.rule=Host(\`netbird.${DOMAIN}\`) && (PathPrefix(\`/relay\`) || PathPrefix(\`/ws-proxy/\`) || PathPrefix(\`/api\`) || PathPrefix(\`/oauth2\`))"
+      - traefik.http.routers.netbird-backend.entrypoints=websecure
+      - traefik.http.routers.netbird-backend.tls=true
+      - traefik.http.routers.netbird-backend.tls.certresolver=letsencrypt
+      - traefik.http.routers.netbird-backend.service=netbird-server
+      - traefik.http.routers.netbird-backend.priority=100
+      - traefik.http.services.netbird-server.loadbalancer.server.port=80
+      - traefik.http.services.netbird-server-h2c.loadbalancer.server.port=80
+      - traefik.http.services.netbird-server-h2c.loadbalancer.server.scheme=h2c
+    networks:
+      - proxy
   netbird-dashboard:
     image: netbirdio/dashboard:latest
     container_name: netbird-dashboard
     hostname: netbird-dashboard
     restart: unless-stopped
-    environment:
-      - NETBIRD_MGMT_API_ENDPOINT=https://netbird.${DOMAIN}
-      - NETBIRD_MGMT_GRPC_API_ENDPOINT=https://netbird.${DOMAIN}
-      - AUTH_AUDIENCE=${OIDC_NETBIRD_AUDIENCE}
-      - AUTH_CLIENT_ID=${OIDC_NETBIRD_CLIENT_ID}
-      - AUTH_CLIENT_SECRET=
-      - AUTH_AUTHORITY=https://authentik.${DOMAIN}/application/o/netbird/
-      - USE_AUTH0=false
-      - AUTH_SUPPORTED_SCOPES=openid profile email offline_access
-      - AUTH_REDIRECT_URI=/nb-auth
-      - AUTH_SILENT_REDIRECT_URI=/nb-silent-auth
-      - NETBIRD_TOKEN_SOURCE=accessToken
+    env_file:
+      - ./netbird/dashboard.env
+    labels:
+      - traefik.enable=true
+      - "traefik.http.routers.netbird-dashboard.rule=Host(\`netbird.${DOMAIN}\`)"
+      - traefik.http.routers.netbird-dashboard.entrypoints=websecure
+      - traefik.http.routers.netbird-dashboard.tls=true
+      - traefik.http.routers.netbird-dashboard.tls.certresolver=letsencrypt
+      - traefik.http.routers.netbird-dashboard.service=dashboard
+      - traefik.http.routers.netbird-dashboard.priority=1
+      - traefik.http.services.dashboard.loadbalancer.server.port=80
     networks:
       - proxy
-  netbird-signal:
-    image: netbirdio/signal:latest
-    container_name: netbird-signal
-    hostname: netbird-signal
-    restart: unless-stopped
-    command: ["--port", "80", "--log-file", "console", "--log-level", "info"]
-    volumes:
-      - ./netbird/signal:/var/lib/netbird
-    networks:
-      - proxy
-  netbird-management:
-    image: netbirdio/management:latest
-    container_name: netbird-management
-    hostname: netbird-management
-    restart: unless-stopped
-    depends_on:
-      - netbird-dashboard
-      - netbird-signal
-    command:
-      - "--port"
-      - "80"
-      - "--log-file"
-      - "console"
-      - "--log-level"
-      - "info"
-      - "--disable-anonymous-metrics=true"
-      - "--single-account-mode-domain=netbird.${DOMAIN}"
-      - "--dns-domain=netbird.${DOMAIN}"
-    volumes:
-      - ./netbird/management:/var/lib/netbird
-      - ./netbird/management/management.json:/etc/netbird/management.json
-    networks:
-      - proxy
-  netbird-relay:
-    image: netbirdio/relay:latest
-    container_name: netbird-relay
-    hostname: netbird-relay
-    restart: unless-stopped
-    ports:
-      - 0.0.0.0:33080:33080
-    environment:
-      - NB_LOG_LEVEL=info
-      - NB_LISTEN_ADDRESS=:33080
-      - NB_EXPOSED_ADDRESS=rel://netbird.${DOMAIN}:33080
-      - NB_AUTH_SECRET=${turn_secret}
-    networks:
-      - proxy
-  coturn:
-    image: coturn/coturn:latest
-    container_name: coturn
-    hostname: coturn
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ./netbird/turnserver.conf:/etc/turnserver.conf:ro
-    command:
-      - -c
-      - /etc/turnserver.conf
 networks:
   proxy:
     external: true
 COMPOSE_NB
-  success "NetBird compose + management.json + turnserver.conf written"
+  success "NetBird (combined server, embedded IdP) compose + config.yaml + dashboard.env written"
 }
 
 # ---- CrowdSec (Traefik-log aware) --------------------------------------------
@@ -1454,10 +1345,8 @@ setup_firewall_debian() {
     ufw allow 80/tcp comment 'HTTP'
     ufw allow 443/tcp comment 'HTTPS'
   fi
-  # NetBird peer-to-peer (STUN/TURN + relay). Coturn uses host networking.
-  ufw allow 3478/udp comment 'NetBird STUN/TURN'
-  ufw allow 49152:65535/udp comment 'NetBird TURN relay'
-  ufw allow 33080/tcp comment 'NetBird relay'
+  # NetBird STUN (combined server; relay rides the Traefik edge on /relay).
+  ufw allow 3478/udp comment 'NetBird STUN'
   ufw --force enable && ufw reload
   ufw status verbose >&2
   success "UFW configured (SSH port ${ssh_port} allowed)"
@@ -1485,10 +1374,8 @@ setup_firewall_rhel() {
     firewall-cmd --permanent --add-service=http
     firewall-cmd --permanent --add-service=https
   fi
-  # NetBird peer-to-peer (STUN/TURN + relay).
+  # NetBird STUN (combined server; relay rides the Traefik edge on /relay).
   firewall-cmd --permanent --add-port=3478/udp
-  firewall-cmd --permanent --add-port=49152-65535/udp
-  firewall-cmd --permanent --add-port=33080/tcp
   if ! firewall-cmd --get-zones 2>/dev/null | grep -q '\bdocker\b'; then
     firewall-cmd --permanent --new-zone=docker 2>/dev/null || true
   fi
@@ -1878,7 +1765,7 @@ verify_deployment() {
   }
 
   # Containers
-  local want="traefik authentik-server netbird-management netbird-dashboard dockhand crowdsec"
+  local want="traefik authentik-server netbird-server netbird-dashboard dockhand crowdsec"
   local c
   for c in $want; do
     _check "container '$c' running" bash -c "docker ps --format '{{.Names}}' | grep -qx '$c'"
@@ -1889,10 +1776,10 @@ verify_deployment() {
   _check "Traefik bound 443"          bash -c "ss -tln 2>/dev/null | grep -q ':443'"
   _check "Authentik health OK" bash -c \
     "curl -sf --max-time 5 -o /dev/null http://127.0.0.1:9000/-/health/ready/"
-  _check "Authentik NetBird OIDC provider present" bash -c \
-    "curl -s --max-time 5 -H 'Authorization: Bearer ${AUTHENTIK_BOOTSTRAP_TOKEN}' 'http://127.0.0.1:9000/api/v3/providers/oauth2/?client_id=${OIDC_NETBIRD_CLIENT_ID}' 2>/dev/null | jq -e '.results[0].client_id' >/dev/null"
-  _check "Traefik dynamic routes present" bash -c \
-    "test -f '${TRAEFIK_DYNAMIC_DIR}/netbird.yml' && test -f '${TRAEFIK_DYNAMIC_DIR}/authentik.yml'"
+  _check "Authentik Dockhand forward-auth provider present" bash -c \
+    "curl -s --max-time 5 -H 'Authorization: Bearer ${AUTHENTIK_BOOTSTRAP_TOKEN}' 'http://127.0.0.1:9000/api/v3/providers/proxy/?search=Dockhand' 2>/dev/null | jq -e '.results[] | select(.name==\"Dockhand\")' >/dev/null"
+  _check "Traefik forward-auth middleware present" bash -c \
+    "test -f '${TRAEFIK_DYNAMIC_DIR}/authentik.yml'"
 
   _check "CrowdSec LAPI responding"   docker exec crowdsec cscli metrics
   _check "acquisition label is traefik" bash -c \
@@ -1966,8 +1853,8 @@ ${C_B}Authentik (Identity Provider)${C_R}
 
 ${C_B}NetBird (self-hosted)${C_R}
   Dashboard: https://netbird.${DOMAIN}   (log in with an Authentik user)
-  Config:    ${NETBIRD_MGMT_DIR}/management.json
-  P2P ports: 3478/udp (STUN/TURN), 49152-65535/udp (relay), 33080/tcp (relay)
+  Config:    ${NETBIRD_DIR}/config.yaml  (embedded IdP; NetBird login = its own /oauth2)
+  P2P ports: 3478/udp (STUN; relay rides the Traefik edge on /relay)
   Client:    install NetBird on a device; set management URL https://netbird.${DOMAIN}
   Ext IP:    ${ext_ip}
 
@@ -1994,17 +1881,20 @@ ${C_B}Network${C_R}   proxy (bridge)
 ${C_B}${C_YEL}Done automatically:${C_R}
   - Traefik edge on 80/443 with Let's Encrypt (HTTP-01 challenge)
   - Authentik IdP deployed; NetBird OIDC + Dockhand forward-auth created via blueprint
-  - NetBird control plane (management/signal/relay/coturn/dashboard) behind Traefik
+  - NetBird combined server (mgmt/signal/relay/STUN) + dashboard behind the Traefik edge
   - CrowdSec parsing Traefik logs; bans enforced incl. Docker-published ports (DOCKER-USER)
   - Cloudflare real visitor IP trusted in Traefik (forwardedHeaders.trustedIPs)
   - Host filesystem mounted into Dockhand READ-ONLY
 
 ${C_B}${C_RED}STAGING NOTES (test before production):${C_R}
-  - NetBird mgmt/signal are gRPC (h2c) behind Traefik. If the dashboard cannot reach
-    the API, check the routers in ${TRAEFIK_DYNAMIC_DIR}/netbird.yml against your
-    NetBird version: https://docs.netbird.io/selfhosted/external-reverse-proxy
-  - Confirm the Authentik blueprint applied (Admin > Applications/Providers: NetBird,
-    Dockhand). If not, finish in the Authentik UI (login akadmin / password above).
+  - NetBird routing uses NetBird's OWN official Traefik labels (gRPC h2c handled
+    upstream). If the dashboard cannot reach the API, compare the labels on
+    netbird-server against your NetBird version:
+    https://docs.netbird.io/selfhosted/external-reverse-proxy
+  - NetBird login uses NetBird's EMBEDDED IdP (/oauth2) -- first visit to
+    https://netbird.<domain> walks you through creating the initial admin.
+  - Confirm the Authentik blueprint applied (Admin > Providers: Dockhand). If not,
+    finish in the Authentik UI (login akadmin / password above).
 
 ${C_B}${C_YEL}Cloudflare - finish in the dashboard (no public API for these):${C_R}
   1. Worker Route -> FAIL OPEN:  ${DOMAIN} > Workers Routes > the crowdsec route
@@ -2016,7 +1906,7 @@ ${C_B}${C_YEL}Credential files (root-only, mode 600):${C_R}
   ${AUTHENTIK_DIR}/authentik.env
 
 ${C_B}Troubleshooting:${C_R}
-  Logs:    docker logs -f traefik   docker logs -f authentik-server   docker logs -f netbird-management
+  Logs:    docker logs -f traefik   docker logs -f authentik-server   docker logs -f netbird-server
   Restart: cd ${STACK_DIR} && docker compose -f docker-compose.traefik.yml restart
   FW:      ${fw_cmd}
   Log:     ${LOG_FILE}
