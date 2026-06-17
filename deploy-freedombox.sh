@@ -1295,6 +1295,11 @@ setup_cloudflare_bouncer() {
     printf "Leave blank to skip the live deploy and finish later.\n" >&2
     read -rsp "Cloudflare API token (hidden, Enter to skip): " CF_API_TOKEN >&2 || true
     printf "\n" >&2
+    if [[ -n "$CF_API_TOKEN" ]]; then
+      printf "  ${C_GRN}Token received${C_R} (%s chars, ending ...%s)\n" "${#CF_API_TOKEN}" "${CF_API_TOKEN: -4}" >&2
+    else
+      printf "  ${C_YEL}No token entered -- skipping the live Cloudflare deploy.${C_R}\n" >&2
+    fi
   fi
 
   # 2. Install the bouncer (CrowdSec repo + package manager, graceful fallback).
