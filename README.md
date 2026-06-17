@@ -253,6 +253,36 @@ Set `CF_API_TOKEN` (a Cloudflare **User** API token) and the deploy installs the
 
 To deploy the bouncer on an **already-running** stack without redeploying, set the token + zone/account IDs in `/etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml`, then `systemctl enable --now crowdsec-cloudflare-worker-bouncer`.
 
+#### Creating the Cloudflare API token
+
+In the Cloudflare dashboard: **My Profile → API Tokens → Create Token → Create Custom Token** (a **User** token, *not* an Account token).
+
+**Token name:** `crowdsec-cloudflare`
+
+**Permissions** — add these **9 rows**. Each row has three dropdowns: 1st = scope (Account / User / Zone), 2nd = permission name, 3rd = access (Read / Edit):
+
+| Scope | Permission | Access |
+|-------|-----------|--------|
+| Account | Workers KV Storage | Edit |
+| Account | Workers Scripts | Edit |
+| Account | Turnstile | Edit |
+| Account | Account Settings | Read |
+| Account | Account Analytics | Read |
+| User | User Details | Read |
+| Zone | DNS | Read |
+| Zone | Workers Routes | Edit |
+| Zone | Zone | Read |
+
+**Account Resources:** leave as **Include → All accounts** (unless you have multiple Cloudflare accounts).
+
+**Zone Resources:** after you add the Zone permissions a Zone Resources section appears — choose **Include → Specific zone** and select your domain (or **All zones** if you only manage a few).
+
+**Client IP Address Filtering:** leave blank.
+
+**TTL:** leave blank (no expiration) unless you want the token to expire.
+
+Then **Continue to summary → Create Token**, copy the generated token, and paste it at the deploy prompt (or pass it as `CF_API_TOKEN=<token>`).
+
 ### Console (cloud)
 
 Each deploy enrolls the CrowdSec instance in the **CrowdSec Console** via `cscli console enroll --auto`. View alerts, decisions, and metrics at [app.crowdsec.net](https://app.crowdsec.net) — accept the pending enrollment there. If enrollment was skipped (LAPI not ready at deploy time), run:
