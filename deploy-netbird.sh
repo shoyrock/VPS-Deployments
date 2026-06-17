@@ -1896,6 +1896,16 @@ ${C_B}${C_RED}STAGING NOTES (test before production):${C_R}
   - Confirm the Authentik blueprint applied (Admin > Providers: Dockhand). If not,
     finish in the Authentik UI (login akadmin / password above).
 
+${C_B}${C_RED}REQUIRED -- OPEN INBOUND PORTS AT YOUR CLOUD FIREWALL${C_R} (security group / VCN / ACL)
+  This script set the HOST firewall, but Docker-published ports BYPASS it, and your
+  cloud provider's firewall sits IN FRONT of the VPS. It must allow inbound:
+     80/tcp, 443/tcp   (NetBird dashboard + web apps; Let's Encrypt also needs 443)
+     3478/udp          (NetBird STUN / NAT traversal)
+     <your SSH port>/tcp
+  Quick check ON the VPS:  curl -skI -m5 https://127.0.0.1 -H "Host: netbird.${DOMAIN}"
+  If that responds but the site is unreachable from your browser, the block is the
+  cloud firewall or DNS (netbird.${DOMAIN} -> this server's IP) -- not this script.
+
 ${C_B}${C_YEL}Cloudflare - finish in the dashboard (no public API for these):${C_R}
   1. Worker Route -> FAIL OPEN:  ${DOMAIN} > Workers Routes > the crowdsec route
   2. Managed WAF ruleset:        ${DOMAIN} > Security > WAF > Managed rules > enable
