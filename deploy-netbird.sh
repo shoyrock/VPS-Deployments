@@ -1516,24 +1516,24 @@ BOUNCER_SERVICE
     warn "Firewall bouncer download failed -- bans will not be enforced at the firewall. Install manually later."
     return 0
   fi
-  docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
+  docker exec crowdsec cscli bouncers delete firewall-bouncer 2>/dev/null || true
   # FIXED: the old extraction grepped for lowercase hex ([a-f0-9]{32,}), but
   # modern CrowdSec issues base64-style keys with uppercase chars -> the grep
   # matched nothing, the config file was never written, and the bouncer
   # crash-looped on "no such file". '-o raw' prints exactly the key.
   local api_key
-  api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer -o raw 2>/dev/null | tr -d '[:space:]' || true)
+  api_key=$(docker exec crowdsec cscli bouncers add firewall-bouncer -o raw 2>/dev/null | tr -d '[:space:]' || true)
   if [[ -z "$api_key" ]]; then
     # fallback for very old cscli without -o raw: accept base64/hex charsets
-    docker exec crowdsec cscli bouncers delete npm-bouncer 2>/dev/null || true
-    api_key=$(docker exec crowdsec cscli bouncers add npm-bouncer 2>/dev/null | grep -oE '[A-Za-z0-9+/=_-]{30,}' | head -1 || true)
+    docker exec crowdsec cscli bouncers delete firewall-bouncer 2>/dev/null || true
+    api_key=$(docker exec crowdsec cscli bouncers add firewall-bouncer 2>/dev/null | grep -oE '[A-Za-z0-9+/=_-]{30,}' | head -1 || true)
   fi
   if [[ -n "$api_key" ]]; then
     mkdir -p /etc/crowdsec
     local fw_mode="iptables"
     command -v nft &>/dev/null && fw_mode="nftables"
     # iptables_chains includes DOCKER-USER so bans also apply to traffic
-    # heading into Docker-published ports (80/443/81), which otherwise
+    # heading into Docker-published ports (80/443/3478), which otherwise
     # bypasses INPUT entirely. (Used in iptables mode; ignored by nftables.)
     cat > /etc/crowdsec/crowdsec-firewall-bouncer.yaml << BOUNCER
 api_url: http://127.0.0.1:8080
@@ -1572,7 +1572,7 @@ BOUNCER
       error "Firewall bouncer is NOT running - bans are not enforced. Journal saved to ${LOG_FILE}. Debug: journalctl -u crowdsec-firewall-bouncer -n 30"
     fi
   else
-    error "Could not obtain bouncer API key - config NOT written, bans will not be enforced. Fix manually: docker exec crowdsec cscli bouncers add npm-bouncer -o raw"
+    error "Could not obtain bouncer API key - config NOT written, bans will not be enforced. Fix manually: docker exec crowdsec cscli bouncers add firewall-bouncer -o raw"
   fi
 }
 
