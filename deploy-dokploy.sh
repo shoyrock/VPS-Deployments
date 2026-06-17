@@ -246,53 +246,63 @@ preflight_checks() {
 
 idempotent_cleanup() {
   step "Cleanup"
-  # SAFETY GATE: this step destroys ALL Docker containers and volumes on the
-  # host, not just ones from a previous run of this script. Require explicit
-  # confirmation unless FORCE_CLEANUP=1 (for unattended/CI use).
+  # ---------------------------------------------------------------------------
+  # FRESH vs EXISTING. On a fresh system there is nothing to destroy -> skip
+  # silently. On an existing system, take ONE explicit confirmation, then do ALL
+  # destruction (Docker + /opt data + services + CrowdSec packages). Unattended:
+  # FORCE_CLEANUP=1 skips the prompt.
+  # ---------------------------------------------------------------------------
+  local not_fresh=0; local -a reasons=(); local d
   if command -v docker &>/dev/null && docker info &>/dev/null; then
-    if [[ -n "$(docker ps -aq 2>/dev/null)" || -n "$(docker volume ls -q 2>/dev/null)" || -n "$(docker images -aq 2>/dev/null)" ]]; then
-      if [[ "${FORCE_CLEANUP:-0}" != "1" ]]; then
-        printf "\n${C_RED}${C_B}WARNING:${C_R}${C_RED} This will STOP and DELETE ALL Docker containers, volumes, images and custom networks on this host (irreversible).${C_R}\n" >&2
-        read -rp "Continue? [yes/no]: " _confirm
-        [[ "$_confirm" =~ ^[Yy]([Ee][Ss])?$ ]] || fatal "Aborted by user before destructive cleanup. Re-run with FORCE_CLEANUP=1 to skip this prompt."
-      fi
-      info "Removing ALL existing containers, volumes, images and custom networks..."
-      # 1. Leave any Swarm FIRST. Prior dokploy/coolify installs run Swarm, which
-      #    reschedules task containers the instant you remove them -> the classic
-      #    "leftovers keep coming back". Leaving the swarm tears down its services.
-      docker swarm leave --force &>/dev/null || true
-      # 2. Force-remove every container (rm -f also stops running ones). Two passes
-      #    catch anything a restart policy or a late Swarm task brought back.
-      local _pass
-      for _pass in 1 2; do
-        docker ps -aq 2>/dev/null | xargs -r docker rm -f &>/dev/null || true
-      done
-      # 3. Volumes (now unmounted -> removable), then ALL images.
-      docker volume ls -q 2>/dev/null | xargs -r docker volume rm -f &>/dev/null || true
-      docker images -aq 2>/dev/null | xargs -r docker rmi -f &>/dev/null || true
-      # 4. Final sweep: any straggler containers/images/volumes + unused custom
-      #    networks (e.g. an old 'proxy' net) + dangling build cache.
-      docker system prune -af --volumes &>/dev/null || true
-      # 5. Verify nothing survived; warn loudly if it did (e.g. a re-arming Swarm).
-      local _left; _left="$(docker ps -aq 2>/dev/null | wc -l | tr -d ' ')"
-      if [[ "${_left:-0}" != "0" ]]; then
-        warn "${_left} container(s) survived cleanup -- a Swarm service may be re-arming. Run: docker swarm leave --force; docker rm -f \$(docker ps -aq)"
-      else
-        success "Docker fully reset (containers, volumes, images, networks)"
-      fi
+    [[ -n "$(docker ps -aq 2>/dev/null)"       ]] && { not_fresh=1; reasons+=("Docker containers"); }
+    [[ -n "$(docker volume ls -q 2>/dev/null)" ]] && { not_fresh=1; reasons+=("Docker volumes"); }
+    [[ -n "$(docker images -aq 2>/dev/null)"   ]] && { not_fresh=1; reasons+=("Docker images"); }
+  fi
+  for d in /opt/*-stack /opt/npm /opt/casaos /var/lib/casaos; do
+    [[ -e "$d" ]] && { not_fresh=1; reasons+=("$d"); break; }
+  done
+  [[ -d /etc/crowdsec || -f /usr/local/bin/crowdsec-firewall-bouncer ]] && { not_fresh=1; reasons+=("CrowdSec install"); }
+  dpkg-query -W -f='${Package}\n' 2>/dev/null | grep -qiE '^crowdsec' && { not_fresh=1; reasons+=("CrowdSec packages"); }
+
+  if [[ "$not_fresh" -eq 0 ]]; then
+    success "Fresh system detected -- nothing to destroy."
+    mkdir -p "$STACK_DIR"; chmod 750 "$STACK_DIR"
+    return 0
+  fi
+
+  warn "Existing install detected: ${reasons[*]}"
+  if [[ "${FORCE_CLEANUP:-0}" != "1" ]]; then
+    printf "\n${C_RED}${C_B}WARNING:${C_R}${C_RED} This is NOT a fresh system. Continuing will STOP and DELETE ALL Docker containers, volumes, images and custom networks, remove /opt/*-stack data, and PURGE CrowdSec packages on this host (irreversible).${C_R}\n" >&2
+    read -rp "Destroy everything and start clean? [yes/no]: " _confirm
+    [[ "$_confirm" =~ ^[Yy]([Ee][Ss])?$ ]] || fatal "Aborted by user. Nothing was changed. Re-run with FORCE_CLEANUP=1 to skip this prompt."
+  fi
+
+  # ---- destructive from here (confirmed, or FORCE_CLEANUP=1) -----------------
+  if command -v docker &>/dev/null && docker info &>/dev/null; then
+    info "Removing ALL existing containers, volumes, images and custom networks..."
+    # Leave any Swarm FIRST (dokploy/coolify) so killed task containers don't respawn.
+    docker swarm leave --force &>/dev/null || true
+    local _pass
+    for _pass in 1 2; do
+      docker ps -aq 2>/dev/null | xargs -r docker rm -f &>/dev/null || true
+    done
+    docker volume ls -q 2>/dev/null | xargs -r docker volume rm -f &>/dev/null || true
+    docker images -aq 2>/dev/null | xargs -r docker rmi -f &>/dev/null || true
+    docker system prune -af --volumes &>/dev/null || true
+    local _left; _left="$(docker ps -aq 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "${_left:-0}" != "0" ]]; then
+      warn "${_left} container(s) survived -- a Swarm service may be re-arming. Run: docker swarm leave --force; docker rm -f \$(docker ps -aq)"
+    else
+      success "Docker fully reset (containers, volumes, images, networks)"
     fi
   fi
 
-  # Remove ALL previously deployed platform data directories
   info "Removing ALL previous platform data..."
-  for dir in /opt/npm /opt/casaos /var/lib/casaos /opt/casaos-stack /opt/coolify-stack /opt/cosmos-stack /opt/dockge-stack /opt/dockhand-stack /opt/dokploy-stack /opt/portainer-stack /opt/runtipi-stack /opt/freedombox-stack /opt/yunohost-stack; do
-    rm -rf "$dir" 2>/dev/null || true
+  for d in /opt/npm /opt/casaos /var/lib/casaos /opt/casaos-stack /opt/coolify-stack /opt/cosmos-stack /opt/dockge-stack /opt/dockhand-stack /opt/dokploy-stack /opt/portainer-stack /opt/runtipi-stack /opt/freedombox-stack /opt/yunohost-stack /opt/netbird-stack; do
+    rm -rf "$d" 2>/dev/null || true
   done
 
-  # Stop and remove ALL previously deployed platform systemd services
   info "Removing ALL previous platform services..."
-  # Tear down any existing Cloudflare Worker bouncer infra on Cloudflare's side
-  # BEFORE deleting its config, so we don't orphan Workers/KV on the CF account.
   if command -v crowdsec-cloudflare-worker-bouncer &>/dev/null \
      && [[ -f /etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml ]]; then
     info "Removing Cloudflare Worker bouncer infrastructure from Cloudflare..."
@@ -306,33 +316,35 @@ idempotent_cleanup() {
     rm -f "/etc/systemd/system/${svc}.service" "/etc/systemd/system/${svc}" 2>/dev/null || true
   done
   for svc in casaos-gateway casaos-user-service casaos-local-storage casaos-message-bus runtipi crowdsec-firewall-bouncer crowdsec-cloudflare-worker-bouncer; do
-    systemctl unmask "$svc" 2>/dev/null || true   # unmask so this run can re-create them
+    systemctl unmask "$svc" 2>/dev/null || true
   done
   systemctl daemon-reload 2>/dev/null || true
 
-  # Remove firewall bouncer binary and config
   rm -f /usr/local/bin/crowdsec-firewall-bouncer 2>/dev/null || true
   rm -f /etc/crowdsec/crowdsec-firewall-bouncer.yaml 2>/dev/null || true
   rm -rf /etc/crowdsec 2>/dev/null || true
 
-  # Remove native crowdsec packages
+  # Native crowdsec packages. CRITICAL: a prior run can leave a HALF-CONFIGURED
+  # package (CF worker-bouncer postinst failing) -> dpkg broken, apt-get remove
+  # itself fails, broken state survives. Repair dpkg FIRST, then PURGE, repair
+  # deps, drop the apt repo.
   if [[ "$OS_FAMILY" == "debian" ]]; then
-    apt-get remove -y -qq crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
-    apt-get autoremove -y -qq 2>/dev/null || true
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>/dev/null || true
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -f -y -qq 2>/dev/null || true
+    DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y -qq 2>/dev/null || true
+    rm -f /etc/apt/sources.list.d/crowdsec_crowdsec.list 2>/dev/null || true
   else
     local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
     $pkg remove -y -q crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
   fi
 
-  # Also handle snap-installed Docker (Ubuntu)
   if command -v snap &>/dev/null; then
     snap disable docker 2>/dev/null || true
     snap remove docker 2>/dev/null || true
   fi
 
-  # Immediately recreate the stack directory after cleaning
-  mkdir -p "$STACK_DIR" "$NPM_DATA_DIR" "$NPM_LE_DIR" "$NPM_LOGS_DIR" "$CROWDSEC_DIR" "$STACK_DIR"
-  chmod 750 "$STACK_DIR"
+  mkdir -p "$STACK_DIR"; chmod 750 "$STACK_DIR"
   success "Stack directory recreated: $STACK_DIR"
 }
 
@@ -1352,6 +1364,13 @@ setup_cloudflare_bouncer() {
 
   # 2. Install the bouncer (CrowdSec repo + package manager, graceful fallback).
   local have_bin=false
+  # The CF worker-bouncer postinst READS this config and FATALs (breaking dpkg)
+  # if it is missing -> pre-create a minimal stub BEFORE install; step 4 below
+  # overwrites it with the real config once the CF zone/account are discovered.
+  if [[ ! -s "$cfg" ]]; then
+    printf '%s\n' 'crowdsec_config:' '  lapi_key: ""' '  lapi_url: http://127.0.0.1:8080/' 'cloudflare_config:' '  accounts: []' 'log_level: info' 'log_media: stdout' > "$cfg" 2>/dev/null || true
+    chmod 600 "$cfg" 2>/dev/null || true
+  fi
   if command -v crowdsec-cloudflare-worker-bouncer &>/dev/null; then
     have_bin=true
   elif [[ "$OS_FAMILY" == "debian" ]]; then

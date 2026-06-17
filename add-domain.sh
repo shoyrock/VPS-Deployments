@@ -105,12 +105,31 @@ _npm_api() {
   [[ -n "$NPM_TOKEN" ]] && args+=(-H "Authorization: Bearer ${NPM_TOKEN}")
   curl "${args[@]}" "${NPM_API_BASE}${path}" "$@"
 }
-npm_login() {
-  local pass="changeme" pf="${STACK_DIR}/.npm_admin_password" resp
-  [[ -f "$pf" ]] && pass="$(tr -d '\n' < "$pf")"
-  resp=$(_npm_api /tokens -d "$(jq -nc --arg s "$pass" '{identity:"admin@example.com",secret:$s}')" 2>/dev/null) || true
+# Try one identity+password against NPM /tokens; sets NPM_TOKEN on success.
+_npm_try_login() {
+  local identity="$1" pass="$2" resp
+  resp=$(_npm_api /tokens -d "$(jq -nc --arg i "$identity" --arg s "$pass" '{identity:$i,secret:$s}')" 2>/dev/null) || true
   NPM_TOKEN=$(echo "$resp" | jq -r '.token // empty' 2>/dev/null || true)
-  [[ -n "$NPM_TOKEN" ]] || fatal "NPM API login failed (tried ${pf} then 'changeme'). Is NPM admin reachable on :81?"
+  [[ -n "$NPM_TOKEN" ]]
+}
+npm_login() {
+  local pf="${STACK_DIR}/.npm_admin_password" id="admin@example.com"
+  # 1. Saved password (default identity), then 2. the factory default.
+  if [[ -f "$pf" ]] && _npm_try_login "$id" "$(tr -d '\n' < "$pf")"; then return 0; fi
+  if _npm_try_login "$id" "changeme"; then return 0; fi
+  # 3. Saved/default rejected -> the admin changed the NPM login. Do NOT assume the
+  #    defaults: prompt for the real credentials (or fail clearly if no TTY).
+  warn "NPM saved/default credentials were rejected -- the admin login was changed."
+  [[ -t 0 ]] || fatal "No terminal to prompt for NPM credentials. Put the current password in ${pf} (identity ${id}), or run this interactively."
+  local i in_id in_pass
+  for i in 1 2 3; do
+    read -rp "NPM admin email [${id}]: " in_id
+    in_id="${in_id:-$id}"
+    read -rsp "NPM admin password: " in_pass; printf '\n' >&2
+    if _npm_try_login "$in_id" "$in_pass"; then success "NPM login OK (${in_id})"; return 0; fi
+    warn "Login failed (attempt ${i}/3)."
+  done
+  fatal "Could not authenticate to NPM after 3 attempts. Verify the admin login at the NPM UI (:81 or SSH tunnel)."
 }
 npm_host_id() {  # <fqdn> -> existing proxy-host id, or empty
   _npm_api /nginx/proxy-hosts 2>/dev/null \
