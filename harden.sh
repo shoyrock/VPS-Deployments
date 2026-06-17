@@ -76,10 +76,10 @@ preflight() {
     # Detect if deployment scripts have been run first
     # ---------------------------------------------------------------------------
     local deployed=false
-    for d in /opt/dockhand-stack /opt/portainer-stack /opt/dockge-stack /opt/cosmos-stack /opt/coolify-stack /opt/dokploy-stack /opt/casaos-stack /opt/runtipi-stack /opt/yunohost-stack /opt/freedombox-stack; do
+    for d in /opt/dockhand-stack /opt/portainer-stack /opt/dockge-stack /opt/cosmos-stack /opt/coolify-stack /opt/dokploy-stack /opt/casaos-stack /opt/runtipi-stack /opt/yunohost-stack /opt/freedombox-stack /opt/netbird-stack; do
         [[ -d "$d" ]] && deployed=true && break
     done
-    command -v docker &>/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -qE 'npm|portainer|dockge|coolify|dockhand|cosmos|dokploy|casaos|runtipi|yunohost|freedombox' && deployed=true
+    command -v docker &>/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -qE 'npm|portainer|dockge|coolify|dockhand|cosmos|dokploy|casaos|runtipi|yunohost|freedombox|netbird-server|traefik|authentik' && deployed=true
 
     if [[ "$deployed" == false ]]; then
         echo ""
@@ -205,6 +205,12 @@ harden_firewall() {
         ufw limit 22/tcp  comment 'SSH rate limit'                      >> "$LOGFILE" 2>&1 || true
         ufw limit 80/tcp  comment 'HTTP (host only; Docker bypasses UFW)'  >> "$LOGFILE" 2>&1 || true
         ufw limit 443/tcp comment 'HTTPS (host only; Docker bypasses UFW)' >> "$LOGFILE" 2>&1 || true
+        # NetBird needs STUN/UDP 3478 for NAT traversal. The reset above wiped it,
+        # so re-add it whenever a NetBird stack is present (no-op otherwise).
+        if [[ -d /opt/netbird-stack ]] || { command -v docker &>/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx netbird-server; }; then
+            ufw allow 3478/udp comment 'NetBird STUN' >> "$LOGFILE" 2>&1 || true
+            ok "NetBird STUN (3478/udp) allowed"
+        fi
         ufw --force enable >> "$LOGFILE" 2>&1 || true
         ok "UFW configured (SSH rate-limited; HTTP/HTTPS protected by CrowdSec — see note)"
     else
@@ -215,6 +221,10 @@ harden_firewall() {
         firewall-cmd --permanent --add-service=http >> "$LOGFILE" 2>&1 || true
         firewall-cmd --permanent --add-service=https >> "$LOGFILE" 2>&1 || true
         firewall-cmd --permanent --add-service=ssh >> "$LOGFILE" 2>&1 || true
+        # NetBird STUN/UDP 3478 (NAT traversal) when a NetBird stack is present.
+        if [[ -d /opt/netbird-stack ]] || { command -v docker &>/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx netbird-server; }; then
+            firewall-cmd --permanent --add-port=3478/udp >> "$LOGFILE" 2>&1 || true
+        fi
         firewall-cmd --reload >> "$LOGFILE" 2>&1 || true
         ok "Firewalld rate limiting configured"
     fi
