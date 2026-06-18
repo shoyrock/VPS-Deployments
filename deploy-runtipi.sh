@@ -765,7 +765,7 @@ npm_create_proxy_host() {
     }')
 
   local RESP ID
-  RESP=$(_npm_api "/nginx/proxy-hosts" -X POST -d "$JSON")
+  RESP=$(_npm_api "/nginx/proxy-hosts" -X POST -d "$JSON") || true
   ID=$(echo "$RESP" | jq -r '.id // empty')
   if [[ -n "$ID" ]]; then
     success "Created proxy host: ${DOMAIN_NAME} -> ${FWD_HOST}:${FWD_PORT}"
@@ -777,12 +777,10 @@ npm_create_proxy_host() {
 }
 
 npm_enable_ssl() {
-  # Correct NPM API flow: 1) create LE certificate, 2) attach it to the host.
-  # (The old /nginx/proxy-hosts/{id}/certificates endpoint does not exist.)
   local HOST_ID="$1"
   local DOMAIN_NAME="$2"
   local EMAIL="${3:-admin@${DOMAIN}}"
-  local JSON RESP CERT_ID
+  local JSON RESP CERT_ID HOST_JSON
 
   JSON=$(jq -nc --arg email "$EMAIL" --arg domain "$DOMAIN_NAME" '{
     provider: "letsencrypt",
@@ -798,12 +796,26 @@ npm_enable_ssl() {
     return 1
   fi
 
-  JSON=$(jq -nc --argjson cert "$CERT_ID" '{
+  HOST_JSON=$(_npm_api "/nginx/proxy-hosts/${HOST_ID}") || true
+  if [[ -z "$HOST_JSON" ]]; then
+    warn "Could not fetch host ${HOST_ID} config to attach SSL — attach manually in NPM UI"
+    return 1
+  fi
+  JSON=$(echo "$HOST_JSON" | jq -c --argjson cert "$CERT_ID" '{
+    domain_names: .domain_names,
+    forward_scheme: .forward_scheme,
+    forward_host: .forward_host,
+    forward_port: .forward_port,
+    access_list_id: (.access_list_id // 0),
     certificate_id: $cert,
     ssl_forced: true,
+    caching_enabled: (.caching_enabled // false),
+    block_exploits: (.block_exploits // true),
+    allow_websocket_upgrade: (.allow_websocket_upgrade // true),
+    http2_support: true,
     hsts_enabled: true,
     hsts_subdomains: false,
-    http2_support: true
+    advanced_config: (.advanced_config // "")
   }')
   RESP=$(_npm_api "/nginx/proxy-hosts/${HOST_ID}" -X PUT -d "$JSON") || true
   if [[ -n "$(echo "$RESP" | jq -r '.id // empty')" ]]; then
@@ -1046,6 +1058,9 @@ setup_firewall_debian() {
   fi
   ufw allow 81/tcp comment 'NPM Admin'
   ufw --force enable && ufw reload
+  # UFW reset flushes iptables rules; Docker's rules (published ports) are
+  # temporarily dropped. Restart Docker to rebuild its iptables chains.
+  systemctl restart docker 2>/dev/null || true
   ufw status verbose >&2
   success "UFW configured (SSH port ${ssh_port} allowed)"
 }
@@ -1249,7 +1264,7 @@ BOUNCER
       if systemctl is-active --quiet crowdsec-firewall-bouncer; then bouncer_ok=true; break; fi
       sleep 2
       # one mid-loop retry in case LAPI wasn't ready on first start
-      [[ $i -eq 5 ]] && systemctl restart crowdsec-firewall-bouncer >>"$LOG_FILE" 2>&1 || true
+      [[ $i -eq 5 ]] && { systemctl restart crowdsec-firewall-bouncer >>"$LOG_FILE" 2>&1 || warn "Mid-loop bouncer restart failed — continuing"; }
     done
     if $bouncer_ok; then
       success "Firewall bouncer registered and ACTIVE"
