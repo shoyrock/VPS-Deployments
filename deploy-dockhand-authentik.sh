@@ -17,7 +17,7 @@ fi
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.6.1-hardened-cloudflare-authentik"
+readonly SCRIPT_VERSION="4.6.2-hardened-cloudflare-authentik"
 readonly SCRIPT_NAME="deploy-dockhand-authentik.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/dockhand-stack"
@@ -794,7 +794,10 @@ npm_change_password() {
   LOGIN=$(_npm_api "/tokens" -d "$JSON" 2>/dev/null) || true
   NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty')
   if [[ -z "$NPM_TOKEN" ]]; then
-    warn "Could not get NPM token - skipping automated NPM setup"
+    # Log the raw rejection so the cause is diagnosable (wrong default creds, NPM
+    # not ready, API shape change) instead of a blind "skipping".
+    _log "WARN" "NPM /tokens login response: $(printf '%s' "$LOGIN" | tr -d '\n' | cut -c1-300)"
+    warn "Could not get NPM token (default admin@example.com/changeme rejected). Raw response in ${LOG_FILE}. Skipping automated NPM setup - change the password manually at :81."
     return 1
   fi
 
@@ -980,6 +983,26 @@ bootstrap_authentik() {
     return 0
   fi
   success "Authentik API reachable"
+
+  # 1b. The health endpoint above needs NO auth, so it cannot detect a bad/missing
+  #     bootstrap token - which is exactly what makes every subsequent API call
+  #     return 403 and the flow lookup come back empty ("Could not resolve flow").
+  #     Probe an AUTHENTICATED endpoint and report the HTTP code so the real cause
+  #     (403 = token problem, 404 = path/version) is obvious instead of a vague warn.
+  local ak_auth_code
+  ak_auth_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+    -H "Authorization: Bearer ${AUTHENTIK_BOOTSTRAP_TOKEN}" \
+    "${AK_API_BASE}/core/users/me/" 2>/dev/null || echo "000")
+  _log "INFO" "Authentik token auth probe (/core/users/me/) -> HTTP ${ak_auth_code}"
+  if [[ "$ak_auth_code" != "200" ]]; then
+    warn "Authentik bootstrap token did NOT authenticate (HTTP ${ak_auth_code}) - cannot create"
+    warn "  the Dockhand provider/app/outpost via API, so Dockhand has NO 2FA gate yet."
+    warn "  akadmin UI login still works: https://authentik.${DOMAIN}"
+    warn "  (akadmin / see ${AUTHENTIK_DIR}/.akadmin_password). Create the Proxy provider +"
+    warn "  attach it to the embedded outpost manually, or re-run after fixing the token."
+    return 0
+  fi
+  success "Authentik bootstrap token authenticated (HTTP 200)"
 
   # 2. Resolve the default authorization flow PK (FK target for the provider).
   local flow_pk
@@ -1551,12 +1574,29 @@ setup_cloudflare_bouncer() {
     printf '%s\n' 'crowdsec_config:' '  lapi_key: ""' '  lapi_url: http://127.0.0.1:8080/' 'cloudflare_config:' '  accounts: []' 'log_level: info' 'log_media: stdout' > "$cfg" 2>/dev/null || true
     chmod 600 "$cfg" 2>/dev/null || true
   fi
-  if command -v crowdsec-cloudflare-worker-bouncer &>/dev/null; then
+  # Require BOTH the binary AND the systemd unit. A prior cleanup can purge the
+  # package (removing the unit) while a leftover binary lingers on $PATH -> the old
+  # `command -v` short-circuit skipped reinstall, then `systemctl enable` failed
+  # with "Unit file ... does not exist". So if the unit is gone, fall through and
+  # (re)install.
+  local wb_unit_present=false
+  { [[ -f /etc/systemd/system/crowdsec-cloudflare-worker-bouncer.service ]] \
+    || [[ -f /lib/systemd/system/crowdsec-cloudflare-worker-bouncer.service ]] \
+    || [[ -f /usr/lib/systemd/system/crowdsec-cloudflare-worker-bouncer.service ]]; } && wb_unit_present=true
+  if command -v crowdsec-cloudflare-worker-bouncer &>/dev/null && $wb_unit_present; then
     have_bin=true
   elif [[ "$OS_FAMILY" == "debian" ]]; then
     info "Adding CrowdSec repository + installing the worker bouncer..."
     curl -s https://packagecloud.io/install/repositories/crowdsec/crowdsec/script.deb.sh | bash >>"$LOG_FILE" 2>&1 || true
-    apt-get install -y -qq crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 || true
+    # CRITICAL: the package ships its own conffile; our pre-created stub (above)
+    # makes dpkg treat it as locally modified, so the postinst conffile handler
+    # shows an interactive "(Y/I/N/O/D/Z)?" prompt. DEBIAN_FRONTEND=noninteractive
+    # alone does NOT suppress conffile prompts -> the script HANGS forever with no
+    # TTY to answer. Force-keep our version and never prompt.
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+      -o Dpkg::Lock::Timeout=300 \
+      -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef \
+      crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 || true
     command -v crowdsec-cloudflare-worker-bouncer &>/dev/null && have_bin=true
   else
     info "Adding CrowdSec repository + installing the worker bouncer..."
@@ -1639,19 +1679,38 @@ CFWB
   # 5. Deploy: starting the daemon creates the CF Worker + KV + route from config.
   if $have_bin && [[ -n "$zone_id" && -n "$account_id" ]]; then
     systemctl daemon-reload 2>/dev/null || true
-    systemctl enable crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 || true
+    systemctl enable crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 \
+      || warn "systemctl enable failed for worker bouncer (unit missing?)"
+    local start_mark; start_mark=$(date '+%Y-%m-%d %H:%M:%S')
     systemctl restart crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 || true
-    local ok=false i
-    for i in $(seq 1 10); do
-      systemctl is-active --quiet crowdsec-cloudflare-worker-bouncer && { ok=true; break; }
-      sleep 2
-    done
-    if $ok; then
+    # The unit is Restart=always, so a CRASH-LOOPING service still shows 'active'
+    # for the ~1s window each cycle. A single is-active poll false-reports success.
+    # Sample across ~16s and require it to be running at the END with NO new
+    # restart between samples; also surface known-fatal causes from the journal.
+    local restarts1 restarts2 sub jtail
+    sleep 8
+    restarts1=$(systemctl show -p NRestarts --value crowdsec-cloudflare-worker-bouncer 2>/dev/null || echo 0)
+    sleep 8
+    restarts2=$(systemctl show -p NRestarts --value crowdsec-cloudflare-worker-bouncer 2>/dev/null || echo 0)
+    sub=$(systemctl show -p SubState --value crowdsec-cloudflare-worker-bouncer 2>/dev/null || echo unknown)
+    jtail=$(journalctl -u crowdsec-cloudflare-worker-bouncer --since "$start_mark" --no-pager 2>/dev/null || true)
+    printf '%s\n' "$jtail" >>"$LOG_FILE" 2>/dev/null || true
+    if systemctl is-active --quiet crowdsec-cloudflare-worker-bouncer \
+       && [[ "$sub" == "running" && "$restarts1" == "$restarts2" ]]; then
       success "Cloudflare Worker bouncer ACTIVE - edge enforcement is live"
       warn "ACTION REQUIRED (no Cloudflare API for this): set the Worker Route to FAIL OPEN -> CF dashboard > ${DOMAIN} > Workers Routes > edit the crowdsec route > Request limit failure mode > Fail open. Without it a worker error shows visitors a CF 1027 page."
+    elif printf '%s' "$jtail" | grep -qi 'Analytics Engine'; then
+      # Bouncer 0.0.18 hardcodes a Workers Analytics Engine binding; the account
+      # must have AE enabled or every deploy FATALs. No API to enable it.
+      error "Worker bouncer is CRASH-LOOPING: your Cloudflare account has Workers Analytics Engine DISABLED, which this bouncer requires."
+      error "  Enable it (free): Cloudflare dashboard > Workers & Pages > Analytics Engine > Enable,"
+      error "  then: systemctl enable --now crowdsec-cloudflare-worker-bouncer"
+      systemctl stop crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
+      systemctl disable crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
     else
-      journalctl -u crowdsec-cloudflare-worker-bouncer -n 20 --no-pager >>"$LOG_FILE" 2>&1 || true
-      warn "Worker bouncer not active - see ${LOG_FILE}. Debug: journalctl -u crowdsec-cloudflare-worker-bouncer -n 30"
+      systemctl stop crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
+      systemctl disable crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
+      warn "Worker bouncer not stably active (SubState=${sub}, restarts ${restarts1}->${restarts2}); stopped to avoid a crash-loop. See ${LOG_FILE}. Debug: journalctl -u crowdsec-cloudflare-worker-bouncer -n 40"
     fi
   else
     systemctl stop crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
@@ -1736,8 +1795,11 @@ verify_deployment() {
     "docker exec crowdsec cscli bouncers list 2>/dev/null | grep -q npm-bouncer"
   _check "http-cve collection installed" bash -c \
     "docker exec crowdsec cscli collections list 2>/dev/null | grep -q crowdsecurity/http-cve"
+  # http.conf holds ONLY set_real_ip_from lines; the CF-Connecting-IP swap is
+  # patched into the container's /etc/nginx/nginx.conf (NOT http.conf). Check both
+  # where they actually live, else this is a guaranteed false negative.
   _check "Cloudflare real-IP config present in NPM" bash -c \
-    "test -f '${NPM_DATA_DIR}/nginx/custom/http.conf' && grep -q CF-Connecting-IP '${NPM_DATA_DIR}/nginx/custom/http.conf'"
+    "test -f '${NPM_DATA_DIR}/nginx/custom/http.conf' && grep -q set_real_ip_from '${NPM_DATA_DIR}/nginx/custom/http.conf' && docker exec npm grep -q CF-Connecting-IP /etc/nginx/nginx.conf"
   _check "firewall bouncer service ACTIVE" systemctl is-active --quiet crowdsec-firewall-bouncer
   # Live end-to-end ban test: ban a TEST-NET IP, confirm it lands in the
   # firewall via the bouncer, then remove it. TEST-NET-1 (192.0.2.0/24) is
