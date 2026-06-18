@@ -13,8 +13,9 @@ fi
 #     Authelia   -> Authentik (IdP, exposed via NetBird reverse proxy)
 #     (added)    -> NetBird self-hosted COMBINED server (netbirdio/netbird-server:
 #                   mgmt+signal+relay+STUN) + dashboard, behind the Traefik edge,
-#                   using NetBird's OWN EMBEDDED IdP (at /oauth2). Config + Traefik
-#                   labels are taken verbatim from NetBird's official installer.
+#                   using NetBird's OWN EMBEDDED IdP (at /oauth2). Admin user is
+#                   auto-created via the setup API. Config + Traefik labels are
+#                   taken verbatim from NetBird's official installer.
 #     (added)    -> netbird-proxy (netbirdio/reverse-proxy): the app ingress engine.
 #                   Traefik passes ALL unmatched HTTPS through TLS passthrough to
 #                   this container; it terminates per-service TLS (ACME) and forwards
@@ -79,6 +80,9 @@ NETBIRD_OIDC_CLIENT_SECRET=""                      # read back from Authentik af
 NETBIRD_DATAREPLICA_SECRET=""                      # relay/turn shared secret (generated)
 NB_PROXY_TOKEN=""                                  # netbird-server-issued token for netbird-proxy
 NB_PROXY_CROWDSEC_KEY=""                            # crowdsec bouncer key for netbird-proxy
+NB_PAT=""                                           # Personal Access Token from setup API (REST API auth)
+NB_ADMIN_EMAIL=""                                   # NetBird admin email (created via setup API)
+NB_ADMIN_PASSWORD=""                                # NetBird admin password (randomly generated)
 
 DOMAIN=""  # Set at runtime via user prompt
 
@@ -179,8 +183,9 @@ _on_exit() {
   local ip ext_ip
   ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "<internal_ip>")
   ext_ip=$(get_external_ip)
-  local ak_pass
+  local ak_pass nb_pass
   ak_pass=$(_read_cred "${AUTHENTIK_DIR}/.akadmin_password")
+  nb_pass=$(_read_cred "${NETBIRD_DIR}/.admin_password")
 
   printf "\n"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
@@ -213,6 +218,10 @@ _on_exit() {
     printf "${C_B}------------------------------------------------------------------------------${C_R}\n"
     printf "${C_B}  ${C_YEL}Authentik admin user: akadmin${C_R}\n"
     printf "${C_B}  ${C_YEL}Authentik password:   %s${C_R}\n" "$ak_pass"
+    printf "${C_B}  ${C_RED}Change this password after first login!${C_R}\n"
+    printf "\n"
+    printf "${C_B}  ${C_YEL}NetBird admin user:   %s${C_R}\n" "${NB_ADMIN_EMAIL:-admin@${DOMAIN}}"
+    printf "${C_B}  ${C_YEL}NetBird password:     %s${C_R}\n" "$nb_pass"
     printf "${C_B}  ${C_RED}Change this password after first login!${C_R}\n"
     printf "\n"
     printf "${C_B}  All credentials are stored (mode 600) under: %s${C_R}\n" "$STACK_DIR"
@@ -686,6 +695,9 @@ setup_stack() {
     sleep 2
   done; printf "\r" >&2
 
+  # --- Bootstrap NetBird admin user + get PAT (needed for REST API) ----------
+  bootstrap_netbird_admin
+
   # --- CrowdSec -------------------------------------------------------------
   info "Starting CrowdSec..."
   docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec
@@ -1034,6 +1046,8 @@ services:
       - ./netbird/data:/var/lib/netbird
       - ./netbird/config.yaml:/etc/netbird/config.yaml
     command: ["--config", "/etc/netbird/config.yaml"]
+    environment:
+      - NB_SETUP_PAT_ENABLED=true
     labels:
       - traefik.enable=true
       - "traefik.http.routers.netbird-grpc.rule=Host(\`netbird.${DOMAIN}\`) && (PathPrefix(\`/signalexchange.SignalExchange/\`) || PathPrefix(\`/management.ManagementService/\`) || PathPrefix(\`/management.ProxyService/\`))"
@@ -1218,21 +1232,120 @@ start_netbird_proxy() {
   done; printf "\r" >&2
 }
 
+# Create the first NetBird owner user via the setup API and obtain a Personal
+# Access Token (PAT). The PAT is required to authenticate REST API calls that
+# create reverse proxy services. The proxy token (nbx_...) from 'token create'
+# is for gRPC only; the REST API needs a PAT (nbp_...).
+#
+# Requires NB_SETUP_PAT_ENABLED=true on the netbird-server container (set in
+# the compose file). The setup endpoint is only available when no users exist;
+# once the owner is created, it auto-disables.
+bootstrap_netbird_admin() {
+  step "Bootstrapping NetBird admin user (setup API + PAT)"
+
+  local nb_ip
+  nb_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' netbird-server 2>/dev/null) || true
+  if [[ -z "$nb_ip" ]]; then
+    warn "Cannot find netbird-server container IP. NetBird admin NOT created."
+    warn "  Create the admin manually: visit https://netbird.${DOMAIN} and follow the setup page."
+    return 0
+  fi
+  local api_base="http://${nb_ip}:80/api"
+
+  # Generate admin credentials
+  NB_ADMIN_EMAIL="admin@${DOMAIN}"
+  NB_ADMIN_PASSWORD=$(rand_password 24)
+
+  local payload
+  payload=$(jq -nc \
+    --arg email "$NB_ADMIN_EMAIL" \
+    --arg name "Admin" \
+    --arg password "$NB_ADMIN_PASSWORD" \
+    '{
+      email: $email,
+      name: $name,
+      password: $password,
+      create_pat: true,
+      pat_expire_in: 365
+    }')
+
+  info "Creating NetBird admin user via setup API..."
+  local resp http_code body
+  for i in $(seq 1 30); do
+    resp=$(curl -s -w '\n%{http_code}' --max-time 10 \
+      -X POST \
+      -H "Content-Type: application/json" \
+      -d "$payload" \
+      "${api_base}/setup" 2>/dev/null) || true
+    http_code=$(echo "$resp" | tail -1)
+    body=$(echo "$resp" | sed '$d')
+
+    if [[ "$http_code" == "200" || "$http_code" == "201" ]]; then
+      # Extract the PAT from the response
+      NB_PAT=$(echo "$body" | jq -r '.personal_access_token // empty' 2>/dev/null || true)
+      if [[ -n "$NB_PAT" ]]; then
+        success "NetBird admin user created: ${NB_ADMIN_EMAIL}"
+        # Save credentials (mode 600)
+        printf '%s' "$NB_ADMIN_PASSWORD" > "${NETBIRD_DIR}/.admin_password"
+        chmod 600 "${NETBIRD_DIR}/.admin_password"
+        printf '%s' "$NB_PAT" > "${NETBIRD_DIR}/.api_token"
+        chmod 600 "${NETBIRD_DIR}/.api_token"
+        success "PAT saved (365-day expiry): ${NETBIRD_DIR}/.api_token"
+        return 0
+      else
+        # User created but no PAT in response -- NB_SETUP_PAT_ENABLED might not be set
+        success "NetBird admin user created: ${NB_ADMIN_EMAIL}"
+        warn "No PAT in setup response (NB_SETUP_PAT_ENABLED not active?)."
+        warn "  Create a PAT manually in the dashboard to enable API automation."
+        printf '%s' "$NB_ADMIN_PASSWORD" > "${NETBIRD_DIR}/.admin_password"
+        chmod 600 "${NETBIRD_DIR}/.admin_password"
+        return 0
+      fi
+    elif [[ "$http_code" == "400" ]]; then
+      # Could be "setup already completed" if re-running
+      local err_msg
+      err_msg=$(echo "$body" | jq -r '.message // empty' 2>/dev/null || true)
+      if echo "$err_msg" | grep -qi "setup\|already\|completed"; then
+        info "NetBird setup already completed -- admin user exists."
+        # Try to use an existing PAT if the script saved one before
+        if [[ -f "${NETBIRD_DIR}/.api_token" ]]; then
+          NB_PAT=$(cat "${NETBIRD_DIR}/.api_token" 2>/dev/null || true)
+          if [[ -n "$NB_PAT" ]]; then
+            success "Using existing PAT from ${NETBIRD_DIR}/.api_token"
+            return 0
+          fi
+        fi
+        warn "No existing PAT found. Create one in the dashboard (User settings)."
+        return 0
+      fi
+    fi
+    printf "\r  ${C_DIM}Waiting for NetBird setup API... %d/30${C_R}" "$i" >&2
+    sleep 3
+  done; printf "\r" >&2
+
+  warn "Could not create NetBird admin via setup API (HTTP ${http_code:-0})."
+  warn "  Response: ${body:-<empty>}"
+  warn "  Create the admin manually: visit https://netbird.${DOMAIN} and follow the setup page."
+  printf '%s' "$NB_ADMIN_PASSWORD" > "${NETBIRD_DIR}/.admin_password"
+  chmod 600 "${NETBIRD_DIR}/.admin_password"
+}
+
 # Create reverse proxy services for Dockhand and Authentik via the NetBird
-# management REST API. The proxy cluster (netbird-proxy) must already be
-# registered with the management server. Uses the same NB_PROXY_TOKEN minted
-# by start_netbird_proxy(). Services are created with direct_upstream=true so
-# the proxy dials the target containers directly over the Docker network (no
-# WireGuard hairpin). Auth is left unconfigured (public) -- the user sets
-# SSO/password/PIN per-service in the NetBird dashboard.
+# management REST API. Requires a Personal Access Token (PAT) from
+# bootstrap_netbird_admin(). The proxy cluster (netbird-proxy) must already be
+# registered with the management server. Services are created with
+# direct_upstream=true so the proxy dials the target containers directly over
+# the Docker network (no WireGuard hairpin).
 create_netbird_proxy_services() {
   step "Creating NetBird reverse proxy services (Dockhand + Authentik)"
 
-  if [[ -z "$NB_PROXY_TOKEN" ]]; then
-    warn "No NB_PROXY_TOKEN -- cannot create reverse proxy services via API."
-    warn "  Create them manually in the NetBird dashboard -> Reverse Proxy -> Services:"
-    warn "    dockhand.${DOMAIN}  ->  dockhand:3000"
-    warn "    authentik.${DOMAIN} ->  authentik-server:9000"
+  if [[ -z "$NB_PAT" ]]; then
+    warn "No PAT -- cannot create reverse proxy services via API."
+    warn "  Create a PAT in the NetBird dashboard (User settings), then run:"
+    warn "    curl -X POST https://netbird.${DOMAIN}/api/reverse-proxies/services \\"
+    warn "      -H 'Authorization: Token <YOUR_PAT>' -H 'Content-Type: application/json' \\"
+    warn "      -d '{\"name\":\"dockhand.${DOMAIN}\",\"domain\":\"dockhand.${DOMAIN}\",\"mode\":\"http\",\"targets\":[{\"target_id\":\"\",\"target_type\":\"host\",\"path\":\"/\",\"protocol\":\"http\",\"host\":\"dockhand\",\"port\":3000,\"enabled\":true,\"options\":{\"direct_upstream\":true}}],\"enabled\":true}'"
+    warn "    (repeat for authentik.${DOMAIN} -> authentik-server:9000)"
     return 0
   fi
 
@@ -1259,7 +1372,7 @@ create_netbird_proxy_services() {
   local cluster_ok=false i clusters_resp
   for i in $(seq 1 60); do
     clusters_resp=$(curl -sf --max-time 5 \
-      -H "Authorization: Token ${NB_PROXY_TOKEN}" \
+      -H "Authorization: Token ${NB_PAT}" \
       "${api_base}/reverse-proxies/clusters" 2>/dev/null) || true
     if echo "$clusters_resp" | jq -e '.[] | select(.online == true)' >/dev/null 2>&1; then
       cluster_ok=true; break
@@ -1315,7 +1428,7 @@ create_netbird_proxy_services() {
     local resp http_code
     resp=$(curl -s -w '\n%{http_code}' --max-time 15 \
       -X POST \
-      -H "Authorization: Token ${NB_PROXY_TOKEN}" \
+      -H "Authorization: Token ${NB_PAT}" \
       -H "Content-Type: application/json" \
       -d "$payload" \
       "${api_base}/reverse-proxies/services" 2>/dev/null) || true
@@ -2152,11 +2265,11 @@ verify_deployment() {
   # Dockhand + Authentik services we created via create_netbird_proxy_services().
   local _nb_ip
   _nb_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' netbird-server 2>/dev/null)
-  if [[ -n "$_nb_ip" && -n "$NB_PROXY_TOKEN" ]]; then
+  if [[ -n "$_nb_ip" && -n "$NB_PAT" ]]; then
     _check "NetBird reverse proxy: Dockhand service exists" bash -c \
-      "curl -sf --max-time 5 -H 'Authorization: Token ${NB_PROXY_TOKEN}' 'http://${_nb_ip}:80/api/reverse-proxies/services' 2>/dev/null | jq -e '.[] | select(.domain==\"dockhand.${DOMAIN}\")' >/dev/null"
+      "curl -sf --max-time 5 -H 'Authorization: Token ${NB_PAT}' 'http://${_nb_ip}:80/api/reverse-proxies/services' 2>/dev/null | jq -e '.[] | select(.domain==\"dockhand.${DOMAIN}\")' >/dev/null"
     _check "NetBird reverse proxy: Authentik service exists" bash -c \
-      "curl -sf --max-time 5 -H 'Authorization: Token ${NB_PROXY_TOKEN}' 'http://${_nb_ip}:80/api/reverse-proxies/services' 2>/dev/null | jq -e '.[] | select(.domain==\"authentik.${DOMAIN}\")' >/dev/null"
+      "curl -sf --max-time 5 -H 'Authorization: Token ${NB_PAT}' 'http://${_nb_ip}:80/api/reverse-proxies/services' 2>/dev/null | jq -e '.[] | select(.domain==\"authentik.${DOMAIN}\")' >/dev/null"
   else
     warn "VERIFY SKIPPED: NetBird reverse proxy service checks (no token or server IP)"
   fi
@@ -2204,8 +2317,9 @@ print_summary() {
   local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "YOUR_VPS_IP")
   local ext_ip; ext_ip=$(get_external_ip)
   local fw_cmd; [[ "$OS_FAMILY" == "debian" ]] && fw_cmd="ufw status verbose" || fw_cmd="firewall-cmd --list-all"
-  local ak_pass
+  local ak_pass nb_pass
   ak_pass=$(_read_cred "${AUTHENTIK_DIR}/.akadmin_password")
+  nb_pass=$(_read_cred "${NETBIRD_DIR}/.admin_password")
 
   printf "\n"
   printf "${C_B}${C_GRN}==============================================================================\n"
@@ -2235,7 +2349,9 @@ ${C_B}Authentik (Identity Provider)${C_R}
   Files:     ${AUTHENTIK_DIR}
 
 ${C_B}NetBird (self-hosted)${C_R}
-  Dashboard: https://netbird.${DOMAIN}   (embedded IdP; first visit creates initial admin)
+  Dashboard: https://netbird.${DOMAIN}   (embedded IdP; admin auto-created by script)
+  Admin:     ${NB_ADMIN_EMAIL:-admin@${DOMAIN}}
+  Password:${C_YEL} ${nb_pass}${C_R}  (change after first login)
   Config:    ${NETBIRD_DIR}/config.yaml  (NetBird login = its own /oauth2)
   P2P ports: 3478/udp (STUN; relay rides the Traefik edge on /relay)
   Client:    install NetBird on a device; set management URL https://netbird.${DOMAIN}
@@ -2266,6 +2382,7 @@ ${C_B}${C_YEL}Done automatically:${C_R}
   - Traefik edge on 80/443 with Let's Encrypt (HTTP-01 challenge)
   - Authentik IdP deployed (exposed via netbird-proxy, NOT Traefik)
   - NetBird combined server (mgmt/signal/relay/STUN) + dashboard behind the Traefik edge
+  - NetBird admin user auto-created via setup API (credentials saved, see above)
   - NetBird reverse proxy (netbird-proxy) started + registered with management server
   - Reverse proxy services auto-created via API: Dockhand + Authentik (Direct Upstream)
   - CrowdSec parsing Traefik logs; bans enforced incl. Docker-published ports (DOCKER-USER)
@@ -2277,8 +2394,9 @@ ${C_B}${C_RED}STAGING NOTES (test before production):${C_R}
     upstream). If the dashboard cannot reach the API, compare the labels on
     netbird-server against your NetBird version:
     https://docs.netbird.io/selfhosted/external-reverse-proxy
-  - NetBird login uses NetBird's EMBEDDED IdP (/oauth2) -- first visit to
-    https://netbird.<domain> walks you through creating the initial admin.
+  - NetBird login uses NetBird's EMBEDDED IdP (/oauth2). Admin user is
+    auto-created by the script -- log in at https://netbird.<domain> with
+    the credentials shown above.
   - Reverse proxy services are created with NO auth (public). Set SSO/password/PIN
     per-service in the NetBird dashboard before relying on them.
   - DNS: netbird.<domain> AND *.<domain> must point to this server's IP
@@ -2302,6 +2420,8 @@ ${C_B}${C_YEL}Cloudflare - finish in the dashboard (no public API for these):${C
 ${C_B}${C_YEL}Credential files (root-only, mode 600):${C_R}
   ${AUTHENTIK_DIR}/.akadmin_password
   ${AUTHENTIK_DIR}/authentik.env
+  ${NETBIRD_DIR}/.admin_password
+  ${NETBIRD_DIR}/.api_token
 
 ${C_B}Troubleshooting:${C_R}
   Logs:    docker logs -f traefik   docker logs -f authentik-server   docker logs -f netbird-server
