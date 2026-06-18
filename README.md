@@ -1,4 +1,4 @@
-# VPS Deployment Scripts — v4.6.0-hardened-cloudflare
+# VPS Deployment Scripts — v4.7.0-hardened-cloudflare
 
 > ⚠️ **SECURITY DISCLAIMER — READ BEFORE USING**
 >
@@ -23,7 +23,7 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script depl
 | Script | Deploys | Stack Dir | Notes |
 |--------|---------|-----------|-------|
 | `deploy-dockhand.sh` | NPM + Dockhand + Authelia + CrowdSec | `/opt/dockhand-stack/` | Docker manager with host file access |
-| `deploy-netbird.sh` | Traefik + Authentik + NetBird + Dockhand + CrowdSec | `/opt/netbird-stack/` | ⚠️ Zero-trust variant (Authentik IdP + NetBird mesh). **Staging — test in a VM first** |
+| `deploy-netbird.sh` | Traefik + Authentik + NetBird (+ built-in reverse proxy) + Dockhand + CrowdSec | `/opt/netbird-stack/` | ⚠️ Zero-trust variant. **NetBird's reverse proxy is the app ingress** (apps exposed via its dashboard, not Traefik labels). **Staging — test in a VM first** |
 | `deploy-portainer.sh` | NPM + Portainer + Authelia + CrowdSec | `/opt/portainer-stack/` | Visual container management |
 | `deploy-dockge.sh` | NPM + Dockge + Authelia + CrowdSec | `/opt/dockge-stack/` | Compose stack manager |
 | `deploy-cosmos.sh` | NPM + Cosmos + Authelia + CrowdSec | `/opt/cosmos-stack/` | All-in-one homelab |
@@ -34,7 +34,14 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script depl
 | `deploy-yunohost.sh` | NPM + YunoHost + Authelia + CrowdSec | `/opt/yunohost-stack/` | Debian server distro (Debian 12 only) |
 | `deploy-freedombox.sh` | NPM + FreedomBox + Authelia + CrowdSec | `/opt/freedombox-stack/` | Debian home server (Debian 12 only) |
 
-**All scripts expose only 3 ports: 80 (HTTP), 443 (HTTPS), 81 (NPM admin).** Individual tool containers have **no host ports** — they communicate internally via Docker's `proxy` network using their container hostnames.
+**Ports are per-deployment — `harden.sh` opens ONLY the ports the running stack actually publishes (plus SSH).** It reads the live Docker port bindings, so each platform gets exactly what it needs and nothing more:
+
+| Stack | Public ports opened by `harden.sh` |
+|-------|-----------------------------------|
+| NPM-based (dockhand, portainer, dockge, …) | `80/tcp`, `443/tcp`, `81/tcp` (NPM admin) |
+| `deploy-netbird.sh` | `80/tcp`, `443/tcp`, `3478/udp` (STUN), `51820/udp` (proxy WireGuard) — **no 81** |
+
+Ports bound to `127.0.0.1` (CrowdSec LAPI 8080, Authentik 9000, …) are **never** opened. Individual tool containers otherwise have **no public host ports** — they talk internally over Docker's `proxy` network by container hostname.
 
 > **Note on port 81:** the NPM admin panel is published on `0.0.0.0:81` so you can reach it at `http://<vps-ip>:81` right after deploy to finish configuration. `harden.sh` leaves it exposed **by default** (`LOCKDOWN_NPM_ADMIN=0`) because it's needed during setup. To bind it to `127.0.0.1` (SSH-tunnel-only) once your proxy hosts are set up, run `LOCKDOWN_NPM_ADMIN=1 ./harden.sh`, then reach it via `ssh -L 8181:127.0.0.1:81 root@<vps>` → `http://localhost:8181`. Re-running with the other value flips it back (idempotent).
 
@@ -45,7 +52,7 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script depl
 ### Option 1: Menu (Recommended)
 
 ```bash
-curl -fsSL -o deploy.sh https://raw.githubusercontent.com/shoyrock/VPS-Deployments/main/deploy.sh
+curl -fsSL -o deploy.sh https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/deploy.sh
 chmod +x deploy.sh
 ./deploy.sh
 ```
@@ -127,7 +134,7 @@ INTERNET → UFW/Firewalld → NPM (80/443/81) → Docker proxy network
   crowdsec (container)  →  reads NPM/SSH logs, enforces bans, enrolled in CrowdSec Console (cloud)
 ```
 
-**Only 3 ports exposed.** All containers communicate via the `proxy` Docker network. NPM is the single entry point.
+*(Diagram above is the NPM-based stacks.* `deploy-netbird.sh` *uses Traefik as the edge and the NetBird reverse proxy as the app ingress instead — see its own deploy summary.)* All containers communicate via the `proxy` Docker network; the proxy/edge is the single entry point. `harden.sh` opens only the ports that stack publishes (see the table above).
 
 ---
 

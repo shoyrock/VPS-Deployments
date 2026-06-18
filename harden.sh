@@ -184,17 +184,45 @@ harden_sysctl() {
 }
 
 # ---------------------------------------------------------------------------
-# 3. Firewall Rate Limiting — rollback: ufw reset / remove firewalld rules
+# Discover the host ports the CURRENT deployment actually needs: every port a
+# running container publishes on a PUBLIC host IP (0.0.0.0 / ::). Ports bound to
+# 127.0.0.1 are intentionally skipped (localhost-only; e.g. CrowdSec LAPI 8080,
+# Authentik 9000). Emits unique "PORT/PROTO" lines (e.g. 443/tcp, 3478/udp).
+# This auto-adapts per platform: NetBird -> 80,443,3478/udp,51820/udp ;
+# NPM stacks -> 80,443,81 ; etc. No hardcoded per-platform list to drift.
+# ---------------------------------------------------------------------------
+collect_public_ports() {
+    command -v docker &>/dev/null || return 0
+    local cid
+    docker ps -q 2>/dev/null | while read -r cid; do
+        docker inspect --format \
+          '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}|{{$p}}{{println}}{{end}}{{end}}' \
+          "$cid" 2>/dev/null
+    done | awk -F'|' '($1=="0.0.0.0" || $1=="::" || $1=="") && $2!="" {print $2}' | sort -u
+}
+
+# ---------------------------------------------------------------------------
+# 3. Firewall — opens ONLY the ports the deployed stack publishes (+ SSH).
+#    Rollback: ufw reset / remove firewalld rules
 # ---------------------------------------------------------------------------
 harden_firewall() {
-    info "=== Configuring firewall rate limiting ==="
+    info "=== Configuring firewall (only ports your deployment publishes) ==="
+    local -a pub=()
+    mapfile -t pub < <(collect_public_ports)
+    if [[ ${#pub[@]} -eq 0 ]]; then
+        warn "No public container ports detected (deploy not run yet?) — opening 80/443 as a fallback"
+        pub=(80/tcp 443/tcp)
+    fi
+    info "Allowing: 22/tcp (SSH) + ${pub[*]}"
+
+    local p
     if [[ "$OS_FAMILY" == "debian" ]]; then
         command -v ufw &>/dev/null || { info "Installing UFW"; $PKG_INSTALL ufw >> "$LOGFILE" 2>&1; }
         # NOTE: Docker publishes container ports straight into the DOCKER iptables
-        # chain, BYPASSING UFW. The 80/443 limits below therefore only affect host
-        # services on those ports — NPM's containerized 80/443 are NOT rate-limited
-        # by UFW. CrowdSec (installed later) is the real layer-7 protection for HTTP.
-        # The SSH (22) limit IS effective because sshd runs on the host.
+        # chain, BYPASSING UFW INPUT. These rules document intent + protect host-bound
+        # services; CrowdSec's firewall bouncer (DOCKER-USER chain) is the real
+        # enforcement for container-published ports. The SSH (22) limit IS effective
+        # because sshd runs on the host.
         if ufw status 2>/dev/null | grep -q 'Status: active'; then
             warn "UFW already active — 'ufw --force reset' will WIPE existing rules"
             _log "Existing UFW rules before reset:"; ufw status numbered >> "$LOGFILE" 2>&1 || true
@@ -202,33 +230,30 @@ harden_firewall() {
         ufw --force reset >> "$LOGFILE" 2>&1 || true
         ufw default deny incoming  >> "$LOGFILE" 2>&1 || true
         ufw default allow outgoing >> "$LOGFILE" 2>&1 || true
-        ufw limit 22/tcp  comment 'SSH rate limit'                      >> "$LOGFILE" 2>&1 || true
-        ufw limit 80/tcp  comment 'HTTP (host only; Docker bypasses UFW)'  >> "$LOGFILE" 2>&1 || true
-        ufw limit 443/tcp comment 'HTTPS (host only; Docker bypasses UFW)' >> "$LOGFILE" 2>&1 || true
-        # NetBird needs STUN/UDP 3478 for NAT traversal. The reset above wiped it,
-        # so re-add it whenever a NetBird stack is present (no-op otherwise).
-        if [[ -d /opt/netbird-stack ]] || { command -v docker &>/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx netbird-server; }; then
-            ufw allow 3478/udp comment 'NetBird STUN' >> "$LOGFILE" 2>&1 || true
-            ok "NetBird STUN (3478/udp) allowed"
-        fi
+        ufw limit 22/tcp comment 'SSH rate limit' >> "$LOGFILE" 2>&1 || true
+        for p in "${pub[@]}"; do
+            case "$p" in
+                80/tcp|443/tcp) ufw limit "$p" comment 'web (host only; Docker bypasses UFW)' >> "$LOGFILE" 2>&1 || true ;;
+                *)              ufw allow "$p" comment 'deployment port'                       >> "$LOGFILE" 2>&1 || true ;;
+            esac
+        done
         ufw --force enable >> "$LOGFILE" 2>&1 || true
-        ok "UFW configured (SSH rate-limited; HTTP/HTTPS protected by CrowdSec — see note)"
+        ok "UFW configured (SSH + ${pub[*]})"
     else
         systemctl is-active --quiet firewalld 2>/dev/null || { $PKG_INSTALL firewalld >> "$LOGFILE" 2>&1; systemctl enable --now firewalld >> "$LOGFILE" 2>&1; }
-        firewall-cmd --permanent --add-rich-rule='rule service name=ssh  limit value=6/m accept'  >> "$LOGFILE" 2>&1 || true
-        firewall-cmd --permanent --add-rich-rule='rule service name=http limit value=30/m accept' >> "$LOGFILE" 2>&1 || true
-        firewall-cmd --permanent --add-rich-rule='rule service name=https limit value=30/m accept' >> "$LOGFILE" 2>&1 || true
-        firewall-cmd --permanent --add-service=http >> "$LOGFILE" 2>&1 || true
-        firewall-cmd --permanent --add-service=https >> "$LOGFILE" 2>&1 || true
+        firewall-cmd --permanent --add-rich-rule='rule service name=ssh limit value=6/m accept' >> "$LOGFILE" 2>&1 || true
         firewall-cmd --permanent --add-service=ssh >> "$LOGFILE" 2>&1 || true
-        # NetBird STUN/UDP 3478 (NAT traversal) when a NetBird stack is present.
-        if [[ -d /opt/netbird-stack ]] || { command -v docker &>/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx netbird-server; }; then
-            firewall-cmd --permanent --add-port=3478/udp >> "$LOGFILE" 2>&1 || true
-        fi
+        for p in "${pub[@]}"; do
+            firewall-cmd --permanent --add-port="$p" >> "$LOGFILE" 2>&1 || true
+            case "$p" in
+                80/tcp)  firewall-cmd --permanent --add-rich-rule='rule service name=http  limit value=30/m accept' >> "$LOGFILE" 2>&1 || true ;;
+                443/tcp) firewall-cmd --permanent --add-rich-rule='rule service name=https limit value=30/m accept' >> "$LOGFILE" 2>&1 || true ;;
+            esac
+        done
         firewall-cmd --reload >> "$LOGFILE" 2>&1 || true
-        ok "Firewalld rate limiting configured"
+        ok "Firewalld configured (SSH + ${pub[*]})"
     fi
-    _log "Firewall rate limiting applied"
+    _log "Firewall configured: 22/tcp ${pub[*]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -630,13 +655,17 @@ verify_hardening() {
         _check "Auto-updates active" "systemctl is-active --quiet dnf-automatic.timer 2>/dev/null"
     fi
 
-    # 7. NPM admin port-81 binding (matches LOCKDOWN_NPM_ADMIN)
+    # 7. NPM admin port-81 binding (matches LOCKDOWN_NPM_ADMIN) — only when an NPM
+    # stack is actually deployed (skipped for NetBird/Traefik stacks, which have no
+    # 'npm' container and no port 81).
     # Prefer 'docker port' — robust even with userland-proxy disabled (no host
     # listener socket shows in ss when docker-proxy is off; DNAT lives in iptables).
-    if [[ "${LOCKDOWN_NPM_ADMIN:-0}" == "1" ]]; then
-        _check "NPM admin bound to localhost" "if command -v docker >/dev/null 2>&1 && docker port npm 81 >/dev/null 2>&1; then docker port npm 81 2>/dev/null | grep -q '127.0.0.1'; else ss -tln 2>/dev/null | grep -q '127.0.0.1:81'; fi"
-    else
-        _check "NPM admin reachable on :81" "if command -v docker >/dev/null 2>&1 && docker port npm 81 >/dev/null 2>&1; then docker port npm 81 2>/dev/null | grep -qE '0\.0\.0\.0|\[::\]'; else ss -tln 2>/dev/null | grep -qE '(0\.0\.0\.0|\*|\[::\]):81'; fi"
+    if command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx npm; then
+        if [[ "${LOCKDOWN_NPM_ADMIN:-0}" == "1" ]]; then
+            _check "NPM admin bound to localhost" "if docker port npm 81 >/dev/null 2>&1; then docker port npm 81 2>/dev/null | grep -q '127.0.0.1'; else ss -tln 2>/dev/null | grep -q '127.0.0.1:81'; fi"
+        else
+            _check "NPM admin reachable on :81" "if docker port npm 81 >/dev/null 2>&1; then docker port npm 81 2>/dev/null | grep -qE '0\.0\.0\.0|\[::\]'; else ss -tln 2>/dev/null | grep -qE '(0\.0\.0\.0|\*|\[::\]):81'; fi"
+        fi
     fi
 
     # 8. Docker

@@ -1235,26 +1235,45 @@ create_netbird_proxy_services() {
     warn "    authentik.${DOMAIN} ->  authentik-server:9000"
     return 0
   fi
+
+  # The management server listens on :80 inside the container (HTTP, not HTTPS
+  # -- safe because traffic never leaves the Docker network). Reach it via the
+  # container's IP on the proxy bridge network.
+  local nb_ip
+  nb_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' netbird-server 2>/dev/null) || true
+  if [[ -z "$nb_ip" ]]; then
+    warn "Cannot find netbird-server container IP. Services not created via API."
+    warn "  Create them manually in the NetBird dashboard -> Reverse Proxy -> Services:"
+    warn "    dockhand.${DOMAIN}  ->  Host: dockhand, Port: 3000, Direct Upstream"
+    warn "    authentik.${DOMAIN} ->  Host: authentik-server, Port: 9000, Direct Upstream"
+    return 0
+  fi
   local api_base="http://${nb_ip}:80/api"
 
   # Wait for the proxy cluster to register with the management server. Until it
   # appears in GET /api/reverse-proxies/clusters, service creation will fail.
+  # The proxy must: start -> gRPC dial management -> authenticate -> register ->
+  # management publishes it via the REST API. This can take 2-4 minutes on first
+  # boot (key generation + TLS handshake). Poll up to 5 minutes.
   info "Waiting for netbird-proxy cluster to register with management server..."
   local cluster_ok=false i clusters_resp
-  for i in $(seq 1 30); do
+  for i in $(seq 1 60); do
     clusters_resp=$(curl -sf --max-time 5 \
       -H "Authorization: Token ${NB_PROXY_TOKEN}" \
       "${api_base}/reverse-proxies/clusters" 2>/dev/null) || true
     if echo "$clusters_resp" | jq -e '.[] | select(.online == true)' >/dev/null 2>&1; then
       cluster_ok=true; break
     fi
-    printf "\r  ${C_DIM}Waiting for proxy cluster... %d/30${C_R}" "$i" >&2
-    sleep 3
+    printf "\r  ${C_DIM}Waiting for proxy cluster... %d/60${C_R}" "$i" >&2
+    sleep 5
   done; printf "\r" >&2
 
   if ! $cluster_ok; then
-    warn "netbird-proxy cluster not registered yet. Services not created via API."
-    warn "  Check: docker logs netbird-proxy"
+    warn "netbird-proxy cluster not registered after 5 minutes. Services not created via API."
+    warn "  Last API response from management server:"
+    warn "    ${clusters_resp:-<empty>}"
+    warn "  netbird-proxy logs (last 20 lines):"
+    docker logs --tail 20 netbird-proxy 2>&1 | sed 's/^/    /' >&2 || true
     warn "  Create them manually in the NetBird dashboard -> Reverse Proxy -> Services:"
     warn "    dockhand.${DOMAIN}  ->  Host: dockhand, Port: 3000, Direct Upstream"
     warn "    authentik.${DOMAIN} ->  Host: authentik-server, Port: 9000, Direct Upstream"
@@ -1984,6 +2003,11 @@ setup_cloudflare_bouncer() {
     zone_id=$(echo "$zjson" | jq -r '.result[0].id // empty' 2>/dev/null || true)
     account_id=$(echo "$zjson" | jq -r '.result[0].account.id // empty' 2>/dev/null || true)
     account_name=$(echo "$zjson" | jq -r '.result[0].account.name // empty' 2>/dev/null || true)
+    # Sanitize account_name: the CrowdSec CF bouncer rejects characters outside
+    # [A-Za-z0-9 ._-()&+@:,]. Cloudflare account names can contain apostrophes
+    # (e.g. "user@gmail.com's Account") which crash its config parser with a
+    # fatal error. Strip disallowed characters.
+    account_name=$(printf '%s' "$account_name" | LC_ALL=C tr -cd 'A-Za-z0-9 ._,()&+@:-')
     if [[ -n "$zone_id" ]]; then
       success "Found Cloudflare zone for ${DOMAIN} (zone ${zone_id:0:8}...)"
     else
@@ -2009,7 +2033,7 @@ crowdsec_config:
 cloudflare_config:
   accounts:
     - id: ${account_id:-<ACCOUNT_ID>}
-      account_name: ${account_name:-<CF_ACCOUNT_EMAIL>}
+      account_name: "${account_name:-<CF_ACCOUNT_EMAIL>}"
       token: ${CF_API_TOKEN:-<CLOUDFLARE_USER_API_TOKEN>}
       zones:
         - zone_id: ${zone_id:-<ZONE_ID>}

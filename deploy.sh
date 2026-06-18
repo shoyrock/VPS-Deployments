@@ -27,8 +27,8 @@ readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION — Update this if you fork the repo
 # ═══════════════════════════════════════════════════════════════════════════════
-# GitHub repo raw URL base (change if you fork)
-readonly GITHUB_REPO="https://raw.githubusercontent.com/shoyrock/VPS-Deployments/main"
+# GitHub repo raw URL base — change to your fork's URL
+readonly GITHUB_REPO="https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TOOL DEFINITIONS
