@@ -330,9 +330,25 @@ idempotent_cleanup() {
   # itself fails, broken state survives. Repair dpkg FIRST, then PURGE, repair
   # deps, drop the apt repo.
   if [[ "$OS_FAMILY" == "debian" ]]; then
-    DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>/dev/null || true
-    DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
-    DEBIAN_FRONTEND=noninteractive apt-get install -f -y -qq 2>/dev/null || true
+    # The CF worker-bouncer postinst READS /etc/crowdsec/bouncers/crowdsec-*.yaml
+    # and FATALs if it's missing -> dpkg --configure -a fails, apt blocks forever.
+    # We just `rm -rf /etc/crowdsec` above, so RECREATE a minimal valid stub so the
+    # postinst can parse it and succeed. (Same trick setup_cloudflare_bouncer uses
+    # before installing the package.)
+    if dpkg-query -W crowdsec-cloudflare-worker-bouncer &>/dev/null; then
+      mkdir -p /etc/crowdsec/bouncers 2>/dev/null || true
+      printf '%s\n' 'crowdsec_config:' '  lapi_key: ""' '  lapi_url: http://127.0.0.1:8080/' 'cloudflare_config:' '  accounts: []' 'log_level: info' 'log_media: stdout' \
+        > /etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml 2>/dev/null || true
+    fi
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confold </dev/null 2>/dev/null || true
+    # Belt-and-suspenders: if the stub-config trick didn't unstick it, yank the
+    # package with dpkg --force-remove-reinstreq --force-all (bypasses the failing
+    # postinst that 'apt-get purge' would re-trigger). Then let apt retry below.
+    if dpkg-query -W -f='${db:Status-Abbrev}' crowdsec-cloudflare-worker-bouncer 2>/dev/null | grep -qE '[FHU]'; then
+      DEBIAN_FRONTEND=noninteractive dpkg --purge --force-remove-reinstreq --force-all crowdsec-cloudflare-worker-bouncer </dev/null 2>/dev/null || true
+    fi
+    DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confold crowdsec crowdsec-firewall-bouncer-nftables crowdsec-firewall-bouncer-iptables crowdsec-cloudflare-worker-bouncer </dev/null 2>/dev/null || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -f -y -qq -o DPkg::Lock::Timeout=300 </dev/null 2>/dev/null || true
     DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y -qq 2>/dev/null || true
     rm -f /etc/apt/sources.list.d/crowdsec_crowdsec.list 2>/dev/null || true
   else
@@ -354,6 +370,8 @@ system_update() {
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
   info "Updating packages - this may take a few minutes, please wait..."
   if [[ "$OS_FAMILY" == "debian" ]]; then
+    # Guard: repair dpkg if cleanup left a half-configured package behind.
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confold </dev/null 2>/dev/null || true
     apt-get update -qq && apt-get upgrade -y -qq && apt-get autoremove -y -qq && apt-get autoclean -qq
   else
     if command -v dnf &>/dev/null; then dnf update -y -q && dnf autoremove -y -q 2>/dev/null || true
@@ -366,6 +384,8 @@ install_dependencies() {
   step "Dependencies"
   info "Installing required packages - please wait..."
   if [[ "$OS_FAMILY" == "debian" ]]; then
+    # Guard: repair dpkg if cleanup left a half-configured package behind.
+    DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confold </dev/null 2>/dev/null || true
     apt-get install -y -qq ca-certificates curl gnupg lsb-release \
       software-properties-common apt-transport-https jq unzip cron logrotate
   else
