@@ -759,7 +759,7 @@ services:
       - "--entrypoints.websecure.address=:443"
       # Let ACME TLS-ALPN-01 challenges for domains we DON'T manage (the NetBird
       # reverse proxy's app subdomains) bypass our resolver and reach the TCP
-      # passthrough router -> netbird-proxy. Without this, acme.tlschallenge below
+      # passthrough router -> netbird-proxy. Without this, acme.tlschallenge
       # intercepts those handshakes and the proxy's per-service certs never issue.
       - "--entrypoints.websecure.allowACMEByPass=true"
       # gRPC streams (NetBird mgmt/signal/relay) must never time out.
@@ -770,7 +770,14 @@ services:
       - "--serverstransport.forwardingtimeouts.idleconntimeout=0s"
       - "--certificatesresolvers.letsencrypt.acme.email=${le_email}"
       - "--certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json"
-      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
+      # Use HTTP-01 challenge (port 80) for Traefik's own certs (netbird.${DOMAIN}).
+      # TLS-ALPN-01 would conflict with allowACMEByPass=true + the TCP passthrough
+      # router (HostSNI(*)) which intercepts the ALPN handshake before Traefik's
+      # ACME handler can respond. HTTP-01 uses port 80 which Traefik fully controls.
+      # netbird-proxy still uses TLS-ALPN-01 for its per-service certs (passed
+      # through by allowACMEByPass to the TCP passthrough router).
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./traefik/dynamic:/dynamic:ro
@@ -1137,6 +1144,10 @@ COMPOSE_CROWDSEC
 gen_netbird_proxy_files() {
   write_netbird_proxy_env ""          # token filled later by start_netbird_proxy
   mkdir -p "${NETBIRD_DIR}/proxy-certs"
+  # The netbird-proxy container runs as a non-root user and needs to write
+  # ACME certificates + lock files to /certs. Without this, cert issuance fails
+  # with "permission denied" on .lock and account key files.
+  chmod 777 "${NETBIRD_DIR}/proxy-certs"
   cat > "${STACK_DIR}/docker-compose.netbird-proxy.yml" << COMPOSE_NBPROXY
 services:
   netbird-proxy:
