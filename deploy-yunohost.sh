@@ -1255,11 +1255,15 @@ setup_cloudflare_realip() {
   step "Cloudflare real-IP restoration (NPM)"
   local custom_dir="${NPM_DATA_DIR}/nginx/custom"
   mkdir -p "$custom_dir"
-  local conf="${custom_dir}/http.conf"   # included inside NPM's http{} block
+  local conf="${custom_dir}/http.conf"
+  # NPM's default /etc/nginx/nginx.conf already defines real_ip_header X-Real-IP
+  # and real_ip_recursive on inside the http{} block. Writing them again in
+  # http.conf (included inside http{}) causes nginx: [emerg] "real_ip_header"
+  # directive is duplicate -> nginx rejects config, port 81 RSTs connections.
+  # Fix: write ONLY set_real_ip_from lines here (never duplicate), and patch
+  # the main nginx.conf inside the container to swap X-Real-IP -> CF-Connecting-IP.
   {
-    echo "# Managed by ${SCRIPT_NAME} - restore real visitor IP behind Cloudflare"
-    echo "real_ip_header CF-Connecting-IP;"
-    echo "real_ip_recursive on;"
+    echo "# Managed by ${SCRIPT_NAME} - Cloudflare IP ranges"
     local cidr
     while IFS= read -r cidr; do
       [[ -n "$cidr" ]] && echo "set_real_ip_from ${cidr};"
@@ -1267,8 +1271,12 @@ setup_cloudflare_realip() {
   } > "$conf"
   success "Wrote ${conf} ($(grep -c set_real_ip_from "$conf" 2>/dev/null || echo 0) CF ranges)"
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx npm; then
+    # Patch NPM's built-in nginx.conf: swap X-Real-IP -> CF-Connecting-IP
+    docker exec npm sed -i \
+      's/real_ip_header X-Real-IP;/real_ip_header CF-Connecting-IP;/' \
+      /etc/nginx/nginx.conf 2>/dev/null || true
     if docker exec npm nginx -t &>/dev/null && docker exec npm nginx -s reload &>/dev/null; then
-      success "NPM reloaded with real-IP config"
+      success "NPM reloaded with real-IP config (real_ip_header -> CF-Connecting-IP)"
     else
       docker restart npm &>/dev/null || true
       warn "NPM reloaded via restart (nginx -s reload unavailable)"

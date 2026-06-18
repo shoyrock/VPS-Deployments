@@ -53,7 +53,7 @@ Ports bound to `127.0.0.1` (CrowdSec LAPI 8080, Authentik 9000, …) are **never
 ### Option 1: Menu (Recommended)
 
 ```bash
-curl -fsSL -o deploy.sh https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/deploy.sh
+curl -fsSL -o deploy.sh https://raw.githubusercontent.com/shoyrock/VPS-Deployments/main/deploy.sh
 chmod +x deploy.sh
 ./deploy.sh
 ```
