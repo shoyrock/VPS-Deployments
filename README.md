@@ -1,4 +1,4 @@
-# VPS Deployment Scripts — v4.7.0-hardened-cloudflare
+# VPS Deployment Scripts — v4.8.0-hardened-cloudflare
 
 > ⚠️ **SECURITY DISCLAIMER — READ BEFORE USING**
 >
@@ -12,7 +12,7 @@
 
 ---
 
-One-shot, hardened deployment scripts for fresh VPS instances. Every script deploys **Nginx Proxy Manager** (reverse proxy + SSL), **Authelia** (SSO + 2FA on every subdomain), **CrowdSec** (IPS with NPM-aware collections + firewall bouncer), and **firewall rules**.
+One-shot, hardened deployment scripts for fresh VPS instances. Every script deploys **Nginx Proxy Manager** (reverse proxy + SSL), an **identity provider** (Authelia SSO + 2FA, or Authentik on the authentik variants), **CrowdSec** (IPS with NPM-aware collections + firewall bouncer), and **firewall rules**.
 
 ---
 
@@ -23,6 +23,7 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script depl
 | Script | Deploys | Stack Dir | Notes |
 |--------|---------|-----------|-------|
 | `deploy-dockhand.sh` | NPM + Dockhand + Authelia + CrowdSec | `/opt/dockhand-stack/` | Docker manager with host file access |
+| `deploy-dockhand-authentik.sh` | NPM + Dockhand + Authentik + CrowdSec | `/opt/dockhand-stack/` | ⚠️ **Authentik variant** — same stack as `deploy-dockhand.sh` but swaps Authelia → Authentik (full IdP: postgres + redis + server + worker). Dockhand gated by Authentik nginx forward-auth. **Staging — test in a VM first** |
 | `deploy-netbird.sh` | Traefik + Authentik + NetBird (+ built-in reverse proxy) + Dockhand + CrowdSec | `/opt/netbird-stack/` | ⚠️ Zero-trust variant. **NetBird's reverse proxy is the app ingress** (apps exposed via its dashboard, not Traefik labels). **Staging — test in a VM first** |
 | `deploy-portainer.sh` | NPM + Portainer + Authelia + CrowdSec | `/opt/portainer-stack/` | Visual container management |
 | `deploy-dockge.sh` | NPM + Dockge + Authelia + CrowdSec | `/opt/dockge-stack/` | Compose stack manager |
@@ -38,7 +39,7 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script depl
 
 | Stack | Public ports opened by `harden.sh` |
 |-------|-----------------------------------|
-| NPM-based (dockhand, portainer, dockge, …) | `80/tcp`, `443/tcp`, `81/tcp` (NPM admin) |
+| NPM-based (dockhand, dockhand-authentik, portainer, dockge, …) | `80/tcp`, `443/tcp`, `81/tcp` (NPM admin) |
 | `deploy-netbird.sh` | `80/tcp`, `443/tcp`, `3478/udp` (STUN), `51820/udp` (proxy WireGuard) — **no 81** |
 
 Ports bound to `127.0.0.1` (CrowdSec LAPI 8080, Authentik 9000, …) are **never** opened. Individual tool containers otherwise have **no public host ports** — they talk internally over Docker's `proxy` network by container hostname.
@@ -60,16 +61,17 @@ chmod +x deploy.sh
 ### Option 2: Direct Deploy
 
 ```bash
-sudo ./deploy-dockhand.sh     # Deploy Dockhand
-sudo ./deploy-portainer.sh    # Deploy Portainer
-sudo ./deploy-dockge.sh       # Deploy Dockge
-sudo ./deploy-cosmos.sh       # Deploy Cosmos
-sudo ./deploy-coolify.sh      # Deploy Coolify
-sudo ./deploy-dokploy.sh      # Deploy Dokploy
-sudo ./deploy-casaos.sh       # Deploy CasaOS
-sudo ./deploy-runtipi.sh      # Deploy Runtipi
-sudo ./deploy-yunohost.sh     # Deploy YunoHost (Debian 12 only)
-sudo ./deploy-freedombox.sh   # Deploy FreedomBox (Debian 12 only)
+sudo ./deploy-dockhand.sh              # Deploy Dockhand (Authelia SSO)
+sudo ./deploy-dockhand-authentik.sh    # Deploy Dockhand (Authentik SSO — staging)
+sudo ./deploy-portainer.sh             # Deploy Portainer
+sudo ./deploy-dockge.sh                # Deploy Dockge
+sudo ./deploy-cosmos.sh                # Deploy Cosmos
+sudo ./deploy-coolify.sh               # Deploy Coolify
+sudo ./deploy-dokploy.sh               # Deploy Dokploy
+sudo ./deploy-casaos.sh                # Deploy CasaOS
+sudo ./deploy-runtipi.sh               # Deploy Runtipi
+sudo ./deploy-yunohost.sh              # Deploy YunoHost (Debian 12 only)
+sudo ./deploy-freedombox.sh            # Deploy FreedomBox (Debian 12 only)
 ```
 
 **Env vars** (all optional):
@@ -97,7 +99,8 @@ Every script deploys the same core stack plus one platform:
 | Component | Container | Purpose |
 |-----------|-----------|---------|
 | **NPM** | `npm` | Reverse proxy on 80/443/81, Let's Encrypt SSL |
-| **Authelia** | `authelia` | SSO login portal + TOTP 2FA on `authelia.YOURDOMAIN.com` |
+| **Authelia** *(default)* | `authelia` | SSO login portal + TOTP 2FA on `authelia.YOURDOMAIN.com` |
+| **Authentik** *(authentik variants)* | `authentik-server`, `authentik-worker`, `authentik-postgres`, `authentik-redis` | Full IdP: SSO login portal + TOTP 2FA + OIDC/SAML providers on `authentik.YOURDOMAIN.com` |
 | **CrowdSec** | `crowdsec` | Log-based intrusion detection, SSH + NPM monitoring; enrolled in the CrowdSec Console (cloud) |
 | **Firewall Bouncer** | systemd service | IP ban enforcement via iptables/nftables |
 | **Your Platform** | varies | e.g. dockhand, portainer, dockge, etc. |
@@ -106,9 +109,9 @@ Every script deploys the same core stack plus one platform:
 
 For scripts with NPM API access, the following is done automatically:
 - NPM admin password changed to a random value
-- Proxy hosts created for the platform and Authelia
+- Proxy hosts created for the platform and the identity provider (Authelia/Authentik)
 - Let's Encrypt SSL certificates requested and enforced
-- Authelia auth snippets applied to the platform proxy host
+- Identity provider auth snippets applied to the platform proxy host (Authelia `auth_request` or Authentik `outpost.goauthentik.io` forward-auth)
 
 ### Credentials
 
@@ -117,7 +120,8 @@ All credentials are **randomly generated**, stored with mode 600 under the stack
 | Credential | Source |
 |-----------|--------|
 | NPM admin | `STACK_DIR/.npm_admin_password` |
-| Authelia admin | `STACK_DIR/authelia/.default_password` |
+| Authelia admin *(default)* | `STACK_DIR/authelia/.default_password` |
+| Authentik admin *(authentik variants)* | `STACK_DIR/authentik/.akadmin_password` |
 
 ---
 
@@ -129,10 +133,12 @@ INTERNET → UFW/Firewalld → NPM (80/443/81) → Docker proxy network
                     ┌───────────────────────────────┴───────────────┐
                     │                                               │
                <platform>:<port>                            authelia:9091
-               (Authelia 2FA)                               (bypass - login)
+               (IdP 2FA forward-auth)                    (bypass - login)
 
   crowdsec (container)  →  reads NPM/SSH logs, enforces bans, enrolled in CrowdSec Console (cloud)
 ```
+
+> *Authentik variant (`deploy-dockhand-authentik.sh`): the right-hand box becomes `authentik-server:9000` (+ postgres/redis/worker), and forward-auth uses `/outpost.goauthentik.io/` instead of `/api/authz/auth-request`.*
 
 *(Diagram above is the NPM-based stacks.* `deploy-netbird.sh` *uses Traefik as the edge and the NetBird reverse proxy as the app ingress instead — see its own deploy summary.)* All containers communicate via the `proxy` Docker network; the proxy/edge is the single entry point. `harden.sh` opens only the ports that stack publishes (see the table above).
 
@@ -193,6 +199,53 @@ For any new container you deploy after the initial setup:
 4. Save
 
 That's it — no YAML edits, no restarts. The `*.YOURDOMAIN.com` wildcard in Authelia's access control covers every subdomain automatically.
+
+---
+
+## Authentik 2FA — `deploy-dockhand-authentik.sh` variant
+
+The Authentik variant swaps Authelia for a full **Authentik** identity provider (postgres + redis + server + worker). It uses the **same NPM ingress** as all other NPM-based scripts — only the IdP changes. Dockhand is gated by Authentik **nginx forward-auth** (`outpost.goauthentik.io`), preserving the "2FA in front of Dockhand" behavior.
+
+### What the script automates
+
+Beyond the standard NPM + Dockhand + CrowdSec + Cloudflare stack, the script uses the Authentik admin API (bootstrap token) to create:
+
+1. A **Proxy provider** (`dockhand`, mode `forward_single` / nginx auth_request)
+2. An **Application** (`dockhand`) bound to that provider
+3. An **embedded Proxy outpost** (`embedded-proxy`) — runs inside `authentik-server`, no extra container
+
+If any API step fails (e.g. Authentik still booting), the script degrades gracefully and prints exact manual UI instructions.
+
+### Default Login
+
+| Field | Value |
+|-------|-------|
+| URL | `https://authentik.YOURDOMAIN.com` |
+| Username | `akadmin` |
+| Password | Random — stored in `STACK_DIR/authentik/.akadmin_password` (mode 600) |
+
+### First login / 2FA setup
+
+1. Browse to `https://authentik.YOURDOMAIN.com` and log in as `akadmin`
+2. Set up a TOTP authenticator in the Authentik UI (akadmin → MFA devices)
+3. **Change the bootstrap password** after first login
+
+### Protecting a NEW container (Authentik variant)
+
+For any new container you deploy after the initial setup:
+
+1. Create an NPM proxy host for it
+2. Go to the **Advanced** tab
+3. Paste in the Custom Nginx Configuration:
+   ```
+   include /data/nginx/custom/authentik-location.conf;
+   include /data/nginx/custom/authentik-authrequest.conf;
+   ```
+4. Save
+
+You'll also need to create a Proxy provider + Application in the Authentik admin UI for the new subdomain (the script only automates this for Dockhand). The embedded outpost covers all providers attached to it.
+
+> **Note:** `add-domain.sh` currently wires Authelia realms, not Authentik. For the Authentik variant, add new domains/realms manually in the Authentik admin UI.
 
 ---
 
@@ -314,9 +367,9 @@ Every script includes a `verify_deployment()` stage that runs automatically befo
 - All containers running
 - NPM API responding
 - NPM default credentials rejected (password was changed)
-- Authelia health endpoint OK
+- Identity provider health endpoint OK (Authelia `/api/health` or Authentik `/-/health/ready/`)
 - nginx config valid
-- Authelia snippets present in NPM's custom dir
+- IdP forward-auth snippets present in NPM's custom dir (Authelia or Authentik)
 - CrowdSec LAPI responding
 - Acquisition label is `nginx-proxy-manager`
 - `crowdsecurity/nginx-proxy-manager` collection installed
@@ -335,6 +388,8 @@ Failures are non-fatal (warn level) with exact debug commands printed.
 | Script | Directory |
 |--------|-----------|
 | `deploy-dockhand.sh` | `/opt/dockhand-stack/` |
+| `deploy-dockhand-authentik.sh` | `/opt/dockhand-stack/` |
+| `deploy-netbird.sh` | `/opt/netbird-stack/` |
 | `deploy-portainer.sh` | `/opt/portainer-stack/` |
 | `deploy-dockge.sh` | `/opt/dockge-stack/` |
 | `deploy-cosmos.sh` | `/opt/cosmos-stack/` |
@@ -349,40 +404,47 @@ Each stack directory contains:
 ```
 STACK_DIR/
 ├── docker-compose.npm.yml
-├── docker-compose.authelia.yml
+├── docker-compose.authelia.yml          (or docker-compose.authentik.yml)
 ├── docker-compose.crowdsec.yml
-├── docker-compose.<platform>.yml   (if applicable)
-├── data/               ← NPM data
-├── letsencrypt/        ← SSL certificates
-├── crowdsec/           ← CrowdSec data + config
-├── authelia/           ← Authelia config + secrets + snippets
+├── docker-compose.<platform>.yml        (if applicable)
+├── data/                ← NPM data
+├── letsencrypt/         ← SSL certificates
+├── crowdsec/            ← CrowdSec data + config
+├── authelia/            ← Authelia config + secrets + snippets (default)
 │   ├── config/
 │   ├── secrets/
 │   └── snippets/
+├── authentik/           ← Authentik data (authentik variants only)
+│   ├── authentik.env    ← secrets (mode 600)
+│   ├── media/ templates/ blueprints/ certs/
+│   ├── postgres/        ← Authentik DB
+│   ├── redis/           ← Authentik cache
+│   └── snippets/        ← NPM forward-auth snippets
 ├── .npm_admin_password
-└── authelia/.default_password
+└── authelia/.default_password           (or authentik/.akadmin_password)
 ```
 
 ### Repository Files
 
 ```
 .
-├── deploy.sh                  ← Unified menu
-├── harden.sh                  ← Security hardening (run after deploy; LOCKDOWN_NPM_ADMIN toggle)
-├── add-domain.sh              ← Additively attach another domain (NPM hosts + Authelia realm)
-├── deploy-dockhand.sh         ← NPM + Dockhand + Authelia + CrowdSec
-├── deploy-netbird.sh          ← Traefik + Authentik + NetBird + Dockhand (zero-trust; staging)
-├── deploy-portainer.sh        ← NPM + Portainer + Authelia + CrowdSec
-├── deploy-dockge.sh           ← NPM + Dockge + Authelia + CrowdSec
-├── deploy-cosmos.sh           ← NPM + Cosmos + Authelia + CrowdSec
-├── deploy-coolify.sh          ← NPM + Coolify + Authelia + CrowdSec
-├── deploy-dokploy.sh          ← NPM + Dokploy + Authelia + CrowdSec
-├── deploy-casaos.sh           ← NPM + CasaOS + Authelia + CrowdSec
-├── deploy-runtipi.sh          ← NPM + Runtipi + Authelia + CrowdSec
-├── deploy-yunohost.sh         ← NPM + YunoHost + Authelia + CrowdSec
-├── deploy-freedombox.sh       ← NPM + FreedomBox + Authelia + CrowdSec
-├── .gitattributes             ← Forces LF endings (CRLF breaks bash on Linux)
-└── README.md                  ← This file
+├── deploy.sh                       ← Unified menu
+├── harden.sh                       ← Security hardening (run after deploy; LOCKDOWN_NPM_ADMIN toggle)
+├── add-domain.sh                   ← Additively attach another domain (NPM hosts + Authelia realm)
+├── deploy-dockhand.sh              ← NPM + Dockhand + Authelia + CrowdSec
+├── deploy-dockhand-authentik.sh    ← NPM + Dockhand + Authentik + CrowdSec (Authentik variant; staging)
+├── deploy-netbird.sh               ← Traefik + Authentik + NetBird + Dockhand (zero-trust; staging)
+├── deploy-portainer.sh             ← NPM + Portainer + Authelia + CrowdSec
+├── deploy-dockge.sh                ← NPM + Dockge + Authelia + CrowdSec
+├── deploy-cosmos.sh                ← NPM + Cosmos + Authelia + CrowdSec
+├── deploy-coolify.sh               ← NPM + Coolify + Authelia + CrowdSec
+├── deploy-dokploy.sh               ← NPM + Dokploy + Authelia + CrowdSec
+├── deploy-casaos.sh                ← NPM + CasaOS + Authelia + CrowdSec
+├── deploy-runtipi.sh               ← NPM + Runtipi + Authelia + CrowdSec
+├── deploy-yunohost.sh              ← NPM + YunoHost + Authelia + CrowdSec
+├── deploy-freedombox.sh            ← NPM + FreedomBox + Authelia + CrowdSec
+├── .gitattributes                  ← Forces LF endings (CRLF breaks bash on Linux)
+└── README.md                       ← This file
 ```
 
 ---
@@ -395,18 +457,20 @@ STACK_DIR/
 | Containers unreachable after `harden.sh` | `sysctl net.ipv4.ip_forward` — **must be `1`** (Docker needs IP forwarding; fixed in harden.sh) |
 | Can't reach NPM admin (:81) | Check `ss -tlnp \| grep ':81'`. If you ran `harden.sh` with `LOCKDOWN_NPM_ADMIN=1`, 81 is localhost-only — use the SSH tunnel: `ssh -L 8181:127.0.0.1:81 root@<vps>` then `http://localhost:8181`. Re-expose with `LOCKDOWN_NPM_ADMIN=0 ./harden.sh` |
 | Port 80/443 conflict | `ss -tlnp \| grep ':80 '` — another service may still be bound |
-| New subdomain gets 403 | Verify the two include lines are in NPM's Advanced tab |
+| New subdomain gets 403 | Verify the two include lines are in NPM's Advanced tab (Authelia or Authentik snippets) |
 | CrowdSec not catching | `docker exec crowdsec cscli metrics && docker exec crowdsec cscli decisions list` |
 | Bouncer not active | `journalctl -u crowdsec-firewall-bouncer -n 50` |
 | Script failed | Check `/var/log/vps-deploy.log` |
 | Authelia crash-looping | `docker logs authelia` — usually missing `users.yml` |
+| Authentik not healthy | `docker logs authentik-server` — first boot runs DB migrations (~3 min). Check `curl -s http://127.0.0.1:9000/-/health/ready/`. Verify `authentik-postgres` is healthy: `docker inspect --format='{{.State.Health.Status}}' authentik-postgres` |
+| Authentik outpost not protecting Dockhand | In the Authentik admin UI, verify the `embedded-proxy` outpost is healthy and the `dockhand` provider is attached. Check `docker logs authentik-server` for outpost errors |
 
 ### Restarting
 
 ```bash
 cd /opt/<platform>-stack
 docker compose -f docker-compose.npm.yml restart
-docker compose -f docker-compose.authelia.yml restart
+docker compose -f docker-compose.authelia.yml restart       # or docker-compose.authentik.yml
 docker compose -f docker-compose.crowdsec.yml restart
 ```
 

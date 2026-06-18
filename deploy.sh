@@ -13,6 +13,7 @@ fi
 #
 # Direct usage: ./deploy.sh portainer
 #               ./deploy.sh dockhand
+#               ./deploy.sh dockhand-authentik
 #               ./deploy.sh netbird
 #               ./deploy.sh harden
 #               ./deploy.sh add-domain example.com   # post-deploy utility (takes a domain)
@@ -54,62 +55,67 @@ TOOL_DESCRIPTIONS[3]="Nginx Proxy Manager + Dockhand — Next-gen Docker manager
 TOOL_PORTS[3]="80, 443, 81"
 TOOL_CATEGORIES[3]="NPM + Container Manager"
 
+TOOL_NAMES[4]="dockhand-authentik"
+TOOL_DESCRIPTIONS[4]="NPM + Dockhand + Authentik — Docker manager with Authentik SSO/2FA (forward-auth)"
+TOOL_PORTS[4]="80, 443, 81"
+TOOL_CATEGORIES[4]="NPM + Container Manager"
+
 # --- NetBird + Authentik (Zero-Trust) ---
-TOOL_NAMES[4]="netbird"
-TOOL_DESCRIPTIONS[4]="NetBird + Authentik + Dockhand — Zero-trust mesh, OIDC SSO, Traefik edge"
-TOOL_PORTS[4]="80, 443 + P2P 3478/udp, 49152-65535/udp, 33080"
-TOOL_CATEGORIES[4]="NetBird + Authentik (Zero-Trust)"
+TOOL_NAMES[5]="netbird"
+TOOL_DESCRIPTIONS[5]="NetBird + Authentik + Dockhand — Zero-trust mesh, OIDC SSO, Traefik edge"
+TOOL_PORTS[5]="80, 443 + P2P 3478/udp, 49152-65535/udp, 33080"
+TOOL_CATEGORIES[5]="NetBird + Authentik (Zero-Trust)"
 
 # --- PaaS / App Platforms ---
-TOOL_NAMES[5]="coolify"
-TOOL_DESCRIPTIONS[5]="Coolify — Open-source PaaS (Heroku/Netlify alternative)"
-TOOL_PORTS[5]="80, 443, 81"
-TOOL_CATEGORIES[5]="PaaS / App Platform"
-
-TOOL_NAMES[6]="dokploy"
-TOOL_DESCRIPTIONS[6]="Dokploy — Docker Swarm orchestration platform"
+TOOL_NAMES[6]="coolify"
+TOOL_DESCRIPTIONS[6]="Coolify — Open-source PaaS (Heroku/Netlify alternative)"
 TOOL_PORTS[6]="80, 443, 81"
 TOOL_CATEGORIES[6]="PaaS / App Platform"
 
-# --- Home Server OS ---
-TOOL_NAMES[7]="casaos"
-TOOL_DESCRIPTIONS[7]="CasaOS — Simple, elegant home server with app store"
+TOOL_NAMES[7]="dokploy"
+TOOL_DESCRIPTIONS[7]="Dokploy — Docker Swarm orchestration platform"
 TOOL_PORTS[7]="80, 443, 81"
-TOOL_CATEGORIES[7]="Home Server OS"
+TOOL_CATEGORIES[7]="PaaS / App Platform"
 
-TOOL_NAMES[8]="runtipi"
-TOOL_DESCRIPTIONS[8]="Runtipi — Home server with 300+ one-click apps"
+# --- Home Server OS ---
+TOOL_NAMES[8]="casaos"
+TOOL_DESCRIPTIONS[8]="CasaOS — Simple, elegant home server with app store"
 TOOL_PORTS[8]="80, 443, 81"
 TOOL_CATEGORIES[8]="Home Server OS"
 
-TOOL_NAMES[9]="cosmos"
-TOOL_DESCRIPTIONS[9]="Cosmos Server — All-in-one homelab suite with built-in proxy"
+TOOL_NAMES[9]="runtipi"
+TOOL_DESCRIPTIONS[9]="Runtipi — Home server with 300+ one-click apps"
 TOOL_PORTS[9]="80, 443, 81"
 TOOL_CATEGORIES[9]="Home Server OS"
 
-# --- Debian Server Distributions ---
-TOOL_NAMES[10]="yunohost"
-TOOL_DESCRIPTIONS[10]="YunoHost — All-in-one Debian server (mail, LDAP, apps)"
-TOOL_PORTS[10]="80, 443, 81 (Debian 12 only)"
-TOOL_CATEGORIES[10]="Debian Server Distro"
+TOOL_NAMES[10]="cosmos"
+TOOL_DESCRIPTIONS[10]="Cosmos Server — All-in-one homelab suite with built-in proxy"
+TOOL_PORTS[10]="80, 443, 81"
+TOOL_CATEGORIES[10]="Home Server OS"
 
-TOOL_NAMES[11]="freedombox"
-TOOL_DESCRIPTIONS[11]="FreedomBox — Debian home server with Cockpit admin"
+# --- Debian Server Distributions ---
+TOOL_NAMES[11]="yunohost"
+TOOL_DESCRIPTIONS[11]="YunoHost — All-in-one Debian server (mail, LDAP, apps)"
 TOOL_PORTS[11]="80, 443, 81 (Debian 12 only)"
 TOOL_CATEGORIES[11]="Debian Server Distro"
 
-# --- Security & Utilities (run AFTER deploying a platform) ---
-TOOL_NAMES[12]="harden"
-TOOL_DESCRIPTIONS[12]="🔒 Harden VPS — SSH lockdown, CrowdSec, GeoIP block, auto-updates"
-TOOL_PORTS[12]="—"
-TOOL_CATEGORIES[12]="Security & Utilities"
+TOOL_NAMES[12]="freedombox"
+TOOL_DESCRIPTIONS[12]="FreedomBox — Debian home server with Cockpit admin"
+TOOL_PORTS[12]="80, 443, 81 (Debian 12 only)"
+TOOL_CATEGORIES[12]="Debian Server Distro"
 
-TOOL_NAMES[13]="add-domain"
-TOOL_DESCRIPTIONS[13]="➕ Add another domain to a running NPM+Authelia stack (extra hosts + SSO realm)"
+# --- Security & Utilities (run AFTER deploying a platform) ---
+TOOL_NAMES[13]="harden"
+TOOL_DESCRIPTIONS[13]="🔒 Harden VPS — SSH lockdown, CrowdSec, GeoIP block, auto-updates"
 TOOL_PORTS[13]="—"
 TOOL_CATEGORIES[13]="Security & Utilities"
 
-readonly TOOL_COUNT=13
+TOOL_NAMES[14]="add-domain"
+TOOL_DESCRIPTIONS[14]="➕ Add another domain to a running NPM+Authelia stack (extra hosts + SSO realm)"
+TOOL_PORTS[14]="—"
+TOOL_CATEGORIES[14]="Security & Utilities"
+
+readonly TOOL_COUNT=14
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COLORS & UI
@@ -243,6 +249,7 @@ if [[ $# -gt 0 ]]; then
     portainer|npm|vps)                requested="portainer" ;;
     dockge)                           requested="dockge" ;;
     dockhand)                         requested="dockhand" ;;
+    dockhand-authentik|dh-authentik)  requested="dockhand-authentik" ;;
     netbird|authentik|zerotrust|nb)   requested="netbird" ;;
     coolify)                          requested="coolify" ;;
     dokploy)                          requested="dokploy" ;;
