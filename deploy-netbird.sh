@@ -1182,6 +1182,7 @@ NB_PROXY_ALLOW_INSECURE=true
 NB_PROXY_DOMAIN=${DOMAIN}
 NB_PROXY_ADDRESS=:8443
 NB_PROXY_TOKEN=${token}
+NB_PROXY_PRIVATE=true
 NB_PROXY_CERTIFICATE_DIRECTORY=/certs
 NB_PROXY_ACME_CERTIFICATES=true
 NB_PROXY_ACME_CHALLENGE_TYPE=tls-alpn-01
@@ -1394,7 +1395,24 @@ create_netbird_proxy_services() {
   fi
   success "Proxy cluster is online"
 
+  # Verify the cluster has the Private capability (required for proxy_cluster
+  # target type + direct_upstream). Without it, the API will reject our service
+  # creation requests.
+  local has_private=false
+  echo "$clusters_resp" | jq -e '.[] | select(.private == true)' >/dev/null 2>&1 && has_private=true
+  if ! $has_private; then
+    warn "Proxy cluster does NOT have the Private capability."
+    warn "  This is required for direct-upstream targets (same-host Docker containers)."
+    warn "  Check: docker logs netbird-proxy (look for NB_PROXY_PRIVATE=true)"
+    warn "  Ensure the proxy container was started with NB_PROXY_PRIVATE=true in proxy.env"
+    return 0
+  fi
+  success "Proxy cluster has Private capability (direct upstream enabled)"
+
   # Helper: POST a reverse proxy service. $1=name/domain, $2=target host, $3=target port
+  # Uses target_type "proxy_cluster" + direct_upstream=true so the proxy dials
+  # the target directly from its Docker network stack (no WireGuard needed).
+  # NB_PROXY_PRIVATE=true on the proxy container unlocks this target type.
   _nb_create_service() {
     local svc_domain="$1" tgt_host="$2" tgt_port="$3"
     local payload
@@ -1409,7 +1427,7 @@ create_netbird_proxy_services() {
         mode: "http",
         targets: [{
           target_id: "",
-          target_type: "host",
+          target_type: "proxy_cluster",
           path: "/",
           protocol: "http",
           host: $host,
@@ -1447,7 +1465,7 @@ create_netbird_proxy_services() {
         warn "Failed to create service ${svc_domain} (HTTP ${http_code:-0})"
         warn "  Response: ${body:-<empty>}"
         warn "  Manual: NetBird dashboard -> Reverse Proxy -> Services -> Add Service"
-        warn "    Domain: ${svc_domain}, Target Host: ${tgt_host}, Port: ${tgt_port}, Direct Upstream"
+        warn "    Domain: ${svc_domain}, Target: Proxy Cluster, Host: ${tgt_host}, Port: ${tgt_port}"
         ;;
     esac
   }
