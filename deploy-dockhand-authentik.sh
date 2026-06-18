@@ -17,7 +17,7 @@ fi
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.6.0-hardened-cloudflare-authentik"
+readonly SCRIPT_VERSION="4.6.1-hardened-cloudflare-authentik"
 readonly SCRIPT_NAME="deploy-dockhand-authentik.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/dockhand-stack"
@@ -1029,32 +1029,42 @@ bootstrap_authentik() {
     return 0
   fi
 
-  # 5. Create (or reuse) an embedded Proxy Outpost covering the dockhand app.
-  #    The embedded outpost runs INSIDE authentik-server (no extra container);
-  #    the server's outpost controller deploys it automatically.
-  local outpost_pk outpost_json
-  outpost_json=$(jq -nc \
-    --arg name "embedded-proxy" \
-    --arg akhost "https://authentik.${DOMAIN}" \
-    '{name:$name, type:"proxy", providers:['"$prov_pk"'], config:{authentik_host:$akhost, authentik_host_insecure:false}}')
-  outpost_pk=$(_ak_api "/outposts/instances/" -X POST -d "$outpost_json" 2>/dev/null \
-              | jq -r '.pk // empty' 2>/dev/null || true)
+  # 5. Attach the dockhand provider to the BUILT-IN embedded outpost.
+  #    CRITICAL: only the managed embedded outpost (managed ==
+  #    "goauthentik.io/outposts/embedded") actually runs INSIDE authentik-server
+  #    and serves /outpost.goauthentik.io/ (the auth_request endpoint the NPM
+  #    snippet proxies to). Creating a brand-new standalone outpost would leave it
+  #    with NO running instance (no docker/k8s service connection) -> the
+  #    forward-auth subrequest 502s and Dockhand's 2FA gate silently never works.
+  #    So: find the embedded outpost and MERGE the dockhand provider into it.
+  #    (Outpost pk is a UUID string; provider pk is an integer.)
+  local outpost_pk outpost_list existing_providers merged_providers
+  outpost_list=$(_ak_api "/outposts/instances/?page_size=100" 2>/dev/null || true)
+  outpost_pk=$(echo "$outpost_list" \
+    | jq -r '.results[]? | select(.managed=="goauthentik.io/outposts/embedded") | .pk' 2>/dev/null | head -1)
+  # Fallback: first proxy-type outpost, in case the managed flag differs by version.
+  [[ -z "$outpost_pk" ]] && outpost_pk=$(echo "$outpost_list" \
+    | jq -r '.results[]? | select(.type=="proxy") | .pk' 2>/dev/null | head -1)
   if [[ -z "$outpost_pk" ]]; then
-    outpost_pk=$(_ak_api "/outposts/instances/?name=embedded-proxy" 2>/dev/null \
-                | jq -r '.results[0].pk // empty' 2>/dev/null || true)
-    if [[ -n "$outpost_pk" ]]; then
-      # Ensure the dockhand provider is attached to the existing outpost.
-      _ak_api "/outposts/instances/${outpost_pk}/" -X PATCH \
-        -d "$(jq -nc --argjson p "[\"$prov_pk\"]" '{providers:$p}')" >/dev/null 2>&1 || true
-    fi
-  fi
-  if [[ -z "$outpost_pk" ]]; then
-    warn "Could not create Authentik outpost. Create one in the UI:"
-    warn "  Outposts > Create: type=Proxy, applications=dockhand. The embedded outpost"
-    warn "  runs inside authentik-server; no extra container needed."
+    warn "Could not find the embedded Authentik outpost. Attach the provider in the UI:"
+    warn "  Outposts > 'authentik Embedded Outpost' > Edit > add the 'dockhand' provider."
     return 0
   fi
-  success "Authentik outpost 'embedded-proxy' created (pk ${outpost_pk})"
+  # Merge - do NOT clobber providers already attached to the embedded outpost.
+  existing_providers=$(echo "$outpost_list" \
+    | jq -c --arg pk "$outpost_pk" '.results[]? | select(.pk==$pk) | .providers' 2>/dev/null || true)
+  [[ -z "$existing_providers" || "$existing_providers" == "null" ]] && existing_providers="[]"
+  merged_providers=$(jq -nc --argjson cur "$existing_providers" --argjson p "$prov_pk" \
+    '($cur + [$p]) | unique' 2>/dev/null || echo "[$prov_pk]")
+  if _ak_api "/outposts/instances/${outpost_pk}/" -X PATCH \
+       -d "$(jq -nc --argjson p "$merged_providers" '{providers:$p}')" 2>/dev/null \
+       | jq -e '.pk // empty' >/dev/null 2>&1; then
+    success "Dockhand provider attached to embedded Authentik outpost (pk ${outpost_pk})"
+  else
+    warn "Could not attach the dockhand provider to the embedded outpost - add it in the UI"
+    warn "  (Outposts > 'authentik Embedded Outpost' > Edit > add provider 'dockhand')."
+    return 0
+  fi
 
   # 6. Wait for the embedded outpost to come up.
   local healthy=false
@@ -1576,6 +1586,16 @@ setup_cloudflare_bouncer() {
   # 4. Write the bouncer config (free-plan-safe). Heredoc is unquoted so the
   #    ${...} variables below are filled in at runtime.
   : "${CF_BOUNCER_KEY:=$(rand_password 48)}"
+  # The worker-bouncer config validator FATALs ("turnstile must be enabled ... to
+  # support captcha action") when actions=[captcha] but turnstile.enabled=false,
+  # which would crash-loop the service. captcha REQUIRES Turnstile, so enable it
+  # only for the captcha action. Reject any other value early.
+  case "$CF_BOUNCER_ACTION" in
+    ban|captcha) ;;
+    *) warn "Invalid CF_BOUNCER_ACTION='${CF_BOUNCER_ACTION}' (expected ban|captcha); using 'ban'."; CF_BOUNCER_ACTION="ban" ;;
+  esac
+  local cf_turnstile="false"
+  [[ "$CF_BOUNCER_ACTION" == "captcha" ]] && cf_turnstile="true"
   cat > "$cfg" << CFWB
 crowdsec_config:
   lapi_key: ${CF_BOUNCER_KEY}
@@ -1600,7 +1620,8 @@ cloudflare_config:
           actions: ["${CF_BOUNCER_ACTION}"]
           default_action: ${CF_BOUNCER_ACTION}
           turnstile:
-            enabled: false
+            enabled: ${cf_turnstile}
+            mode: managed
   worker:
     log_only: false
 
@@ -1687,10 +1708,12 @@ verify_deployment() {
     else warn "VERIFY FAILED: ${label}"; fails=$((fails+1)); fi
   }
 
-  # Containers
-  local want="npm dockhand authentik-server authentik-worker authentik-postgres authentik-redis crowdsec"
+  # Containers. NOTE: must be an array - the global IFS=$'\n\t' has no space, so a
+  # space-separated string would NOT word-split here (every check would run once
+  # against the whole string and fail).
+  local want=(npm dockhand authentik-server authentik-worker authentik-postgres authentik-redis crowdsec)
   local c
-  for c in $want; do
+  for c in "${want[@]}"; do
     _check "container '$c' running" bash -c "docker ps --format '{{.Names}}' | grep -qx '$c'"
   done
 
