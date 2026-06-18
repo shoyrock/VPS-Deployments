@@ -22,9 +22,9 @@ fi
 #
 # Topology: one Traefik (ours, named to match NetBird's labels) owns 80/443:
 #     netbird.<domain>             -> netbird-server (gRPC h2c) + dashboard (Traefik direct)
-#     *.netbird.<domain>           -> netbird-proxy (TLS passthrough; per-service ACME)
-#         dockhand.netbird.<domain>    -> dockhand:3000
-#         authentik.netbird.<domain>   -> authentik-server:9000
+#     *.<domain>                   -> netbird-proxy (TLS passthrough; per-service ACME)
+#         dockhand.<domain>            -> dockhand:3000
+#         authentik.<domain>           -> authentik-server:9000
 #   NetBird STUN stays host-published: 3478/udp. Relay rides Traefik on /relay.
 #   Reverse proxy services are auto-created via the NetBird management REST API.
 #
@@ -199,8 +199,8 @@ _on_exit() {
   printf "${C_B}------------------------------------------------------------------------------${C_R}\n"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
     printf "${C_B}  NetBird (control plane): https://netbird.%s${C_R}\n" "$DOMAIN"
-    printf "${C_B}  Authentik (via proxy):   https://authentik.netbird.%s${C_R}\n" "$DOMAIN"
-    printf "${C_B}  Dockhand (via proxy):    https://dockhand.netbird.%s${C_R}\n" "$DOMAIN"
+    printf "${C_B}  Authentik (via proxy):   https://authentik.%s${C_R}\n" "$DOMAIN"
+    printf "${C_B}  Dockhand (via proxy):    https://dockhand.%s${C_R}\n" "$DOMAIN"
     printf "${C_B}------------------------------------------------------------------------------${C_R}\n"
     printf "${C_B}${C_YEL}  Containers on the proxy network:${C_R}\n"
     printf "${C_B}    traefik              ->  ports 80, 443 (TLS edge; passes apps to netbird-proxy)${C_R}\n"
@@ -218,18 +218,18 @@ _on_exit() {
     printf "${C_B}  All credentials are stored (mode 600) under: %s${C_R}\n" "$STACK_DIR"
     printf "\n"
     printf "${C_B}${C_YEL}  Reverse proxy services auto-created via NetBird API:${C_R}\n"
-    printf "${C_B}    dockhand.netbird.%s  ->  dockhand:3000          (Direct Upstream)${C_R}\n" "$DOMAIN"
-    printf "${C_B}    authentik.netbird.%s ->  authentik-server:9000  (Direct Upstream)${C_R}\n" "$DOMAIN"
+    printf "${C_B}    dockhand.%s  ->  dockhand:3000          (Direct Upstream)${C_R}\n" "$DOMAIN"
+    printf "${C_B}    authentik.%s ->  authentik-server:9000  (Direct Upstream)${C_R}\n" "$DOMAIN"
     printf "${C_B}  Auth is unconfigured (public). Set SSO/password/PIN per-service in:${C_R}\n"
     printf "${C_B}    NetBird dashboard -> Reverse Proxy -> Services -> [service] -> Authentication${C_R}\n"
     printf "${C_B}  netbird.%s stays on Traefik directly (proxy control plane + dashboard).${C_R}\n" "$DOMAIN"
-    printf "${C_B}  DNS: point *.netbird.%s -> %s for reverse proxy TLS to issue.${C_R}\n" "$DOMAIN" "$ext_ip"
+    printf "${C_B}  DNS: point *.%s -> %s for reverse proxy TLS to issue.${C_R}\n" "$DOMAIN" "$ext_ip"
   fi
   printf "${C_B}  Ports: 80 (HTTP), 443 (HTTPS); NetBird STUN: 3478/udp; proxy WireGuard: 51820/udp${C_R}\n"
   printf "${C_B}  Log: %s${C_R}\n" "$LOG_FILE"
   printf "${C_B}==============================================================================${C_R}\n\n"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
-    printf "${C_B}${C_GRN}Your VPS is ready!${C_R} DNS: ${C_CYN}netbird.%s -> %s${C_R} and ${C_CYN}*.netbird.%s -> %s${C_R}\n\n" "$DOMAIN" "$ext_ip" "$DOMAIN" "$ext_ip"
+    printf "${C_B}${C_GRN}Your VPS is ready!${C_R} DNS: ${C_CYN}netbird.%s -> %s${C_R} and ${C_CYN}*.%s -> %s${C_R}\n\n" "$DOMAIN" "$ext_ip" "$DOMAIN" "$ext_ip"
   else
     printf "${C_B}${C_YEL}Deployment failed.${C_R} Check: ${C_CYN}cat $LOG_FILE${C_R}\n\n"
   fi
@@ -577,7 +577,7 @@ services:
       # Dockhand is NOT exposed directly by Traefik. All app ingress goes
       # through the NetBird reverse proxy. It stays on the 'proxy' network so the
       # proxy can reach it via Direct Upstream as http://dockhand:3000.
-      # The reverse proxy service (dockhand.netbird.${DOMAIN}) is auto-created
+      # The reverse proxy service (dockhand.${DOMAIN}) is auto-created
       # by create_netbird_proxy_services() via the NetBird management API.
       # (Old direct Traefik route kept below, disabled, for reference.)
       - "traefik.enable=false"
@@ -883,7 +883,7 @@ services:
         condition: service_started
     labels:
       # Authentik is NOT exposed directly by Traefik. It is reached via the
-      # NetBird reverse proxy (authentik.netbird.${DOMAIN} -> authentik-server:9000)
+      # NetBird reverse proxy (authentik.${DOMAIN} -> authentik-server:9000)
       # so all app ingress goes through NetBird. It stays on the 'proxy' network
       # so netbird-proxy can reach it via Direct Upstream as http://authentik-server:9000.
       - "traefik.enable=false"
@@ -920,7 +920,7 @@ networks:
 COMPOSE_AK
 
   # Authentik is deployed as a general-purpose IdP. It is exposed via the NetBird
-  # reverse proxy (authentik.netbird.${DOMAIN}), NOT via Traefik forward-auth.
+  # reverse proxy (authentik.${DOMAIN}), NOT via Traefik forward-auth.
   # App auth for dockhand and other services is handled by the NetBird reverse
   # proxy's own auth (SSO/password/PIN) configured per-service in the dashboard.
   # No forward-auth blueprint is needed since nothing routes through Traefik
@@ -967,7 +967,7 @@ gen_netbird_files() {
   # config.yaml -- VERBATIM from NetBird's official installer render_combined_yaml()
   # (combined netbird-server, EMBEDDED IdP at /oauth2, sqlite store). No external
   # OIDC: NetBird logs in via its own built-in IdP. Authentik is exposed via the
-  # NetBird reverse proxy (authentik.netbird.${DOMAIN}) as a general-purpose IdP.
+  # NetBird reverse proxy (authentik.${DOMAIN}) as a general-purpose IdP.
   cat > "${NETBIRD_DIR}/config.yaml" << NBCFG
 server:
   listenAddress: ":80"
@@ -1165,7 +1165,7 @@ write_netbird_proxy_env() {
 NB_PROXY_DEBUG_LOGS=false
 NB_PROXY_MANAGEMENT_ADDRESS=http://netbird-server:80
 NB_PROXY_ALLOW_INSECURE=true
-NB_PROXY_DOMAIN=netbird.${DOMAIN}
+NB_PROXY_DOMAIN=${DOMAIN}
 NB_PROXY_ADDRESS=:8443
 NB_PROXY_TOKEN=${token}
 NB_PROXY_CERTIFICATE_DIRECTORY=/certs
@@ -1231,19 +1231,8 @@ create_netbird_proxy_services() {
   if [[ -z "$NB_PROXY_TOKEN" ]]; then
     warn "No NB_PROXY_TOKEN -- cannot create reverse proxy services via API."
     warn "  Create them manually in the NetBird dashboard -> Reverse Proxy -> Services:"
-    warn "    dockhand.netbird.${DOMAIN}  ->  dockhand:3000"
-    warn "    authentik.netbird.${DOMAIN} ->  authentik-server:9000"
-    return 0
-  fi
-
-  # The management server listens on :80 inside the container (HTTP, not HTTPS
-  # -- safe because traffic never leaves the Docker network). Reach it via the
-  # container's IP on the proxy bridge network.
-  local nb_ip
-  nb_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' netbird-server 2>/dev/null)
-  if [[ -z "$nb_ip" ]]; then
-    warn "Cannot find netbird-server container IP. Services not created via API."
-    warn "  Create them manually in the NetBird dashboard."
+    warn "    dockhand.${DOMAIN}  ->  dockhand:3000"
+    warn "    authentik.${DOMAIN} ->  authentik-server:9000"
     return 0
   fi
   local api_base="http://${nb_ip}:80/api"
@@ -1267,8 +1256,8 @@ create_netbird_proxy_services() {
     warn "netbird-proxy cluster not registered yet. Services not created via API."
     warn "  Check: docker logs netbird-proxy"
     warn "  Create them manually in the NetBird dashboard -> Reverse Proxy -> Services:"
-    warn "    dockhand.netbird.${DOMAIN}  ->  Host: dockhand, Port: 3000, Direct Upstream"
-    warn "    authentik.netbird.${DOMAIN} ->  Host: authentik-server, Port: 9000, Direct Upstream"
+    warn "    dockhand.${DOMAIN}  ->  Host: dockhand, Port: 3000, Direct Upstream"
+    warn "    authentik.${DOMAIN} ->  Host: authentik-server, Port: 9000, Direct Upstream"
     return 0
   fi
   success "Proxy cluster is online"
@@ -1332,14 +1321,14 @@ create_netbird_proxy_services() {
   }
 
   info "Creating reverse proxy service for Dockhand..."
-  _nb_create_service "dockhand.netbird.${DOMAIN}" "dockhand" 3000
+  _nb_create_service "dockhand.${DOMAIN}" "dockhand" 3000
 
   info "Creating reverse proxy service for Authentik..."
-  _nb_create_service "authentik.netbird.${DOMAIN}" "authentik-server" 9000
+  _nb_create_service "authentik.${DOMAIN}" "authentik-server" 9000
 
   info "Reverse proxy services created. Configure auth (SSO/password/PIN) in the"
   info "  NetBird dashboard -> Reverse Proxy -> Services -> [service] -> Authentication."
-  info "  DNS: point *.netbird.${DOMAIN} -> $(get_external_ip) for TLS to issue."
+  info "  DNS: point *.${DOMAIN} -> $(get_external_ip) for TLS to issue."
 }
 
 # ==============================================================================
@@ -2141,9 +2130,9 @@ verify_deployment() {
   _nb_ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' netbird-server 2>/dev/null)
   if [[ -n "$_nb_ip" && -n "$NB_PROXY_TOKEN" ]]; then
     _check "NetBird reverse proxy: Dockhand service exists" bash -c \
-      "curl -sf --max-time 5 -H 'Authorization: Token ${NB_PROXY_TOKEN}' 'http://${_nb_ip}:80/api/reverse-proxies/services' 2>/dev/null | jq -e '.[] | select(.domain==\"dockhand.netbird.${DOMAIN}\")' >/dev/null"
+      "curl -sf --max-time 5 -H 'Authorization: Token ${NB_PROXY_TOKEN}' 'http://${_nb_ip}:80/api/reverse-proxies/services' 2>/dev/null | jq -e '.[] | select(.domain==\"dockhand.${DOMAIN}\")' >/dev/null"
     _check "NetBird reverse proxy: Authentik service exists" bash -c \
-      "curl -sf --max-time 5 -H 'Authorization: Token ${NB_PROXY_TOKEN}' 'http://${_nb_ip}:80/api/reverse-proxies/services' 2>/dev/null | jq -e '.[] | select(.domain==\"authentik.netbird.${DOMAIN}\")' >/dev/null"
+      "curl -sf --max-time 5 -H 'Authorization: Token ${NB_PROXY_TOKEN}' 'http://${_nb_ip}:80/api/reverse-proxies/services' 2>/dev/null | jq -e '.[] | select(.domain==\"authentik.${DOMAIN}\")' >/dev/null"
   else
     warn "VERIFY SKIPPED: NetBird reverse proxy service checks (no token or server IP)"
   fi
@@ -2211,12 +2200,12 @@ netbird.${DOMAIN}              ->  netbird-dashboard + management(gRPC) + signal
   (control plane -- the ONLY direct Traefik route)
 
 ${C_B}${C_GRN}-- NetBird reverse proxy (TLS passthrough -> per-service ACME) --${C_R}
-dockhand.netbird.${DOMAIN}     ->  dockhand:3000           (Direct Upstream)
-authentik.netbird.${DOMAIN}    ->  authentik-server:9000   (Direct Upstream)
+dockhand.${DOMAIN}     ->  dockhand:3000           (Direct Upstream)
+authentik.${DOMAIN}    ->  authentik-server:9000   (Direct Upstream)
   (all app ingress goes through netbird-proxy; auth set per-service in dashboard)
 
 ${C_B}Authentik (Identity Provider)${C_R}
-  URL:       https://authentik.netbird.${DOMAIN}
+  URL:       https://authentik.${DOMAIN}
   Admin:     akadmin
   Password:${C_YEL} ${ak_pass}${C_R}  (change after first login)
   Files:     ${AUTHENTIK_DIR}
@@ -2230,7 +2219,7 @@ ${C_B}NetBird (self-hosted)${C_R}
   Proxy:     netbird-proxy (reverse proxy engine; services auto-created for Dockhand + Authentik)
 
 ${C_B}Dockhand${C_R}
-  URL:        https://dockhand.netbird.${DOMAIN}
+  URL:        https://dockhand.${DOMAIN}
   Auth:       Set in NetBird dashboard -> Reverse Proxy -> Services -> Dockhand -> Authentication
   Data:       ${DOCKHAND_DATA_DIR}
   Host Files: READ-ONLY mount under /host (see compose comment to enable writes)
@@ -2268,7 +2257,7 @@ ${C_B}${C_RED}STAGING NOTES (test before production):${C_R}
     https://netbird.<domain> walks you through creating the initial admin.
   - Reverse proxy services are created with NO auth (public). Set SSO/password/PIN
     per-service in the NetBird dashboard before relying on them.
-  - DNS: netbird.<domain> AND *.netbird.<domain> must point to this server's IP
+  - DNS: netbird.<domain> AND *.<domain> must point to this server's IP
     for the control plane + reverse proxy TLS certs to issue.
 
 ${C_B}${C_RED}REQUIRED -- OPEN INBOUND PORTS AT YOUR CLOUD FIREWALL${C_R} (security group / VCN / ACL)
