@@ -17,7 +17,7 @@ fi
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.6.0-hardened-cloudflare"
+readonly SCRIPT_VERSION="4.6.1-hardened-cloudflare"
 readonly SCRIPT_NAME="deploy-dockhand.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/dockhand-stack"
@@ -478,15 +478,21 @@ get_user_domain() {
 setup_dockhand() {
   step "Dockhand (standalone)"
   mkdir -p "${DOCKHAND_DATA_DIR}"
+  # Shared apps directory. Dockhand gets READ-WRITE control here so it can fully
+  # TRACK (adopt/edit/deploy) user app stacks. The mount uses an IDENTICAL
+  # host:container path (/opt/apps:/opt/apps) - mandatory for a socket-based
+  # manager: Dockhand tells the HOST daemon to deploy, and the daemon resolves each
+  # stack's bind-mount source paths on the host, so Dockhand's view of the path
+  # must equal the host path or adoption + bind mounts break. Put each app at
+  # /opt/apps/<app>/compose.yaml, then Dockhand > Import to track it.
+  mkdir -p /opt/apps && chmod 750 /opt/apps
 
-  # SECURITY: the host filesystem is mounted READ-ONLY (/:/host:ro).
-  # The previous read-write mount meant any Dockhand compromise = instant,
-  # silent root on the host. Note that the docker.sock mount is still
-  # root-equivalent by nature (required for a Docker manager), but Authelia
-  # 2FA gates all access and the :ro mount removes the easiest abuse path.
-  # If you genuinely need write access to host files from the Dockhand UI,
-  # change "/:/host:ro" to "/:/host" below and re-run:
-  #   docker compose -f /opt/dockhand-stack/docker-compose.dockhand.yml up -d --force-recreate
+  # SECURITY: the rest of the host filesystem is mounted READ-ONLY (/:/host:ro).
+  # The previous read-write whole-host mount meant any Dockhand compromise =
+  # instant, silent root on the host. /opt/apps is the single READ-WRITE EXCEPTION
+  # (so Dockhand can manage app stacks); everything else stays :ro. The docker.sock
+  # mount is still root-equivalent by nature (required for a Docker manager), but
+  # Authelia 2FA gates all access.
   cat > "${STACK_DIR}/docker-compose.dockhand.yml" << 'COMPOSE_DOCKHAND'
 services:
   dockhand:
@@ -499,6 +505,10 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./dockhand-data:/app/data
+      # User app stacks: READ-WRITE, identical host:container path so Dockhand can
+      # fully track/edit/deploy them and the daemon resolves their bind mounts.
+      - /opt/apps:/opt/apps
+      # Rest of host: READ-ONLY (browse only).
       - /:/host:ro
     networks:
       - proxy

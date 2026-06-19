@@ -17,7 +17,7 @@ fi
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.6.3-hardened-cloudflare-authentik"
+readonly SCRIPT_VERSION="4.6.5-hardened-cloudflare-authentik"
 readonly SCRIPT_NAME="deploy-dockhand-authentik.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/dockhand-stack"
@@ -486,15 +486,21 @@ get_user_domain() {
 setup_dockhand() {
   step "Dockhand (standalone)"
   mkdir -p "${DOCKHAND_DATA_DIR}"
+  # Shared apps directory. Dockhand gets READ-WRITE control here so it can fully
+  # TRACK (adopt/edit/deploy) user app stacks. The mount uses an IDENTICAL
+  # host:container path (/opt/apps:/opt/apps) - this is mandatory for a socket-
+  # based manager: Dockhand tells the HOST daemon to deploy, and the daemon
+  # resolves each stack's bind-mount source paths on the host, so Dockhand's view
+  # of the path must equal the host path or adoption + bind mounts break. Put
+  # each app at /opt/apps/<app>/compose.yaml, then Dockhand > Import to track it.
+  mkdir -p /opt/apps && chmod 750 /opt/apps
 
-  # SECURITY: the host filesystem is mounted READ-ONLY (/:/host:ro).
-  # The previous read-write mount meant any Dockhand compromise = instant,
-  # silent root on the host. Note that the docker.sock mount is still
-  # root-equivalent by nature (required for a Docker manager), but Authentik
-  # 2FA gates all access and the :ro mount removes the easiest abuse path.
-  # If you genuinely need write access to host files from the Dockhand UI,
-  # change "/:/host:ro" to "/:/host" below and re-run:
-  #   docker compose -f /opt/dockhand-stack/docker-compose.dockhand.yml up -d --force-recreate
+  # SECURITY: the rest of the host filesystem is mounted READ-ONLY (/:/host:ro).
+  # The previous read-write whole-host mount meant any Dockhand compromise =
+  # instant, silent root on the host. /opt/apps is the single READ-WRITE
+  # EXCEPTION (so Dockhand can manage app stacks); everything else stays :ro.
+  # The docker.sock mount is still root-equivalent by nature (required for a
+  # Docker manager), but Authentik 2FA gates all access.
   cat > "${STACK_DIR}/docker-compose.dockhand.yml" << 'COMPOSE_DOCKHAND'
 services:
   dockhand:
@@ -507,6 +513,10 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./dockhand-data:/app/data
+      # User app stacks: READ-WRITE, identical host:container path so Dockhand can
+      # fully track/edit/deploy them and the daemon resolves their bind mounts.
+      - /opt/apps:/opt/apps
+      # Rest of host: READ-ONLY (browse only).
       - /:/host:ro
     networks:
       - proxy
@@ -1092,7 +1102,7 @@ bootstrap_authentik() {
   #    forward-auth subrequest 502s and Dockhand's 2FA gate silently never works.
   #    So: find the embedded outpost and MERGE the dockhand provider into it.
   #    (Outpost pk is a UUID string; provider pk is an integer.)
-  local outpost_pk outpost_list existing_providers merged_providers
+  local outpost_pk outpost_list existing_providers merged_providers existing_config merged_config
   outpost_list=$(_ak_api "/outposts/instances/?page_size=100" 2>/dev/null || true)
   outpost_pk=$(echo "$outpost_list" \
     | jq -r '.results[]? | select(.managed=="goauthentik.io/outposts/embedded") | .pk' 2>/dev/null | head -1)
@@ -1110,13 +1120,24 @@ bootstrap_authentik() {
   [[ -z "$existing_providers" || "$existing_providers" == "null" ]] && existing_providers="[]"
   merged_providers=$(jq -nc --argjson cur "$existing_providers" --argjson p "$prov_pk" \
     '($cur + [$p]) | unique' 2>/dev/null || echo "[$prov_pk]")
+  # ALSO set the outpost's authentik_host. The embedded outpost ships with an EMPTY
+  # authentik_host, which makes Authentik show "authentik domain is not configured.
+  # Authentication will not work." and breaks redirect URLs. Merge it into the
+  # existing config so the other config keys (log_level, naming template, ...) survive.
+  existing_config=$(echo "$outpost_list" \
+    | jq -c --arg pk "$outpost_pk" '.results[]? | select(.pk==$pk) | .config' 2>/dev/null || true)
+  [[ -z "$existing_config" || "$existing_config" == "null" ]] && existing_config="{}"
+  merged_config=$(jq -nc --argjson cfg "$existing_config" --arg h "https://authentik.${DOMAIN}" \
+    '$cfg + {authentik_host:$h, authentik_host_insecure:false}' 2>/dev/null \
+    || printf '{"authentik_host":"https://authentik.%s","authentik_host_insecure":false}' "$DOMAIN")
   if _ak_api "/outposts/instances/${outpost_pk}/" -X PATCH \
-       -d "$(jq -nc --argjson p "$merged_providers" '{providers:$p}')" 2>/dev/null \
+       -d "$(jq -nc --argjson p "$merged_providers" --argjson c "$merged_config" '{providers:$p, config:$c}')" 2>/dev/null \
        | jq -e '.pk // empty' >/dev/null 2>&1; then
-    success "Dockhand provider attached to embedded Authentik outpost (pk ${outpost_pk})"
+    success "Dockhand provider attached + authentik_host set on embedded outpost (pk ${outpost_pk})"
   else
-    warn "Could not attach the dockhand provider to the embedded outpost - add it in the UI"
-    warn "  (Outposts > 'authentik Embedded Outpost' > Edit > add provider 'dockhand')."
+    warn "Could not update the embedded outpost - do it in the UI:"
+    warn "  Outposts > 'authentik Embedded Outpost' > Edit > add provider 'dockhand' AND"
+    warn "  set authentik_host: https://authentik.${DOMAIN}"
     return 0
   fi
 
