@@ -1394,7 +1394,7 @@ setup_cloudflare_bouncer() {
   elif [[ "$OS_FAMILY" == "debian" ]]; then
     info "Adding CrowdSec repository + installing the worker bouncer..."
     curl -s https://packagecloud.io/install/repositories/crowdsec/crowdsec/script.deb.sh | bash >>"$LOG_FILE" 2>&1 || true
-    apt-get install -y -qq crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o Dpkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 || true
     command -v crowdsec-cloudflare-worker-bouncer &>/dev/null && have_bin=true
   else
     info "Adding CrowdSec repository + installing the worker bouncer..."

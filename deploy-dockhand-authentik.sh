@@ -17,7 +17,7 @@ fi
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.6.2-hardened-cloudflare-authentik"
+readonly SCRIPT_VERSION="4.6.3-hardened-cloudflare-authentik"
 readonly SCRIPT_NAME="deploy-dockhand-authentik.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/dockhand-stack"
@@ -790,14 +790,27 @@ npm_change_password() {
   step "Securing NPM admin password"
   local NEW_PASS JSON LOGIN
   NEW_PASS=$(rand_password 24)
+  # NPM's API can briefly reject logins right after a container/daemon restart -
+  # and the firewall step runs `systemctl restart docker` just before this. So
+  # retry the initial default-credential login instead of giving up on the first
+  # transient failure (the old single-shot was the #1 reason automated NPM setup
+  # silently skipped, leaving DEFAULT creds + no proxy hosts).
   JSON='{"identity":"admin@example.com","secret":"changeme"}'
-  LOGIN=$(_npm_api "/tokens" -d "$JSON" 2>/dev/null) || true
-  NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty')
+  NPM_TOKEN=""
+  local _try
+  for _try in $(seq 1 8); do
+    LOGIN=$(_npm_api "/tokens" -d "$JSON" 2>/dev/null) || true
+    NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty' 2>/dev/null)
+    [[ -n "$NPM_TOKEN" ]] && break
+    printf "\r  ${C_DIM}Waiting for NPM API to accept default login... %d/8${C_R}" "$_try" >&2
+    sleep 5
+  done
+  printf "\r" >&2
   if [[ -z "$NPM_TOKEN" ]]; then
     # Log the raw rejection so the cause is diagnosable (wrong default creds, NPM
     # not ready, API shape change) instead of a blind "skipping".
     _log "WARN" "NPM /tokens login response: $(printf '%s' "$LOGIN" | tr -d '\n' | cut -c1-300)"
-    warn "Could not get NPM token (default admin@example.com/changeme rejected). Raw response in ${LOG_FILE}. Skipping automated NPM setup - change the password manually at :81."
+    warn "Could not get NPM token (default admin@example.com/changeme rejected after retries). Raw response in ${LOG_FILE}. Skipping automated NPM setup - change the password manually at :81."
     return 1
   fi
 
@@ -989,27 +1002,45 @@ bootstrap_authentik() {
   #     return 403 and the flow lookup come back empty ("Could not resolve flow").
   #     Probe an AUTHENTICATED endpoint and report the HTTP code so the real cause
   #     (403 = token problem, 404 = path/version) is obvious instead of a vague warn.
-  local ak_auth_code
-  ak_auth_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-    -H "Authorization: Bearer ${AUTHENTIK_BOOTSTRAP_TOKEN}" \
-    "${AK_API_BASE}/core/users/me/" 2>/dev/null || echo "000")
+  # The akadmin user + bootstrap API token are created during Authentik's startup
+  # bootstrap, which can lag several seconds BEHIND the health endpoint reporting
+  # ready - so the token 403s for a short window even though the server is "up".
+  # Every prior run probed exactly once, ~1s after ready, got 403, and bailed
+  # ("Could not resolve flow"). RETRY the authenticated probe until it succeeds,
+  # then fall back with the exact HTTP code (403=token, 404=path/version).
+  local ak_auth_code="" i
+  for i in $(seq 1 24); do
+    ak_auth_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+      -H "Authorization: Bearer ${AUTHENTIK_BOOTSTRAP_TOKEN}" \
+      "${AK_API_BASE}/core/users/me/" 2>/dev/null || echo "000")
+    [[ "$ak_auth_code" == "200" ]] && break
+    printf "\r  ${C_DIM}Waiting for Authentik bootstrap token... %d/24 (HTTP %s)${C_R}" "$i" "$ak_auth_code" >&2
+    sleep 5
+  done
+  printf "\r" >&2
   _log "INFO" "Authentik token auth probe (/core/users/me/) -> HTTP ${ak_auth_code}"
   if [[ "$ak_auth_code" != "200" ]]; then
-    warn "Authentik bootstrap token did NOT authenticate (HTTP ${ak_auth_code}) - cannot create"
-    warn "  the Dockhand provider/app/outpost via API, so Dockhand has NO 2FA gate yet."
+    warn "Authentik bootstrap token did NOT authenticate (HTTP ${ak_auth_code} after ~2m) - cannot"
+    warn "  create the Dockhand provider/app/outpost via API, so Dockhand has NO 2FA gate yet."
     warn "  akadmin UI login still works: https://authentik.${DOMAIN}"
     warn "  (akadmin / see ${AUTHENTIK_DIR}/.akadmin_password). Create the Proxy provider +"
-    warn "  attach it to the embedded outpost manually, or re-run after fixing the token."
+    warn "  attach it to the embedded outpost manually, or re-run."
     return 0
   fi
   success "Authentik bootstrap token authenticated (HTTP 200)"
 
-  # 2. Resolve the default authorization flow PK (FK target for the provider).
-  local flow_pk
-  flow_pk=$(_ak_api "/flows/instances/default-provider-authorization-implicit-consent/" 2>/dev/null \
-           | jq -r '.pk // empty' 2>/dev/null || true)
+  # 2. Resolve the authorization flow PK (FK target for the provider). Try the
+  #    implicit- then explicit-consent defaults, then ANY authorization-designation
+  #    flow, so a renamed/blueprint-customized default still resolves.
+  local flow_pk="" slug
+  for slug in default-provider-authorization-implicit-consent default-provider-authorization-explicit-consent; do
+    flow_pk=$(_ak_api "/flows/instances/${slug}/" 2>/dev/null | jq -r '.pk // empty' 2>/dev/null || true)
+    [[ -n "$flow_pk" ]] && break
+    flow_pk=$(_ak_api "/flows/instances/?slug=${slug}" 2>/dev/null | jq -r '.results[0].pk // empty' 2>/dev/null || true)
+    [[ -n "$flow_pk" ]] && break
+  done
   if [[ -z "$flow_pk" ]]; then
-    flow_pk=$(_ak_api "/flows/instances/?slug=default-provider-authorization-implicit-consent" 2>/dev/null \
+    flow_pk=$(_ak_api "/flows/instances/?designation=authorization" 2>/dev/null \
              | jq -r '.results[0].pk // empty' 2>/dev/null || true)
   fi
   if [[ -z "$flow_pk" ]]; then
@@ -1593,10 +1624,10 @@ setup_cloudflare_bouncer() {
     # shows an interactive "(Y/I/N/O/D/Z)?" prompt. DEBIAN_FRONTEND=noninteractive
     # alone does NOT suppress conffile prompts -> the script HANGS forever with no
     # TTY to answer. Force-keep our version and never prompt.
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+    DEBIAN_FRONTEND=noninteractive timeout 300 apt-get install -y -qq \
       -o Dpkg::Lock::Timeout=300 \
       -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef \
-      crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 || true
+      crowdsec-cloudflare-worker-bouncer </dev/null >>"$LOG_FILE" 2>&1 || true
     command -v crowdsec-cloudflare-worker-bouncer &>/dev/null && have_bin=true
   else
     info "Adding CrowdSec repository + installing the worker bouncer..."
