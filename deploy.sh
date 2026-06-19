@@ -21,7 +21,7 @@ fi
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly SCRIPT_NAME="deploy.sh"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -41,86 +41,91 @@ declare -A TOOL_CATEGORIES
 
 # --- NPM + Container Manager ---
 TOOL_NAMES[1]="portainer"
-TOOL_DESCRIPTIONS[1]="Nginx Proxy Manager + Portainer — Visual container management with proxy"
+TOOL_DESCRIPTIONS[1]="NPM + Portainer - visual Docker management"
 TOOL_PORTS[1]="80, 443, 81"
 TOOL_CATEGORIES[1]="NPM + Container Manager"
 
 TOOL_NAMES[2]="dockge"
-TOOL_DESCRIPTIONS[2]="Nginx Proxy Manager + Dockge — Compose stack manager with proxy"
+TOOL_DESCRIPTIONS[2]="NPM + Dockge - compose-stack manager"
 TOOL_PORTS[2]="80, 443, 81"
 TOOL_CATEGORIES[2]="NPM + Container Manager"
 
 TOOL_NAMES[3]="dockhand"
-TOOL_DESCRIPTIONS[3]="Nginx Proxy Manager + Dockhand — Next-gen Docker manager with SSO"
+TOOL_DESCRIPTIONS[3]="NPM + Dockhand - modern Docker manager + SSO"
 TOOL_PORTS[3]="80, 443, 81"
 TOOL_CATEGORIES[3]="NPM + Container Manager"
 
 TOOL_NAMES[4]="dockhand-authentik"
-TOOL_DESCRIPTIONS[4]="NPM + Dockhand + Authentik — Docker manager with Authentik SSO/2FA (forward-auth)"
+TOOL_DESCRIPTIONS[4]="NPM + Dockhand + Authentik 2FA (forward-auth)"
 TOOL_PORTS[4]="80, 443, 81"
 TOOL_CATEGORIES[4]="NPM + Container Manager"
 
 # --- NetBird + Authentik (Zero-Trust) ---
 TOOL_NAMES[5]="netbird"
-TOOL_DESCRIPTIONS[5]="NetBird + Authentik + Dockhand — Zero-trust mesh, OIDC SSO, Traefik edge"
+TOOL_DESCRIPTIONS[5]="NetBird + Authentik - zero-trust mesh VPN"
 TOOL_PORTS[5]="80, 443 + P2P 3478/udp, 49152-65535/udp, 33080"
 TOOL_CATEGORIES[5]="NetBird + Authentik (Zero-Trust)"
 
 # --- PaaS / App Platforms ---
 TOOL_NAMES[6]="coolify"
-TOOL_DESCRIPTIONS[6]="Coolify — Open-source PaaS (Heroku/Netlify alternative)"
+TOOL_DESCRIPTIONS[6]="Coolify - open-source PaaS (Heroku-like)"
 TOOL_PORTS[6]="80, 443, 81"
 TOOL_CATEGORIES[6]="PaaS / App Platform"
 
 TOOL_NAMES[7]="dokploy"
-TOOL_DESCRIPTIONS[7]="Dokploy — Docker Swarm orchestration platform"
+TOOL_DESCRIPTIONS[7]="Dokploy - Docker Swarm app platform"
 TOOL_PORTS[7]="80, 443, 81"
 TOOL_CATEGORIES[7]="PaaS / App Platform"
 
 # --- Home Server OS ---
 TOOL_NAMES[8]="casaos"
-TOOL_DESCRIPTIONS[8]="CasaOS — Simple, elegant home server with app store"
+TOOL_DESCRIPTIONS[8]="CasaOS - home server + app store"
 TOOL_PORTS[8]="80, 443, 81"
 TOOL_CATEGORIES[8]="Home Server OS"
 
 TOOL_NAMES[9]="runtipi"
-TOOL_DESCRIPTIONS[9]="Runtipi — Home server with 300+ one-click apps"
+TOOL_DESCRIPTIONS[9]="Runtipi - home server, 300+ one-click apps"
 TOOL_PORTS[9]="80, 443, 81"
 TOOL_CATEGORIES[9]="Home Server OS"
 
 TOOL_NAMES[10]="cosmos"
-TOOL_DESCRIPTIONS[10]="Cosmos Server — All-in-one homelab suite with built-in proxy"
+TOOL_DESCRIPTIONS[10]="Cosmos - homelab suite + built-in proxy"
 TOOL_PORTS[10]="80, 443, 81"
 TOOL_CATEGORIES[10]="Home Server OS"
 
 # --- Debian Server Distributions ---
 TOOL_NAMES[11]="yunohost"
-TOOL_DESCRIPTIONS[11]="YunoHost — All-in-one Debian server (mail, LDAP, apps)"
+TOOL_DESCRIPTIONS[11]="YunoHost - all-in-one server (mail, LDAP)"
 TOOL_PORTS[11]="80, 443, 81 (Debian 12 only)"
 TOOL_CATEGORIES[11]="Debian Server Distro"
 
 TOOL_NAMES[12]="freedombox"
-TOOL_DESCRIPTIONS[12]="FreedomBox — Debian home server with Cockpit admin"
+TOOL_DESCRIPTIONS[12]="FreedomBox - Debian home server + Cockpit"
 TOOL_PORTS[12]="80, 443, 81 (Debian 12 only)"
 TOOL_CATEGORIES[12]="Debian Server Distro"
 
 # --- Security & Utilities (run AFTER deploying a platform) ---
 TOOL_NAMES[13]="harden"
-TOOL_DESCRIPTIONS[13]="🔒 Harden VPS — SSH lockdown, CrowdSec, GeoIP block, auto-updates"
+TOOL_DESCRIPTIONS[13]="Harden VPS - firewall, CrowdSec, SSH lockdown"
 TOOL_PORTS[13]="—"
 TOOL_CATEGORIES[13]="Security & Utilities"
 
 TOOL_NAMES[14]="add-domain"
-TOOL_DESCRIPTIONS[14]="➕ Add another domain to a running NPM+Authelia stack (extra hosts + SSO realm)"
+TOOL_DESCRIPTIONS[14]="Add a domain to a running NPM + SSO stack"
 TOOL_PORTS[14]="—"
 TOOL_CATEGORIES[14]="Security & Utilities"
 
 TOOL_NAMES[15]="verify"
-TOOL_DESCRIPTIONS[15]="🔎 Verify stack — health + security audit (containers, CrowdSec, TLS, auth gate). Read-only."
+TOOL_DESCRIPTIONS[15]="Verify NPM/Dockhand/Authentik stack (read-only)"
 TOOL_PORTS[15]="—"
 TOOL_CATEGORIES[15]="Security & Utilities"
 
-readonly TOOL_COUNT=15
+TOOL_NAMES[16]="audit"
+TOOL_DESCRIPTIONS[16]="Audit NetBird/Traefik stack (read-only)"
+TOOL_PORTS[16]="—"
+TOOL_CATEGORIES[16]="Security & Utilities"
+
+readonly TOOL_COUNT=16
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COLORS & UI
@@ -134,14 +139,15 @@ else
   C_MAG=''
 fi
 
+# Fixed 60-col rule. Pure ASCII so it renders + aligns in any terminal/charset
+# and at any PuTTY window size (no right-edge border to drift out of line).
+readonly RULE="============================================================"
+
 header() {
-  printf "\n${C_B}${C_CYN}"
-  printf "╔══════════════════════════════════════════════════════════════════╗\n"
-  printf "║           VPS SELF-HOSTING DEPLOYMENT SUITE v%s               ║\n" "$SCRIPT_VERSION"
-  printf "╠══════════════════════════════════════════════════════════════════╣\n"
-  printf "║   One script to deploy them all — Docker, CrowdSec, Firewall     ║\n"
-  printf "╚══════════════════════════════════════════════════════════════════╝"
-  printf "${C_R}\n\n"
+  printf "\n${C_B}${C_CYN}%s${C_R}\n" "$RULE"
+  printf "  ${C_B}${C_CYN}VPS SELF-HOSTING DEPLOYMENT SUITE${C_R}   ${C_DIM}v%s${C_R}\n" "$SCRIPT_VERSION"
+  printf "  ${C_DIM}Deploy and harden self-hosting platforms on any VPS${C_R}\n"
+  printf "${C_B}${C_CYN}%s${C_R}\n" "$RULE"
 }
 
 print_menu() {
@@ -150,12 +156,14 @@ print_menu() {
     local category="${TOOL_CATEGORIES[$i]}"
     if [[ "$category" != "$current_category" ]]; then
       current_category="$category"
-      printf "\n${C_B}${C_YEL}── %s ──${C_R}\n" "$category"
+      printf "\n${C_B}${C_YEL}%s${C_R}\n" "$category"
     fi
-    printf "  ${C_B}%2d)${C_R} ${C_CYN}%-12s${C_R} %s\n" "$i" "${TOOL_NAMES[$i]}" "${TOOL_DESCRIPTIONS[$i]}"
+    # name column = 18 so the longest name (dockhand-authentik) still aligns;
+    # short descriptions keep every row to one line inside an 80-col window.
+    printf "  ${C_B}%2d)${C_R} ${C_CYN}%-18s${C_R} ${C_DIM}%s${C_R}\n" \
+      "$i" "${TOOL_NAMES[$i]}" "${TOOL_DESCRIPTIONS[$i]}"
   done
-  printf "\n  ${C_B} q)${C_R} ${C_RED}Quit${C_R}\n"
-  printf "\n"
+  printf "\n   ${C_B}q)${C_R} ${C_DIM}Quit${C_R}\n\n"
 }
 
 # Map a tool name to its actual script filename. Platforms use deploy-<name>.sh;
@@ -165,15 +173,16 @@ _script_for_name() {
     harden)     echo "harden.sh" ;;
     add-domain) echo "add-domain.sh" ;;
     verify)     echo "verify-stack.sh" ;;
+    audit)      echo "audit.sh" ;;
     *)          echo "deploy-$1.sh" ;;
   esac
 }
 
 print_tool_detail() {
   local num=$1
-  printf "\n${C_B}${C_CYN}── %s ──${C_R}\n" "${TOOL_NAMES[$num]}"
+  printf "\n${C_B}${C_CYN}> %s${C_R}\n" "${TOOL_NAMES[$num]}"
   printf "  ${C_DIM}%s${C_R}\n" "${TOOL_DESCRIPTIONS[$num]}"
-  printf "  ${C_B}Ports:${C_R} ${TOOL_PORTS[$num]}\n"
+  printf "  ${C_B}Ports:${C_R}  %s\n" "${TOOL_PORTS[$num]}"
   printf "  ${C_B}Script:${C_R} %s\n\n" "$(_script_for_name "${TOOL_NAMES[$num]}")"
 }
 
@@ -186,24 +195,25 @@ _run_script() {
   # Show appropriate warning based on script type
   case "$script_name" in
     harden.sh)
-      printf "${C_YEL}!${C_R} This will harden system security (firewall, CrowdSec, auto-updates).\n"
-      printf "  ${C_GRN}✔${C_R} Docker containers will NOT be affected.\n"
+      printf "  ${C_YEL}[!]${C_R} Hardens system security (firewall, CrowdSec, auto-updates).\n"
+      printf "  ${C_GRN}[ok]${C_R} Your Docker containers are NOT affected.\n"
       ;;
     add-domain.sh)
-      printf "${C_GRN}✔${C_R} Additive + safe on a live system — adds proxy hosts + an SSO realm for a new domain.\n"
-      printf "  ${C_GRN}✔${C_R} Existing domains, hosts and certs are NOT touched.\n"
+      printf "  ${C_GRN}[ok]${C_R} Safe on a live system - adds proxy hosts + an SSO realm for a new domain.\n"
+      printf "  ${C_GRN}[ok]${C_R} Existing domains, hosts and certs are NOT touched.\n"
       ;;
-    verify-stack.sh)
-      printf "${C_GRN}✔${C_R} Read-only audit — inspects containers, CrowdSec, TLS and the auth gate.\n"
-      printf "  ${C_GRN}✔${C_R} Changes NOTHING (only a self-test ban it adds then deletes). Safe to run anytime.\n"
+    verify-stack.sh|audit.sh)
+      printf "  ${C_GRN}[ok]${C_R} Read-only health + security audit. Changes nothing on the system.\n"
+      printf "  ${C_GRN}[ok]${C_R} Safe to run anytime.\n"
       ;;
     *)
-      printf "${C_YEL}⚠${C_R} This will install/configure services. Existing containers may be ${C_RED}DESTROYED${C_R}.\n"
+      printf "  ${C_YEL}[!]${C_R} Installs/configures services. Existing containers may be ${C_RED}DESTROYED${C_R}.\n"
       ;;
   esac
+  printf "\n"
   read -rp "Proceed? [y/N]: " confirm
-  [[ "$confirm" =~ ^[Yy]$ ]] || { printf "Aborted.\n"; return 1; }
-  printf "\n${C_CYN}▶ Starting ${script_name}...${C_R}\n\n"
+  [[ "$confirm" =~ ^[Yy]$ ]] || { printf "${C_DIM}Cancelled.${C_R}\n"; return 1; }
+  printf "\n${C_CYN}>> Starting ${script_name} ...${C_R}\n\n"
   bash "$script_path" "$@"
 }
 
@@ -271,13 +281,14 @@ if [[ $# -gt 0 ]]; then
     freedombox|fbx)                   requested="freedombox" ;;
     harden|security|lockdown)         requested="harden" ;;
     add-domain|adddomain|domain)      requested="add-domain" ;;
-    verify|verify-stack|check|audit)  requested="verify" ;;
+    verify|verify-stack|check)        requested="verify" ;;
+    audit|audit-netbird)              requested="audit" ;;
     *)
       printf "${C_RED}Unknown tool: ${requested}${C_R}\n"
-      printf "Run ${C_B}./deploy.sh${C_R} without arguments for the interactive menu.\n"
+      printf "Run ${C_B}./deploy.sh${C_R} with no arguments for the interactive menu.\n"
       printf "\nAvailable tools:\n"
       for i in $(seq 1 $TOOL_COUNT); do
-        printf "  ${C_CYN}%-12s${C_R} %s\n" "${TOOL_NAMES[$i]}" "${TOOL_DESCRIPTIONS[$i]}"
+        printf "  ${C_CYN}%-18s${C_R} ${C_DIM}%s${C_R}\n" "${TOOL_NAMES[$i]}" "${TOOL_DESCRIPTIONS[$i]}"
       done
       exit 1
       ;;
@@ -301,19 +312,19 @@ while true; do
   header
   print_menu
 
-  read -rp "Enter [1-${TOOL_COUNT}] for tool, or [q] to quit: " choice
+  read -rp "$(printf "${C_B}Select a number [1-${TOOL_COUNT}], or q to quit:${C_R} ")" choice
 
   # Handle quit
-  [[ "$choice" =~ ^[Qq]$ ]] && { printf "\n${C_DIM}Goodbye!${C_R}\n\n"; exit 0; }
+  [[ "$choice" =~ ^[Qq]$ ]] && { printf "\n${C_DIM}Bye.${C_R}\n\n"; exit 0; }
 
   # Validate number
   if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le $TOOL_COUNT ]]; then
     print_tool_detail "$choice"
     run_tool "${TOOL_NAMES[$choice]}"
-    printf "\n${C_DIM}Press Enter to return to menu...${C_R}"
+    printf "\n${C_DIM}Press Enter to return to the menu ...${C_R}"
     read -r
   else
-    printf "${C_RED}Invalid choice. Please enter 1-${TOOL_COUNT} or q.${C_R}\n"
+    printf "${C_RED}Not a valid choice.${C_R} Enter a number 1-${TOOL_COUNT}, or q to quit.\n"
     sleep 1
   fi
 done

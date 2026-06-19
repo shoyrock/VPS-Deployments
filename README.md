@@ -16,6 +16,24 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script depl
 
 ---
 
+## Quick Start (one-liner)
+
+On a **fresh VPS**, bootstrap everything with one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shoyrock/VPS-Deployments/main/install.sh | bash
+```
+
+It installs `deploy.sh` (the menu) to `/opt/vps-deploy` and launches it — pick a platform, then run **harden**, then **verify**. Jump straight to one tool by appending its name:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shoyrock/VPS-Deployments/main/install.sh | bash -s -- dockhand-authentik
+```
+
+Prefer `wget`? `wget -qO- <url> | bash` works the same way.
+
+---
+
 ## Quick Reference
 
 ### Available Scripts

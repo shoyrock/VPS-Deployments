@@ -565,6 +565,17 @@ harden_misc() {
 * hard core 0
 LIMITS
     chmod -x /etc/update-motd.d/* 2>/dev/null || true
+    # Disable rpcbind/portmapper (port 111). Ubuntu ships it enabled and listening
+    # on 0.0.0.0:111 (+ [::]:111) - a classic DDoS-amplification + info-disclosure
+    # surface - yet nothing on a single-host Docker deploy needs it. Skip only if
+    # NFS is actually in use (rpcbind is required for NFS client/server).
+    if mount 2>/dev/null | grep -qE ' type nfs| type nfs4' || grep -qsE '\snfs[4 ]' /etc/fstab 2>/dev/null; then
+        info "rpcbind left enabled (NFS mount detected)"
+    elif systemctl list-unit-files 2>/dev/null | grep -q '^rpcbind'; then
+        systemctl disable --now rpcbind.socket rpcbind 2>/dev/null || true
+        systemctl mask rpcbind.socket rpcbind 2>/dev/null || true
+        ok "rpcbind (port 111) disabled + masked (no NFS in use)"
+    fi
     ok "Misc hardening applied (permissions, core dumps, MOTD)"
     _log "Misc hardening applied"
 }
@@ -662,6 +673,7 @@ verify_hardening() {
     # 3. GeoIP
     _check "GeoIP zone files"        "[[ -f /usr/local/bin/geoip-block/cn.zone ]]"
     _check "GeoIP rule active"       "iptables -C INPUT -m set --match-set geoip_block src -j DROP 2>/dev/null || iptables -L GEOIP_BLOCK -n >/dev/null 2>&1"
+    _check "rpcbind (port 111) off"  "mount 2>/dev/null | grep -qE ' type nfs' || ! ss -tlnH 2>/dev/null | grep -q ':111 '"
 
     # 4. CrowdSec
     _check "CrowdSec installed"      "command -v cscli >/dev/null 2>&1 || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx crowdsec"

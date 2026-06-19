@@ -1,5 +1,52 @@
 # Changelog
 
+## install.sh — NEW one-line bootstrapper
+
+`curl -fsSL https://raw.githubusercontent.com/shoyrock/VPS-Deployments/main/install.sh | bash` (or `wget -qO- ... | bash`). Ensures root (re-execs via sudo, re-fetching since the script arrives over a pipe), installs curl/ca-certificates if missing, downloads `deploy.sh` to `/opt/vps-deploy`, and launches the menu reading from `/dev/tty` (so prompts work behind `curl | bash`). Pass a tool name to skip straight to it: `... | bash -s -- dockhand-authentik`. README gained a Quick Start section.
+
+## deploy.sh — 1.0.0 → 1.1.0 (menu UX + audit entry)
+
+- **PuTTY-friendly UI** — the old header used a full-width Unicode box whose right border drifted out of alignment, and menu rows wrapped past 80 columns. Rewritten with pure-ASCII rules (render in any terminal/charset, any window size), short one-line descriptions (every row now ≤ 72 cols — no wrapping), and an 18-wide name column so even `dockhand-authentik` lines up. Category headers, prompts, and confirmations cleaned up and de-emoji'd.
+- **`audit` added to the menu (#16, Security & Utilities)** — `audit.sh` (the NetBird/Traefik stack health+security auditor) was in the repo but unreachable from the menu. Now selectable. Its CLI alias was previously mis-mapped to `verify`; `audit` now resolves to `audit.sh` and `verify` to `verify-stack.sh`. Both flagged read-only.
+
+## ALL 10 non-netbird platform scripts — 4.6.0 → 4.7.0 (production parity)
+
+Brought casaos, coolify, cosmos, dockge, dockhand, dokploy, freedombox, portainer, runtipi, yunohost up to the same production bar as dockhand-authentik. Each was `bash -n` validated and CR-clean. Same 6 fixes ported to all 10 (they share one copy-paste base):
+
+- **CrowdSec SSH/system DETECTION (security hole closed)** — they installed the `sshd`/`linux` collections but had NO auth.log/syslog acquisition, so SSH brute force + host attacks were INVISIBLE. Added `acquis.d/syslog.yaml` (auth.log/syslog/secure/messages), installed + enabled **rsyslog** (Ubuntu 24.04 is journald-only), and `touch` the log files before the CrowdSec restart. The crowdsec container already mounted `/var/log:ro`, so detection now works end-to-end.
+- **More community collections** — added `crowdsecurity/base-http-scenarios` (web scanning/probing/traversal/bad-UA). Full set now matches dockhand-authentik.
+- **Worker bouncer no longer left half-configured** — same dpkg `iF` fix: when the worker can't run (no Analytics Engine / crash-loop / no token) it's now purged to a clean state so it can't block unattended security updates over a months-long run. Also stops a `Restart=always` crash-loop instead of leaving it spinning.
+- **Flaky live-ban verify** — the false-negative `sleep 15`/check-once round-trip now POLLS up to ~36s.
+- **Orphan-container warning** — each compose file now runs under its own project (`-p npm|crowdsec|authelia|<platform>`, derived from the filename) instead of one shared project; restart hints updated to match.
+
+NOTE: netbird excluded (uses Traefik, separate ingress). runtipi's own `docker-compose.prod.yml` runs from its own dir (its own project) and was intentionally left alone.
+
+## harden.sh — rpcbind (port 111) disabled (from live VPS audit)
+
+A full audit of a live deployed VPS (Oracle, Ubuntu 24) found `rpcbind`/portmapper enabled and listening on `0.0.0.0:111` + `[::]:111` — a classic DDoS-amplification / info-disclosure surface that nothing on a single-host Docker deploy uses. `harden_misc` now disables + masks `rpcbind`/`rpcbind.socket` (skipped if an NFS mount is present), and `verify_hardening` checks port 111 is closed.
+
+Audit also confirmed (no change needed): external attack surface is just 22/80/443 (Oracle's cloud security list blocks 81/111 regardless of UFW); CrowdSec is actively banning real attackers (thinkphp-CVE, CVE-2017-9841, http-probing, bad-UA) AND detecting SSH brute force via auth.log (the v4.7 detection fix works live); SSH is key-only/no-password/maxauthtries 3; Docker daemon.json hardened; containers non-privileged. The only live wart was the worker bouncer stuck in dpkg `iF` (already fixed for fresh installs by the v4.7.4 purge).
+
+## harden.sh — CrowdSec/firewall conflict fix
+
+Running `harden.sh` on a box that already has a deploy-*.sh stack broke CrowdSec enforcement: the post-harden `verify-stack.sh` flipped "live ban enforced" from PASS to **FAIL**.
+
+- **`ufw --force reset` flushed the bouncer's nftables rules, never restarted.** harden rebuilds the firewall (UFW reset+enable, GeoIP) but never restarted the deploy's `crowdsec-firewall-bouncer`, so its `table ip crowdsec` rules were gone → bans not enforced. `install_crowdsec` now detects the existing bouncer and **restarts it after the firewall step** so its rules are rebuilt.
+- **Parallel CrowdSec + wrong bouncer backend.** `install_crowdsec` would install a *second* native CrowdSec and the **iptables** bouncer variant, colliding with the deploy's Dockerized CrowdSec + **nftables** bouncer (two LAPIs, two firewall backends). It now detects an existing CrowdSec (Docker container, bouncer unit, or bouncer config) and skips the parallel install entirely.
+- On-box remedy if you already hit this: `sudo systemctl restart crowdsec-firewall-bouncer` then re-run the verifier.
+
+## deploy-dockhand-authentik.sh — 4.7.4
+
+### Production: worker bouncer no longer left half-configured (blocks unattended updates)
+- If the Cloudflare Worker bouncer can't run (no Analytics Engine / crash-loop / no token), its apt package was left in dpkg state **`iF` (half-configured)** — the postinst FATALs without AE. A half-configured package makes `apt-get` and **unattended-upgrades** error out, so on a long unattended run **security updates silently stop**. The deploy now **purges** the package to a clean dpkg state in all three can't-run branches (the host firewall bouncer — the real enforcement — is a separate package and is untouched). Re-running the deploy after enabling AE re-adds it.
+
+## deploy-dockhand-authentik.sh — 4.7.3 + verify-stack.sh
+
+### Live-ban check was a flaky FALSE NEGATIVE
+- `[FAIL] live ban NOT enforced in firewall` could appear even though enforcement worked perfectly (confirmed on a live box: decision reached LAPI *and* the nft set). Cause: the test did a single `sleep 12`/`sleep 15` then checked once, but the firewall bouncer pulls every 10s — and once it's syncing large CrowdSec **community blocklists** (tens of thousands of decisions per cycle, e.g. after CAPI enrollment) the per-cycle work can push a freshly-added test decision just past that fixed wait. Race → false fail.
+- Fix: the live-ban round-trip now **polls** (12 × 3s ≈ up to 36s, breaks as soon as the IP appears) instead of one fixed sleep. Applied in all three places: `verify-stack.sh`, the deploy's in-script `verify_deployment`, and the verifier the deploy installs to `/opt/dockhand-stack/verify-stack.sh`.
+- Takeaway: harden.sh did NOT break enforcement (the firewall bouncer enrolled community blocklists and kept working); the test was simply too impatient.
+
 ## deploy-dockhand-authentik.sh — 4.7.2
 
 ### "Found orphan containers ([dockhand])" warning — permanently fixed
