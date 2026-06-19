@@ -17,7 +17,7 @@ fi
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.7.0-hardened-cloudflare-authentik"
+readonly SCRIPT_VERSION="4.7.1-hardened-cloudflare-authentik"
 readonly SCRIPT_NAME="deploy-dockhand-authentik.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/dockhand-stack"
@@ -1252,7 +1252,14 @@ automate_npm() {
   # Dockhand: protected by Authentik forward-auth (nginx auth_request). Both
   # snippets are required: the location block (outpost proxy + auth subrequest)
   # AND the auth_request directives.
-  local auth_snippet=$'include /data/nginx/custom/authentik-location.conf;\ninclude /data/nginx/custom/authentik-authrequest.conf;'
+  #
+  # The long proxy_*_timeout directives keep Dockhand's container-terminal
+  # WebSocket alive. The handshake succeeds (you see the shell banner), but
+  # NPM's default proxy_read_timeout is 60s, so an interactive shell that sits
+  # idle - or any long-running exec - gets killed: "Connection error.
+  # Disconnected." 86400s (24h) keeps the terminal open. websocket upgrade
+  # headers are already added by allow_websocket_upgrade:true on the host.
+  local auth_snippet=$'proxy_read_timeout 86400s;\nproxy_send_timeout 86400s;\ninclude /data/nginx/custom/authentik-location.conf;\ninclude /data/nginx/custom/authentik-authrequest.conf;'
   local dockhand_id=""
   dockhand_id=$(npm_create_proxy_host "dockhand.${DOMAIN}" "dockhand" 3000 true "$auth_snippet") || true
   [[ -n "$dockhand_id" ]] && npm_enable_ssl "$dockhand_id" "dockhand.${DOMAIN}" || true
