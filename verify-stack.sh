@@ -58,6 +58,33 @@ if systemctl list-unit-files 2>/dev/null | grep -q crowdsec-cloudflare-worker-bo
   else warn "CF worker bouncer installed but not active (enable Workers Analytics Engine in Cloudflare? check: journalctl -u crowdsec-cloudflare-worker-bouncer -n 40)"; fi
 fi
 
+# ---- C2. CrowdSec DETECTION (logs -> scenarios) ---------------------------
+hdr "CrowdSec detection"
+docker exec crowdsec sh -c 'cat /etc/crowdsec/acquis.d/syslog.yaml 2>/dev/null' | grep -q 'type: syslog' \
+  && pass "SSH/system log acquisition configured" \
+  || fail "SSH/system acquisition MISSING -- SSH/host attacks are INVISIBLE to CrowdSec"
+docker exec crowdsec cscli collections list 2>/dev/null | grep -q crowdsecurity/sshd \
+  && pass "sshd collection installed" || warn "sshd collection missing"
+if [ -f /var/log/auth.log ]; then
+  pass "/var/log/auth.log present (rsyslog writing SSH logs)"
+  # live ssh-bf detection: inject a failed-login burst (TEST-NET-2, RFC5737) and
+  # confirm CrowdSec parses it into a decision; then clean up.
+  tip="198.51.100.66"; hn="$(hostname -s 2>/dev/null || echo host)"
+  for k in $(seq 1 12); do printf '%s %s sshd[%d]: Failed password for invalid user verifyuser from %s port %d ssh2\n' \
+    "$(date '+%b %e %H:%M:%S')" "$hn" "$((1000+k))" "$tip" "$((20000+k))" >> /var/log/auth.log; done
+  seen=no
+  for w in $(seq 1 12); do
+    docker exec crowdsec cscli decisions list -o raw 2>/dev/null | grep -q "$tip" && { seen=yes; break; }
+    docker exec crowdsec cscli alerts list -o raw 2>/dev/null | grep -q "$tip" && { seen=yes; break; }
+    sleep 3
+  done
+  docker exec crowdsec cscli decisions delete --ip "$tip" >/dev/null 2>&1
+  [ "$seen" = yes ] && pass "live ssh-bf DETECTION works (auth.log parsed -> decision)" \
+    || fail "synthetic ssh-bf NOT detected (docker exec crowdsec cscli metrics)"
+else
+  fail "/var/log/auth.log MISSING -- SSH detection inactive (is rsyslog running?)"
+fi
+
 # ---- D. Security posture --------------------------------------------------
 hdr "Security posture"
 # NPM default creds MUST be rejected

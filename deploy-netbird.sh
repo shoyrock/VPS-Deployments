@@ -41,7 +41,7 @@ fi
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.7.2-netbird-proxy"
+readonly SCRIPT_VERSION="4.7.1-netbird-proxy"
 readonly SCRIPT_NAME="deploy-netbird.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/netbird-stack"
@@ -559,21 +559,15 @@ get_user_domain() {
 setup_dockhand() {
   step "Dockhand (standalone)"
   mkdir -p "${DOCKHAND_DATA_DIR}"
-  # Shared apps directory. Dockhand gets READ-WRITE control here so it can fully
-  # TRACK (adopt/edit/deploy) user app stacks. The mount uses an IDENTICAL
-  # host:container path (/opt/apps:/opt/apps) - mandatory for a socket-based
-  # manager: Dockhand tells the HOST daemon to deploy, and the daemon resolves each
-  # stack's bind-mount source paths on the host, so Dockhand's view of the path
-  # must equal the host path or adoption + bind mounts break. Put each app at
-  # /opt/apps/<app>/compose.yaml, then Dockhand > Import to track it.
-  mkdir -p /opt/apps && chmod 750 /opt/apps
 
-  # SECURITY: the rest of the host filesystem is mounted READ-ONLY (/:/host:ro);
-  # /opt/apps is the single READ-WRITE EXCEPTION so Dockhand can manage app stacks.
+  # SECURITY: the host filesystem is mounted READ-ONLY (/:/host:ro).
   # The docker.sock mount is root-equivalent by nature (required for a Docker
   # manager). Dockhand has NO direct ingress (traefik.enable=false); it is reached
   # only via the NetBird reverse proxy, so set auth (SSO/password/PIN) ON the
-  # NetBird proxy service that exposes it.
+  # NetBird proxy service that exposes it. The :ro mount removes the easiest abuse
+  # path. To allow host writes from the Dockhand UI, change "/:/host:ro" to
+  # "/:/host" and re-run:
+  #   docker compose -f ${STACK_DIR}/docker-compose.dockhand.yml up -d --force-recreate
   cat > "${STACK_DIR}/docker-compose.dockhand.yml" << COMPOSE_DOCKHAND
 services:
   dockhand:
@@ -586,10 +580,6 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./dockhand-data:/app/data
-      # User app stacks: READ-WRITE, identical host:container path so Dockhand can
-      # fully track/edit/deploy them and the daemon resolves their bind mounts.
-      - /opt/apps:/opt/apps
-      # Rest of host: READ-ONLY (browse only).
       - /:/host:ro
     labels:
       - "traefik.enable=true"

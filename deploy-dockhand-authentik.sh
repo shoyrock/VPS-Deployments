@@ -17,7 +17,7 @@ fi
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.6.5-hardened-cloudflare-authentik"
+readonly SCRIPT_VERSION="4.7.0-hardened-cloudflare-authentik"
 readonly SCRIPT_NAME="deploy-dockhand-authentik.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/dockhand-stack"
@@ -395,12 +395,17 @@ install_dependencies() {
     # Guard: repair dpkg if cleanup left a half-configured package behind.
     DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confold </dev/null 2>/dev/null || true
     apt-get install -y -qq ca-certificates curl gnupg lsb-release \
-      software-properties-common apt-transport-https jq unzip cron logrotate
+      software-properties-common apt-transport-https jq unzip cron logrotate rsyslog
   else
     local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
     $pkg install -y -q ca-certificates curl gnupg2 yum-utils \
-      device-mapper-persistent-data lvm2 jq unzip cronie logrotate
+      device-mapper-persistent-data lvm2 jq unzip cronie logrotate rsyslog
   fi
+  # rsyslog must run so SSH/auth + system events land in /var/log/auth.log and
+  # /var/log/syslog. Ubuntu 24.04 (and other modern distros) ship journald-only by
+  # default - those files don't exist without rsyslog, leaving CrowdSec's sshd +
+  # linux collections blind (the whole reason a host can sit an hour with 0 hits).
+  systemctl enable --now rsyslog 2>/dev/null || true
   success "Dependencies installed"
 }
 
@@ -486,21 +491,15 @@ get_user_domain() {
 setup_dockhand() {
   step "Dockhand (standalone)"
   mkdir -p "${DOCKHAND_DATA_DIR}"
-  # Shared apps directory. Dockhand gets READ-WRITE control here so it can fully
-  # TRACK (adopt/edit/deploy) user app stacks. The mount uses an IDENTICAL
-  # host:container path (/opt/apps:/opt/apps) - this is mandatory for a socket-
-  # based manager: Dockhand tells the HOST daemon to deploy, and the daemon
-  # resolves each stack's bind-mount source paths on the host, so Dockhand's view
-  # of the path must equal the host path or adoption + bind mounts break. Put
-  # each app at /opt/apps/<app>/compose.yaml, then Dockhand > Import to track it.
-  mkdir -p /opt/apps && chmod 750 /opt/apps
 
-  # SECURITY: the rest of the host filesystem is mounted READ-ONLY (/:/host:ro).
-  # The previous read-write whole-host mount meant any Dockhand compromise =
-  # instant, silent root on the host. /opt/apps is the single READ-WRITE
-  # EXCEPTION (so Dockhand can manage app stacks); everything else stays :ro.
-  # The docker.sock mount is still root-equivalent by nature (required for a
-  # Docker manager), but Authentik 2FA gates all access.
+  # SECURITY: the host filesystem is mounted READ-ONLY (/:/host:ro).
+  # The previous read-write mount meant any Dockhand compromise = instant,
+  # silent root on the host. Note that the docker.sock mount is still
+  # root-equivalent by nature (required for a Docker manager), but Authentik
+  # 2FA gates all access and the :ro mount removes the easiest abuse path.
+  # If you genuinely need write access to host files from the Dockhand UI,
+  # change "/:/host:ro" to "/:/host" below and re-run:
+  #   docker compose -f /opt/dockhand-stack/docker-compose.dockhand.yml up -d --force-recreate
   cat > "${STACK_DIR}/docker-compose.dockhand.yml" << 'COMPOSE_DOCKHAND'
 services:
   dockhand:
@@ -513,10 +512,6 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./dockhand-data:/app/data
-      # User app stacks: READ-WRITE, identical host:container path so Dockhand can
-      # fully track/edit/deploy them and the daemon resolves their bind mounts.
-      - /opt/apps:/opt/apps
-      # Rest of host: READ-ONLY (browse only).
       - /:/host:ro
     networks:
       - proxy
@@ -1432,6 +1427,41 @@ labels:
 EOF
     warn "NPM acquisition written (via docker exec)"
   fi
+
+  # SSH + system log acquisition. CRITICAL: the sshd + linux collections are
+  # useless without a log source. The old script acquired ONLY NPM web logs, so
+  # SSH brute force and host attacks were INVISIBLE to CrowdSec. /var/log is
+  # mounted into the container - point CrowdSec at auth.log/secure (sshd) and
+  # syslog/messages (linux), parsed as syslog. (RHEL uses secure/messages.)
+  local sys_acquis="${CROWDSEC_DIR}/config/acquis.d/syslog.yaml"
+  cat > "$sys_acquis" << 'SYS_ACQUIS'
+filenames:
+  - /var/log/auth.log
+  - /var/log/syslog
+  - /var/log/secure
+  - /var/log/messages
+labels:
+  type: syslog
+SYS_ACQUIS
+  if docker exec crowdsec cat /etc/crowdsec/acquis.d/syslog.yaml &>/dev/null; then
+    success "SSH + system log acquisition configured (auth.log/syslog)"
+  else
+    docker exec -i crowdsec sh -c "mkdir -p /etc/crowdsec/acquis.d && cat > /etc/crowdsec/acquis.d/syslog.yaml" << 'EOF' || true
+filenames:
+  - /var/log/auth.log
+  - /var/log/syslog
+  - /var/log/secure
+  - /var/log/messages
+labels:
+  type: syslog
+EOF
+    warn "SSH/system acquisition written (via docker exec)"
+  fi
+  # Ensure the log files exist NOW so CrowdSec begins tailing them on restart
+  # (rsyslog only creates them on the first matching event; an absent file is not
+  # watched until the next restart).
+  touch /var/log/auth.log /var/log/syslog 2>/dev/null || true
+
   # A full restart is required for new acquisition files to take effect
   # (SIGHUP does not reliably reload acquisition sources).
   info "Restarting CrowdSec to apply acquisition config..."
@@ -1869,11 +1899,135 @@ verify_deployment() {
     else warn "VERIFY FAILED: test ban did not appear in firewall rules"; fails=$((fails+1)); fi
   fi
 
+  # DETECTION (not just enforcement): the sshd/linux collections need a log source.
+  _check "SSH/system log acquisition configured" bash -c \
+    "docker exec crowdsec cat /etc/crowdsec/acquis.d/syslog.yaml 2>/dev/null | grep -q 'type: syslog'"
+  _check "sshd collection installed" bash -c \
+    "docker exec crowdsec cscli collections list 2>/dev/null | grep -q crowdsecurity/sshd"
+
+  # Live DETECTION test: synthesize an SSH brute-force burst in auth.log and
+  # confirm CrowdSec PARSES it into a decision. Proves acquisition -> parser ->
+  # scenario, which the ban test above does NOT. Source is TEST-NET-2
+  # (198.51.100.66, RFC 5737) so it can never be a real client.
+  if [[ -f /var/log/auth.log ]]; then
+    info "Running live SSH brute-force DETECTION test (198.51.100.66, reserved test IP)..."
+    local _tip="198.51.100.66" _hn _k
+    _hn=$(hostname -s 2>/dev/null || echo host)
+    for _k in $(seq 1 12); do
+      printf '%s %s sshd[%d]: Failed password for invalid user verifyuser from %s port %d ssh2\n' \
+        "$(date '+%b %e %H:%M:%S')" "$_hn" "$((1000+_k))" "$_tip" "$((20000+_k))" >> /var/log/auth.log
+    done
+    local _seen=false _w
+    for _w in $(seq 1 12); do
+      if docker exec crowdsec cscli decisions list -o raw 2>/dev/null | grep -q "$_tip" \
+         || docker exec crowdsec cscli alerts list -o raw 2>/dev/null | grep -q "$_tip"; then _seen=true; break; fi
+      sleep 3
+    done
+    docker exec crowdsec cscli decisions delete --ip "$_tip" &>/dev/null || true
+    if $_seen; then success "VERIFY: CrowdSec DETECTION works (ssh-bf parsed from auth.log -> decision)"
+    else warn "VERIFY FAILED: synthetic ssh-bf not detected. Debug: docker exec crowdsec cscli metrics (check Acquisition + Scenarios)"; fails=$((fails+1)); fi
+  else
+    warn "VERIFY FAILED: /var/log/auth.log missing - SSH detection inactive. Is rsyslog running? (systemctl status rsyslog)"; fails=$((fails+1))
+  fi
+
   if [[ $fails -eq 0 ]]; then
     success "All verification checks passed"
   else
     warn "${fails} verification check(s) failed - review warnings above and ${LOG_FILE}"
   fi
+}
+
+# -------------------------------------------------------------------------------
+# Install the standalone health + security verifier onto the host so it can be
+# re-run any time (this is the same set of checks, runnable on demand):
+#   sudo bash /opt/dockhand-stack/verify-stack.sh
+# -------------------------------------------------------------------------------
+install_verify_script() {
+  step "Installing verifier (verify-stack.sh)"
+  cat > "${STACK_DIR}/verify-stack.sh" << 'VERIFY_EOF'
+#!/usr/bin/env bash
+# verify-stack.sh -- health + SECURITY audit for the Dockhand + Authentik + NPM +
+# CrowdSec stack. Installed by deploy-dockhand-authentik.sh. Run as root:
+#   sudo bash /opt/dockhand-stack/verify-stack.sh
+# Read-only except self-cleaning CrowdSec ban + ssh-bf detection tests (reserved IPs).
+set -uo pipefail
+C_R='\033[0m'; C_B='\033[1m'; C_G='\033[0;32m'; C_Y='\033[0;33m'; C_RED='\033[0;31m'; C_C='\033[0;36m'
+[[ -t 1 ]] || { C_R=; C_B=; C_G=; C_Y=; C_RED=; C_C=; }
+P=0; W=0; F=0
+pass(){ printf "${C_G}[PASS]${C_R} %s\n" "$*"; P=$((P+1)); }
+warn(){ printf "${C_Y}[WARN]${C_R} %s\n" "$*"; W=$((W+1)); }
+fail(){ printf "${C_RED}[FAIL]${C_R} %s\n" "$*"; F=$((F+1)); }
+hdr(){  printf "\n${C_B}${C_C}== %s ==${C_R}\n" "$*"; }
+[[ "${EUID:-$(id -u)}" -eq 0 ]] || { echo "Run as root: sudo bash $0"; exit 1; }
+command -v docker >/dev/null 2>&1 || { echo "docker not found"; exit 1; }
+STACK_DIR="/opt/dockhand-stack"; AUTHENTIK_DIR="${STACK_DIR}/authentik"
+DOMAIN="$(tr -d '\n' < /etc/vps-deploy-domain 2>/dev/null || true)"
+printf "${C_B}Dockhand stack health + security audit${C_R}  domain=${DOMAIN:-<unknown>}\n"
+hdr "Containers"
+for c in npm dockhand authentik-server authentik-worker authentik-postgres authentik-redis crowdsec; do
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$c"; then pass "container $c running"; else fail "container $c NOT running"; fi
+done
+hdr "Service health"
+curl -sf --max-time 5 http://127.0.0.1:81/api/ >/dev/null 2>&1 && pass "NPM API up (:81)" || fail "NPM API down (:81)"
+curl -sf --max-time 5 http://127.0.0.1:9000/-/health/ready/ >/dev/null 2>&1 && pass "Authentik health OK (:9000)" || fail "Authentik health FAIL"
+docker exec npm nginx -t >/dev/null 2>&1 && pass "NPM nginx config valid" || fail "NPM nginx config INVALID"
+docker exec crowdsec cscli lapi status >/dev/null 2>&1 && pass "CrowdSec LAPI responding" || fail "CrowdSec LAPI down"
+[[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]] && pass "IP forwarding on" || warn "IP forwarding off"
+hdr "CrowdSec enforcement"
+docker exec crowdsec cscli collections list 2>/dev/null | grep -q nginx-proxy-manager && pass "NPM collection installed" || warn "NPM collection missing"
+docker exec crowdsec cscli bouncers list 2>/dev/null | grep -q npm-bouncer && pass "firewall bouncer registered" || warn "firewall bouncer not registered"
+if systemctl is-active --quiet crowdsec-firewall-bouncer; then
+  pass "firewall bouncer service active"
+  docker exec crowdsec cscli decisions add --ip 192.0.2.1 --duration 2m --reason verify-stack >/dev/null 2>&1
+  sleep 12; banned=no
+  command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -q '192\.0\.2\.1' && banned=yes
+  [[ $banned == no ]] && iptables -S 2>/dev/null | grep -q '192\.0\.2\.1' && banned=yes
+  [[ $banned == no ]] && ipset list 2>/dev/null | grep -q '192\.0\.2\.1' && banned=yes
+  docker exec crowdsec cscli decisions delete --ip 192.0.2.1 >/dev/null 2>&1
+  [[ $banned == yes ]] && pass "live ban enforced (round-trip OK)" || fail "live ban NOT enforced"
+else fail "firewall bouncer service NOT active"; fi
+if systemctl list-unit-files 2>/dev/null | grep -q crowdsec-cloudflare-worker-bouncer; then
+  if systemctl is-active --quiet crowdsec-cloudflare-worker-bouncer; then pass "CF worker bouncer active (edge)"
+  else warn "CF worker bouncer installed but not active (enable Cloudflare Analytics Engine? journalctl -u crowdsec-cloudflare-worker-bouncer -n 40)"; fi
+fi
+hdr "CrowdSec detection (logs -> scenarios)"
+docker exec crowdsec sh -c 'cat /etc/crowdsec/acquis.d/syslog.yaml 2>/dev/null' | grep -q 'type: syslog' && pass "SSH/system log acquisition configured" || fail "SSH/system acquisition MISSING - SSH/host attacks are INVISIBLE to CrowdSec"
+docker exec crowdsec cscli collections list 2>/dev/null | grep -q crowdsecurity/sshd && pass "sshd collection installed" || warn "sshd collection missing"
+[ -f /var/log/auth.log ] && pass "/var/log/auth.log present (rsyslog writing SSH logs)" || fail "/var/log/auth.log MISSING - SSH detection inactive (is rsyslog running?)"
+if [ -f /var/log/auth.log ]; then
+  tip="198.51.100.66"; hn="$(hostname -s 2>/dev/null || echo host)"
+  for k in $(seq 1 12); do printf '%s %s sshd[%d]: Failed password for invalid user verifyuser from %s port %d ssh2\n' "$(date '+%b %e %H:%M:%S')" "$hn" "$((1000+k))" "$tip" "$((20000+k))" >> /var/log/auth.log; done
+  seen=no; for w in $(seq 1 12); do docker exec crowdsec cscli decisions list -o raw 2>/dev/null | grep -q "$tip" && { seen=yes; break; }; docker exec crowdsec cscli alerts list -o raw 2>/dev/null | grep -q "$tip" && { seen=yes; break; }; sleep 3; done
+  docker exec crowdsec cscli decisions delete --ip "$tip" >/dev/null 2>&1
+  [ "$seen" = yes ] && pass "live ssh-bf DETECTION works (auth.log parsed -> decision)" || fail "synthetic ssh-bf NOT detected (docker exec crowdsec cscli metrics)"
+fi
+hdr "Security posture"
+if curl -s --max-time 5 -X POST http://127.0.0.1:81/api/tokens -H 'Content-Type: application/json' -d '{"identity":"admin@example.com","secret":"changeme"}' 2>/dev/null | grep -q '"token"'; then
+  fail "NPM DEFAULT password STILL ACTIVE (admin@example.com/changeme) -- change NOW at :81"; else pass "NPM default creds rejected"; fi
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then pass "UFW active"
+elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -q running; then pass "firewalld active"
+else fail "no active host firewall"; fi
+binds="$(ss -tlnH 2>/dev/null | awk '{print $4}')"
+echo "$binds" | grep -qE '0\.0\.0\.0:8080$|\[::\]:8080$|\*:8080$' && fail "CrowdSec LAPI :8080 EXPOSED on all interfaces" || pass "CrowdSec LAPI :8080 not world-listening"
+echo "$binds" | grep -qE '0\.0\.0\.0:9000$|\[::\]:9000$|\*:9000$' && fail "Authentik :9000 EXPOSED on all interfaces" || pass "Authentik :9000 not world-listening"
+echo "$binds" | grep -qE '0\.0\.0\.0:81$|\[::\]:81$|\*:81$' && warn "NPM admin :81 on all interfaces -- restrict to LAN/VPN" || pass "NPM admin :81 not world-open"
+mnt="$(docker inspect -f '{{range .Mounts}}{{.Destination}}={{.RW}}{{"\n"}}{{end}}' dockhand 2>/dev/null | grep '^/host=')"
+if [ -n "$mnt" ]; then echo "$mnt" | grep -q '=false$' && pass "Dockhand host fs READ-ONLY (/host:ro)" || fail "Dockhand host fs READ-WRITE -- compromise = root on host"
+else warn "Dockhand /host mount not found"; fi
+docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' dockhand 2>/dev/null | grep -q '/var/run/docker.sock' && warn "Dockhand has docker.sock (root-equivalent, by design) -- the auth gate is your ONLY protection" || true
+gate="$(docker exec npm sh -c "grep -lsi 'authentik' /data/nginx/proxy_host/*.conf 2>/dev/null | xargs -r grep -lsi 'dockhand' 2>/dev/null" 2>/dev/null || true)"
+[ -n "$gate" ] && pass "Authentik forward-auth gate present on dockhand host" || fail "dockhand host has NO Authentik gate -- root UI unprotected at edge"
+for f in "${STACK_DIR}/.npm_admin_password" "${AUTHENTIK_DIR}/.akadmin_password" /etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml; do
+  [ -f "$f" ] || continue; m="$(stat -c '%a' "$f" 2>/dev/null || echo '?')"
+  [ "$m" = 600 ] && pass "perms 600 on $(basename "$f")" || warn "perms $m on $f (want 600)"; done
+hdr "Summary"
+printf "${C_G}PASS:%d${C_R}   ${C_Y}WARN:%d${C_R}   ${C_RED}FAIL:%d${C_R}\n" "$P" "$W" "$F"
+if [ $F -gt 0 ]; then printf "${C_RED}${C_B}NOT fully secured -- resolve FAIL items.${C_R}\n"; exit 1
+elif [ $W -gt 0 ]; then printf "${C_Y}${C_B}Functional, review WARNings.${C_R}\n"; exit 0
+else printf "${C_G}${C_B}All checks passed.${C_R}\n"; exit 0; fi
+VERIFY_EOF
+  chmod 755 "${STACK_DIR}/verify-stack.sh"
+  success "Verifier installed: ${STACK_DIR}/verify-stack.sh  (re-run: sudo bash ${STACK_DIR}/verify-stack.sh)"
 }
 
 # -------------------------------------------------------------------------------
@@ -1957,6 +2111,7 @@ ${C_B}${C_YEL}Done automatically:${C_R}
   - CrowdSec Console enrollment attempted
   - Authentik 2FA protecting Dockhand (nginx forward-auth + embedded proxy outpost)
   - CrowdSec bans enforced incl. Docker-published ports (DOCKER-USER chain)
+  - CrowdSec DETECTION wired for SSH + system logs (rsyslog + auth.log/syslog acquisition)
   - CrowdSec http-cve collection installed (CVE-exploit probing detection)
   - Cloudflare real visitor IPs restored in NPM (CF-Connecting-IP header)
   - Cloudflare Worker bouncer deployed for edge IP-ban enforcement (if token supplied)
@@ -1979,9 +2134,11 @@ ${C_B}${C_YEL}Credential files (root-only, mode 600):${C_R}
   ${AUTHENTIK_DIR}/.akadmin_password
 
 ${C_B}Troubleshooting:${C_R}
+  Verify:  sudo bash ${STACK_DIR}/verify-stack.sh   (re-runnable health + security audit)
   Logs:    docker logs -f npm    docker logs -f dockhand    docker logs -f authentik-server
   Restart: cd ${STACK_DIR} && docker compose -f docker-compose.npm.yml restart
   FW:      ${fw_cmd}
+  CrowdSec: docker exec crowdsec cscli metrics   docker exec crowdsec cscli alerts list
   Log:     ${LOG_FILE}
 EOF
   _log "INFO" "=== Deployment completed in $(( elapsed / 60 ))m $(( elapsed % 60 ))s ==="
@@ -2030,6 +2187,7 @@ main() {
   setup_logrotate
   automate_npm
   register_dockhand_stacks
+  install_verify_script
   verify_deployment
   DEPLOY_STATUS="success"
   print_summary
