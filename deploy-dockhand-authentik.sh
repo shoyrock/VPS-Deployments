@@ -17,7 +17,7 @@ fi
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.7.2-hardened-cloudflare-authentik"
+readonly SCRIPT_VERSION="4.7.4-hardened-cloudflare-authentik"
 readonly SCRIPT_NAME="deploy-dockhand-authentik.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/dockhand-stack"
@@ -1649,6 +1649,21 @@ setup_cloudflare_bouncer() {
   local cfg="${cfg_dir}/crowdsec-cloudflare-worker-bouncer.yaml"
   mkdir -p "$cfg_dir"
 
+  # When the worker can't run (no Analytics Engine, crash-loop, or no token), its
+  # apt package is often left HALF-CONFIGURED (dpkg state 'iF') because the
+  # postinst FATALs without AE. A half-configured package makes `apt-get` and
+  # unattended-upgrades error out - so over a months-long unattended run, SECURITY
+  # UPDATES SILENTLY STOP. This purges it to a clean dpkg state (the firewall
+  # bouncer, the real enforcement, is a different package and is untouched). The
+  # user can re-run the deploy after enabling AE to add edge enforcement.
+  _worker_pkg_clean() {
+    command -v dpkg >/dev/null 2>&1 || return 0
+    dpkg-query -W crowdsec-cloudflare-worker-bouncer >/dev/null 2>&1 || return 0
+    DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all crowdsec-cloudflare-worker-bouncer </dev/null >>"$LOG_FILE" 2>&1 \
+      || DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq -o DPkg::Lock::Timeout=300 crowdsec-cloudflare-worker-bouncer </dev/null >>"$LOG_FILE" 2>&1 || true
+    info "Worker bouncer package removed to keep dpkg/apt clean for unattended updates (re-run deploy after enabling Analytics Engine to add it)."
+  }
+
   # 1. Token: from env, else prompt. Blank = configure now, deploy later.
   if [[ -z "$CF_API_TOKEN" ]]; then
     printf "\n${C_B}Cloudflare Worker bouncer${C_R} blocks banned IPs at Cloudflare's edge.\n" >&2
@@ -1806,19 +1821,22 @@ CFWB
       # must have AE enabled or every deploy FATALs. No API to enable it.
       error "Worker bouncer is CRASH-LOOPING: your Cloudflare account has Workers Analytics Engine DISABLED, which this bouncer requires."
       error "  Enable it (free): Cloudflare dashboard > Workers & Pages > Analytics Engine > Enable,"
-      error "  then: systemctl enable --now crowdsec-cloudflare-worker-bouncer"
+      error "  then RE-RUN this deploy (or just CF_BOUNCER_TOKEN=... bash $0) to install + activate the worker."
       systemctl stop crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
       systemctl disable crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
+      _worker_pkg_clean
     else
       systemctl stop crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
       systemctl disable crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
-      warn "Worker bouncer not stably active (SubState=${sub}, restarts ${restarts1}->${restarts2}); stopped to avoid a crash-loop. See ${LOG_FILE}. Debug: journalctl -u crowdsec-cloudflare-worker-bouncer -n 40"
+      _worker_pkg_clean
+      warn "Worker bouncer not stably active (SubState=${sub}, restarts ${restarts1}->${restarts2}); stopped + removed to avoid a crash-loop and keep dpkg clean. See ${LOG_FILE}. Debug: journalctl -u crowdsec-cloudflare-worker-bouncer -n 40"
     fi
   else
     systemctl stop crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
     systemctl disable crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
-    warn "Cloudflare Worker bouncer configured but NOT deployed (no token/zone, or package missing)."
-    info "Finish later: ensure the package is installed, set token + IDs in ${cfg}, then: systemctl enable --now crowdsec-cloudflare-worker-bouncer"
+    _worker_pkg_clean
+    warn "Cloudflare Worker bouncer NOT deployed (no token/zone supplied). Edge enforcement skipped; the host firewall bouncer still enforces all bans."
+    info "Add it later: enable Analytics Engine, then re-run the deploy with CF_BOUNCER_TOKEN set (it regenerates the config + installs + activates the worker)."
   fi
 }
 
@@ -1909,11 +1927,17 @@ verify_deployment() {
   if systemctl is-active --quiet crowdsec-firewall-bouncer; then
     info "Running live ban round-trip test (192.0.2.1, reserved test IP)..."
     docker exec crowdsec cscli decisions add --ip 192.0.2.1 --duration 2m --reason "deploy-verify" &>/dev/null || true
-    sleep 15  # bouncer pulls every 10s
-    local banned=false
-    if command -v nft &>/dev/null && nft list ruleset 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=true; fi
-    if ! $banned && iptables -S 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=true; fi
-    if ! $banned && ipset list 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=true; fi
+    # POLL, don't sleep-once: the bouncer pulls every 10s, and when it is also
+    # syncing large community blocklists (tens of thousands of decisions) a single
+    # fixed wait can land between pulls and falsely report "not enforced". Retry
+    # up to ~36s.
+    local banned=false _bi
+    for _bi in $(seq 1 12); do
+      if { command -v nft &>/dev/null && nft list ruleset 2>/dev/null | grep -q '192\.0\.2\.1'; } \
+         || iptables -S 2>/dev/null | grep -q '192\.0\.2\.1' \
+         || ipset list 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=true; break; fi
+      sleep 3
+    done
     docker exec crowdsec cscli decisions delete --ip 192.0.2.1 &>/dev/null || true
     if $banned; then success "VERIFY: end-to-end ban enforcement works"
     else warn "VERIFY FAILED: test ban did not appear in firewall rules"; fails=$((fails+1)); fi
@@ -1999,10 +2023,14 @@ docker exec crowdsec cscli bouncers list 2>/dev/null | grep -q npm-bouncer && pa
 if systemctl is-active --quiet crowdsec-firewall-bouncer; then
   pass "firewall bouncer service active"
   docker exec crowdsec cscli decisions add --ip 192.0.2.1 --duration 2m --reason verify-stack >/dev/null 2>&1
-  sleep 12; banned=no
-  command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -q '192\.0\.2\.1' && banned=yes
-  [[ $banned == no ]] && iptables -S 2>/dev/null | grep -q '192\.0\.2\.1' && banned=yes
-  [[ $banned == no ]] && ipset list 2>/dev/null | grep -q '192\.0\.2\.1' && banned=yes
+  # POLL up to ~36s (bouncer pulls every 10s; heavier when syncing community blocklists)
+  banned=no
+  for _ in $(seq 1 12); do
+    if { command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -q '192\.0\.2\.1'; } \
+       || iptables -S 2>/dev/null | grep -q '192\.0\.2\.1' \
+       || ipset list 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=yes; break; fi
+    sleep 3
+  done
   docker exec crowdsec cscli decisions delete --ip 192.0.2.1 >/dev/null 2>&1
   [[ $banned == yes ]] && pass "live ban enforced (round-trip OK)" || fail "live ban NOT enforced"
 else fail "firewall bouncer service NOT active"; fi

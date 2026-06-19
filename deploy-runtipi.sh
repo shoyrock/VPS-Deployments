@@ -17,7 +17,7 @@ fi
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.6.0-hardened-cloudflare"
+readonly SCRIPT_VERSION="4.7.0-hardened-cloudflare"
 readonly SCRIPT_NAME="deploy-runtipi.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/runtipi-stack"
@@ -386,11 +386,13 @@ install_dependencies() {
     # Guard: repair dpkg if cleanup left a half-configured package behind.
     DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confold </dev/null 2>/dev/null || true
     apt-get install -y -qq ca-certificates curl gnupg lsb-release \
-      software-properties-common apt-transport-https jq unzip cron logrotate
+      software-properties-common apt-transport-https jq unzip cron logrotate rsyslog
+    systemctl enable --now rsyslog 2>/dev/null || true
   else
     local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
     $pkg install -y -q ca-certificates curl gnupg2 yum-utils \
-      device-mapper-persistent-data lvm2 jq unzip cronie logrotate
+      device-mapper-persistent-data lvm2 jq unzip cronie logrotate rsyslog
+    systemctl enable --now rsyslog 2>/dev/null || true
   fi
   success "Dependencies installed"
 }
@@ -580,7 +582,7 @@ services:
       # nginx-proxy-manager collection, so they are not listed again.
       # http-dos = L7 flood detection; whitelist-good-actors = avoid banning
       # legit crawlers (Google/Bing/etc). All free hub collections, log-based.
-      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux crowdsecurity/http-cve crowdsecurity/http-dos crowdsecurity/whitelist-good-actors
+      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/linux crowdsecurity/nginx-proxy-manager crowdsecurity/base-http-scenarios crowdsecurity/http-cve crowdsecurity/http-dos crowdsecurity/whitelist-good-actors
       # Pre-register the Cloudflare Worker bouncer so it authenticates to LAPI
       # with this exact key (setup_cloudflare_bouncer writes it into the config).
       - BOUNCER_KEY_cloudflarebouncer=${CF_BOUNCER_KEY}
@@ -596,11 +598,11 @@ COMPOSE_CROWDSEC
 
 
   info "Pulling images..."
-  docker compose -f "${STACK_DIR}/docker-compose.npm.yml" pull
-  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" pull
+  docker compose -p npm -f "${STACK_DIR}/docker-compose.npm.yml" pull
+  docker compose -p crowdsec -f "${STACK_DIR}/docker-compose.crowdsec.yml" pull
 
   info "Starting NPM..."
-  docker compose -f "${STACK_DIR}/docker-compose.npm.yml" up -d
+  docker compose -p npm -f "${STACK_DIR}/docker-compose.npm.yml" up -d
   for i in $(seq 1 30); do
     local has_80=false has_443=false has_81=false
     ss -tlnp 2>/dev/null | grep -q ':80[[:space:]]' && has_80=true
@@ -626,8 +628,8 @@ COMPOSE_CROWDSEC
   setup_authelia_config
   setup_authelia_snippets
   setup_authelia_users          # users.yml MUST exist before the container starts
-  docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" pull
-  docker compose -f "${STACK_DIR}/docker-compose.authelia.yml" up -d
+  docker compose -p authelia -f "${STACK_DIR}/docker-compose.authelia.yml" pull
+  docker compose -p authelia -f "${STACK_DIR}/docker-compose.authelia.yml" up -d
   info "Waiting for Authelia..."
   for i in $(seq 1 30); do
     if docker ps --format '{{.Names}}' | grep -qx "authelia" && \
@@ -670,7 +672,7 @@ COMPOSE_CROWDSEC
   printf "\r" >&2
 
   info "Starting CrowdSec..."
-  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec
+  docker compose -p crowdsec -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec
   for i in $(seq 1 30); do
     docker ps --format '{{.Names}}' | grep -qx "crowdsec" && { success "CrowdSec container running"; break; }
     printf "${C_DIM}  Waiting for CrowdSec container... (%d/30)${C_R}\r" "$i" >&2
@@ -1164,6 +1166,35 @@ EOF
   fi
   # A full restart is required for new acquisition files to take effect
   # (SIGHUP does not reliably reload acquisition sources).
+  # SSH + system log acquisition. The sshd + linux collections need a log SOURCE;
+  # /var/log is already mounted into the crowdsec container (:ro) and rsyslog
+  # (installed in dependencies) writes auth.log/syslog on journald-only distros
+  # like Ubuntu 24.04. Without this, SSH brute force + host attacks are INVISIBLE.
+  local sys_acquis="${CROWDSEC_DIR}/config/acquis.d/syslog.yaml"
+  cat > "$sys_acquis" << 'SYS_ACQUIS'
+filenames:
+  - /var/log/auth.log
+  - /var/log/syslog
+  - /var/log/secure
+  - /var/log/messages
+labels:
+  type: syslog
+SYS_ACQUIS
+  if docker exec crowdsec cat /etc/crowdsec/acquis.d/syslog.yaml &>/dev/null; then
+    success "SSH + system log acquisition configured (auth.log/syslog)"
+  else
+    docker exec -i crowdsec sh -c "mkdir -p /etc/crowdsec/acquis.d && cat > /etc/crowdsec/acquis.d/syslog.yaml" << 'EOF' || true
+filenames:
+  - /var/log/auth.log
+  - /var/log/syslog
+  - /var/log/secure
+  - /var/log/messages
+labels:
+  type: syslog
+EOF
+    warn "SSH/system acquisition written (via docker exec)"
+  fi
+  touch /var/log/auth.log /var/log/syslog 2>/dev/null || true
   info "Restarting CrowdSec to apply acquisition config..."
   docker restart crowdsec &>/dev/null || true
   for i in $(seq 1 30); do
@@ -1325,6 +1356,18 @@ setup_cloudflare_realip() {
 # -------------------------------------------------------------------------------
 setup_cloudflare_bouncer() {
   step "CrowdSec Cloudflare Worker bouncer"
+  # When the worker can't run (no Analytics Engine / crash-loop / no token), its
+  # apt package is often left HALF-CONFIGURED (dpkg 'iF') because the postinst
+  # FATALs. That makes apt-get + unattended-upgrades error out, so over a long
+  # unattended run SECURITY UPDATES SILENTLY STOP. Purge it to a clean state (the
+  # host firewall bouncer - the real enforcement - is a different package).
+  _worker_pkg_clean() {
+    command -v dpkg >/dev/null 2>&1 || return 0
+    dpkg-query -W crowdsec-cloudflare-worker-bouncer >/dev/null 2>&1 || return 0
+    DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all crowdsec-cloudflare-worker-bouncer </dev/null >>"$LOG_FILE" 2>&1 \
+      || DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq -o DPkg::Lock::Timeout=300 crowdsec-cloudflare-worker-bouncer </dev/null >>"$LOG_FILE" 2>&1 || true
+    info "Worker bouncer package removed to keep dpkg/apt clean for unattended updates (re-run after enabling Analytics Engine to add it)."
+  }
   local cfg_dir="/etc/crowdsec/bouncers"
   local cfg="${cfg_dir}/crowdsec-cloudflare-worker-bouncer.yaml"
   mkdir -p "$cfg_dir"
@@ -1445,13 +1488,19 @@ CFWB
       warn "ACTION REQUIRED (no Cloudflare API for this): set the Worker Route to FAIL OPEN -> CF dashboard > ${DOMAIN} > Workers Routes > edit the crowdsec route > Request limit failure mode > Fail open. Without it a worker error shows visitors a CF 1027 page."
     else
       journalctl -u crowdsec-cloudflare-worker-bouncer -n 20 --no-pager >>"$LOG_FILE" 2>&1 || true
-      warn "Worker bouncer not active - see ${LOG_FILE}. Debug: journalctl -u crowdsec-cloudflare-worker-bouncer -n 30"
+      # Don't leave a Restart=always service crash-looping for months. Stop,
+      # disable, and purge so the box stays clean (firewall bouncer unaffected).
+      systemctl stop crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
+      systemctl disable crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
+      _worker_pkg_clean
+      warn "Worker bouncer not active (likely Cloudflare Analytics Engine disabled) - stopped + removed to avoid a crash-loop. See ${LOG_FILE}. Enable AE then re-run with CF_BOUNCER_TOKEN set."
     fi
   else
     systemctl stop crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
     systemctl disable crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
-    warn "Cloudflare Worker bouncer configured but NOT deployed (no token/zone, or package missing)."
-    info "Finish later: ensure the package is installed, set token + IDs in ${cfg}, then: systemctl enable --now crowdsec-cloudflare-worker-bouncer"
+    _worker_pkg_clean
+    warn "Cloudflare Worker bouncer NOT deployed (no token/zone). Edge enforcement skipped; the host firewall bouncer still enforces all bans."
+    info "Add it later: enable Analytics Engine, then re-run with CF_BOUNCER_TOKEN set (regenerates config + installs + activates the worker)."
   fi
 }
 
@@ -1537,11 +1586,15 @@ verify_deployment() {
   if systemctl is-active --quiet crowdsec-firewall-bouncer; then
     info "Running live ban round-trip test (192.0.2.1, reserved test IP)..."
     docker exec crowdsec cscli decisions add --ip 192.0.2.1 --duration 2m --reason "deploy-verify" &>/dev/null || true
-    sleep 15  # bouncer pulls every 10s
-    local banned=false
-    if command -v nft &>/dev/null && nft list ruleset 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=true; fi
-    if ! $banned && iptables -S 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=true; fi
-    if ! $banned && ipset list 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=true; fi
+    # POLL, don't sleep-once: bouncer pulls every 10s and a single fixed wait can
+    # land between pulls (esp. while syncing big community blocklists) -> false fail.
+    local banned=false _bi
+    for _bi in $(seq 1 12); do
+      if { command -v nft &>/dev/null && nft list ruleset 2>/dev/null | grep -q '192\.0\.2\.1'; } \
+         || iptables -S 2>/dev/null | grep -q '192\.0\.2\.1' \
+         || ipset list 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=true; break; fi
+      sleep 3
+    done
     docker exec crowdsec cscli decisions delete --ip 192.0.2.1 &>/dev/null || true
     if $banned; then success "VERIFY: end-to-end ban enforcement works"
     else warn "VERIFY FAILED: test ban did not appear in firewall rules"; fails=$((fails+1)); fi
@@ -1657,7 +1710,7 @@ ${C_B}${C_YEL}Credential files (root-only, mode 600):${C_R}
 
 ${C_B}Troubleshooting:${C_R}
   Logs:    docker logs -f npm    docker logs -f tipi-reverse-proxy    docker logs -f authelia
-  Restart: cd ${STACK_DIR} && docker compose -f docker-compose.npm.yml restart
+  Restart: docker compose -p npm -f ${STACK_DIR}/docker-compose.npm.yml restart   (per-stack project: -p npm|crowdsec|authelia|<platform>)
   FW:      ${fw_cmd}
   Log:     ${LOG_FILE}
 EOF

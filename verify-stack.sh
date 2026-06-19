@@ -43,11 +43,16 @@ docker exec crowdsec cscli bouncers list 2>/dev/null | grep -q npm-bouncer && pa
 if systemctl is-active --quiet crowdsec-firewall-bouncer; then
   pass "firewall bouncer service active"
   docker exec crowdsec cscli decisions add --ip 192.0.2.1 --duration 2m --reason verify-stack >/dev/null 2>&1
-  sleep 12
+  # POLL up to ~36s. The bouncer pulls every 10s; when it is also syncing large
+  # community blocklists (tens of thousands of decisions) the per-cycle work can
+  # push a fresh decision past a single fixed wait -> false "not enforced".
   banned=no
-  command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -q '192\.0\.2\.1' && banned=yes
-  [[ $banned == no ]] && iptables -S 2>/dev/null | grep -q '192\.0\.2\.1' && banned=yes
-  [[ $banned == no ]] && ipset list 2>/dev/null | grep -q '192\.0\.2\.1' && banned=yes
+  for _ in $(seq 1 12); do
+    if { command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -q '192\.0\.2\.1'; } \
+       || iptables -S 2>/dev/null | grep -q '192\.0\.2\.1' \
+       || ipset list 2>/dev/null | grep -q '192\.0\.2\.1'; then banned=yes; break; fi
+    sleep 3
+  done
   docker exec crowdsec cscli decisions delete --ip 192.0.2.1 >/dev/null 2>&1
   [[ $banned == yes ]] && pass "live ban enforced in firewall (round-trip OK)" || fail "live ban NOT enforced in firewall"
 else

@@ -341,6 +341,29 @@ GEOEOF
 # ---------------------------------------------------------------------------
 install_crowdsec() {
     info "=== Installing CrowdSec (local mode) ==="
+    # CONFLICT GUARD: the deploy-*.sh stacks already run CrowdSec in a Docker
+    # container with an *nftables* firewall bouncer (table ip crowdsec). Do NOT
+    # install a second NATIVE CrowdSec + the *iptables* bouncer variant here -
+    # two LAPIs and two firewall backends (nft vs iptables) collide and silently
+    # break enforcement. Instead just rebuild the existing bouncer's rules, which
+    # the `ufw --force reset` + GeoIP step above flushed, and return.
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx crowdsec \
+       || systemctl list-unit-files 2>/dev/null | grep -q '^crowdsec-firewall-bouncer' \
+       || [[ -f /etc/crowdsec/crowdsec-firewall-bouncer.yaml ]]; then
+        ok "Existing CrowdSec + firewall bouncer detected (from deploy) — not installing a parallel native instance"
+        if systemctl list-unit-files 2>/dev/null | grep -q '^crowdsec-firewall-bouncer'; then
+            # Rebuild the bouncer's nft table on top of the new UFW/GeoIP ruleset.
+            if systemctl restart crowdsec-firewall-bouncer >> "$LOGFILE" 2>&1; then
+                ok "Firewall bouncer restarted — ban rules rebuilt after firewall reset"
+            else
+                warn "Could not restart crowdsec-firewall-bouncer — run: systemctl restart crowdsec-firewall-bouncer"
+            fi
+        else
+            warn "Bouncer config present but no systemd unit — bans may not be enforced until the bouncer runs"
+        fi
+        _log "CrowdSec: kept existing deploy instance; firewall bouncer restarted"
+        return
+    fi
     if command -v cscli &>/dev/null; then
         ok "CrowdSec already installed"
     else
