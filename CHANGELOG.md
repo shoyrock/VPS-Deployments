@@ -22,6 +22,9 @@
 ### Distribution / upload set
 - `vps-deploy-fixes.zip` now includes `deploy.sh` (the master menu that deploys every script), `harden.sh`, and `add-domain.sh` — previously missing, so the menu referenced scripts that weren't in the upload set.
 
+### deploy.sh — `verify` added to the menu
+- `verify-stack.sh` was installed on the box but had no entry in the master menu. Added as item #15 under **Security & Utilities** (`./deploy.sh verify`, aliases: verify-stack/check/audit). It's flagged read-only (changes nothing but a self-test ban it adds then deletes).
+
 ## deploy-dockhand-authentik.sh — 4.6.0 → 4.7.0
 
 Fully audited and hardened. Highlights:

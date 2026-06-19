@@ -115,7 +115,12 @@ TOOL_DESCRIPTIONS[14]="➕ Add another domain to a running NPM+Authelia stack (e
 TOOL_PORTS[14]="—"
 TOOL_CATEGORIES[14]="Security & Utilities"
 
-readonly TOOL_COUNT=14
+TOOL_NAMES[15]="verify"
+TOOL_DESCRIPTIONS[15]="🔎 Verify stack — health + security audit (containers, CrowdSec, TLS, auth gate). Read-only."
+TOOL_PORTS[15]="—"
+TOOL_CATEGORIES[15]="Security & Utilities"
+
+readonly TOOL_COUNT=15
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COLORS & UI
@@ -159,6 +164,7 @@ _script_for_name() {
   case "$1" in
     harden)     echo "harden.sh" ;;
     add-domain) echo "add-domain.sh" ;;
+    verify)     echo "verify-stack.sh" ;;
     *)          echo "deploy-$1.sh" ;;
   esac
 }
@@ -186,6 +192,10 @@ _run_script() {
     add-domain.sh)
       printf "${C_GRN}✔${C_R} Additive + safe on a live system — adds proxy hosts + an SSO realm for a new domain.\n"
       printf "  ${C_GRN}✔${C_R} Existing domains, hosts and certs are NOT touched.\n"
+      ;;
+    verify-stack.sh)
+      printf "${C_GRN}✔${C_R} Read-only audit — inspects containers, CrowdSec, TLS and the auth gate.\n"
+      printf "  ${C_GRN}✔${C_R} Changes NOTHING (only a self-test ban it adds then deletes). Safe to run anytime.\n"
       ;;
     *)
       printf "${C_YEL}⚠${C_R} This will install/configure services. Existing containers may be ${C_RED}DESTROYED${C_R}.\n"
@@ -261,6 +271,7 @@ if [[ $# -gt 0 ]]; then
     freedombox|fbx)                   requested="freedombox" ;;
     harden|security|lockdown)         requested="harden" ;;
     add-domain|adddomain|domain)      requested="add-domain" ;;
+    verify|verify-stack|check|audit)  requested="verify" ;;
     *)
       printf "${C_RED}Unknown tool: ${requested}${C_R}\n"
       printf "Run ${C_B}./deploy.sh${C_R} without arguments for the interactive menu.\n"
