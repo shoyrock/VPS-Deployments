@@ -1,5 +1,19 @@
 # Changelog
 
+## deploy-dockhand-authentik.sh — 4.7.2
+
+### "Found orphan containers ([dockhand])" warning — permanently fixed
+- All four compose files live in `/opt/dockhand-stack`, so Compose gave them ONE shared project name. Bringing up `npm.yml` then saw `dockhand` (from a different file) as an "orphan" of that project. Each stack now runs under its own project: `-p npm`, `-p crowdsec`, `-p authentik`, `-p dockhand`. No more cross-file orphan warnings.
+- NOTE: `--remove-orphans` was deliberately NOT used — under the old shared project it would have **deleted** the dockhand/authentik/crowdsec containers whenever npm was brought up. Separate projects is the correct, non-destructive fix.
+- Manual commands now take the project flag, e.g. `docker compose -p npm -f /opt/dockhand-stack/docker-compose.npm.yml restart`.
+
+### CrowdSec — more community collections (all free, all applicable)
+- Added `crowdsecurity/base-http-scenarios` (generic web attacks: scanning, probing, path traversal, bad UAs, crawlers). Full set now: `sshd`, `linux`, `nginx-proxy-manager`, `base-http-scenarios`, `http-cve`, `http-dos`, `whitelist-good-actors` — every collection that has a live acquisition source on this box (auth.log, syslog, NPM web logs).
+- Deliberately left out (would log nothing / need extra wiring): `iptables` (no nftables log feed), `appsec-*` (needs the AppSec/WAF engine + a forwarding bouncer), mail/db collections (no such service).
+
+### Two remediation components — both present, status clarified
+- Both bouncers are still wired: the host **firewall bouncer** (nftables, enforces bans locally) and the **Cloudflare Worker bouncer** (blocks at Cloudflare's edge). If `cscli bouncers list` shows `cloudflarebouncer` registered but with no "Last API pull"/version, the worker isn't running — that is the **Cloudflare Workers Analytics Engine** prerequisite (must be enabled on the CF account; no API for it), not a missing component.
+
 ## deploy-dockhand-authentik.sh — 4.7.1
 
 ### Container terminal WebSocket dropped ("Connection error. Disconnected.")

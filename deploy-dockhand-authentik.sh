@@ -17,7 +17,7 @@ fi
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.7.1-hardened-cloudflare-authentik"
+readonly SCRIPT_VERSION="4.7.2-hardened-cloudflare-authentik"
 readonly SCRIPT_NAME="deploy-dockhand-authentik.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/dockhand-stack"
@@ -499,7 +499,7 @@ setup_dockhand() {
   # 2FA gates all access and the :ro mount removes the easiest abuse path.
   # If you genuinely need write access to host files from the Dockhand UI,
   # change "/:/host:ro" to "/:/host" below and re-run:
-  #   docker compose -f /opt/dockhand-stack/docker-compose.dockhand.yml up -d --force-recreate
+  #   docker compose -p dockhand -f /opt/dockhand-stack/docker-compose.dockhand.yml up -d --force-recreate
   cat > "${STACK_DIR}/docker-compose.dockhand.yml" << 'COMPOSE_DOCKHAND'
 services:
   dockhand:
@@ -521,8 +521,8 @@ networks:
 COMPOSE_DOCKHAND
 
   info "Pulling Dockhand image..."
-  docker compose -f "${STACK_DIR}/docker-compose.dockhand.yml" pull
-  docker compose -f "${STACK_DIR}/docker-compose.dockhand.yml" up -d --force-recreate
+  docker compose -p dockhand -f "${STACK_DIR}/docker-compose.dockhand.yml" pull
+  docker compose -p dockhand -f "${STACK_DIR}/docker-compose.dockhand.yml" up -d --force-recreate
 
   info "Waiting for Dockhand to be ready..."
   for i in $(seq 1 30); do
@@ -667,7 +667,20 @@ services:
       # nginx-proxy-manager collection, so they are not listed again.
       # http-dos = L7 flood detection; whitelist-good-actors = avoid banning
       # legit crawlers (Google/Bing/etc). All free hub collections, log-based.
-      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/nginx-proxy-manager crowdsecurity/linux crowdsecurity/http-cve crowdsecurity/http-dos crowdsecurity/whitelist-good-actors
+      # All free community-hub collections, scoped to what this VPS actually
+      # has an acquisition source for (SSH/auth.log, syslog, NPM/nginx web logs):
+      #   sshd                  - SSH brute force + CVEs (auth.log)
+      #   linux                 - host/system scenarios (syslog)
+      #   nginx-proxy-manager   - NPM access/error log scenarios (web)
+      #   base-http-scenarios   - generic web attacks: scanning, probing, path
+      #                           traversal, bad user-agents, crawlers (web)
+      #   http-cve              - known HTTP CVE exploit attempts (web)
+      #   http-dos              - HTTP denial-of-service (web)
+      #   whitelist-good-actors - cuts false positives (search-engine/CDN IPs)
+      # NOT enabled (no acquisition source / needs extra wiring): iptables
+      # (no nft/iptables log feed), appsec-* (needs the AppSec/WAF engine + a
+      # bouncer that forwards requests), postfix/mariadb/etc (no such service).
+      - COLLECTIONS=crowdsecurity/sshd crowdsecurity/linux crowdsecurity/nginx-proxy-manager crowdsecurity/base-http-scenarios crowdsecurity/http-cve crowdsecurity/http-dos crowdsecurity/whitelist-good-actors
       # Pre-register the Cloudflare Worker bouncer so it authenticates to LAPI
       # with this exact key (setup_cloudflare_bouncer writes it into the config).
       - BOUNCER_KEY_cloudflarebouncer=${CF_BOUNCER_KEY}
@@ -683,11 +696,11 @@ COMPOSE_CROWDSEC
 
 
   info "Pulling images..."
-  docker compose -f "${STACK_DIR}/docker-compose.npm.yml" pull
-  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" pull
+  docker compose -p npm -f "${STACK_DIR}/docker-compose.npm.yml" pull
+  docker compose -p crowdsec -f "${STACK_DIR}/docker-compose.crowdsec.yml" pull
 
   info "Starting NPM..."
-  docker compose -f "${STACK_DIR}/docker-compose.npm.yml" up -d
+  docker compose -p npm -f "${STACK_DIR}/docker-compose.npm.yml" up -d
   for i in $(seq 1 30); do
     local has_80=false has_443=false has_81=false
     ss -tlnp 2>/dev/null | grep -q ':80[[:space:]]' && has_80=true
@@ -710,8 +723,8 @@ COMPOSE_CROWDSEC
   info "Deploying Authentik (postgres + redis + server + worker)..."
   gen_authentik_files
   setup_authentik_snippets      # write nginx forward-auth snippets into NPM custom dir
-  docker compose -f "${STACK_DIR}/docker-compose.authentik.yml" pull
-  docker compose -f "${STACK_DIR}/docker-compose.authentik.yml" up -d
+  docker compose -p authentik -f "${STACK_DIR}/docker-compose.authentik.yml" pull
+  docker compose -p authentik -f "${STACK_DIR}/docker-compose.authentik.yml" up -d
   info "Waiting for Authentik server (first boot runs migrations - up to ~3 min)..."
   # Probe from the HOST against the published API port (127.0.0.1:9000). The
   # goauthentik image ships NO curl, so 'docker exec ... curl' always failed in
@@ -763,7 +776,7 @@ COMPOSE_CROWDSEC
   printf "\r" >&2
 
   info "Starting CrowdSec..."
-  docker compose -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec
+  docker compose -p crowdsec -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec
   for i in $(seq 1 30); do
     docker ps --format '{{.Names}}' | grep -qx "crowdsec" && { success "CrowdSec container running"; break; }
     printf "${C_DIM}  Waiting for CrowdSec container... (%d/30)${C_R}\r" "$i" >&2
@@ -2143,7 +2156,7 @@ ${C_B}${C_YEL}Credential files (root-only, mode 600):${C_R}
 ${C_B}Troubleshooting:${C_R}
   Verify:  sudo bash ${STACK_DIR}/verify-stack.sh   (re-runnable health + security audit)
   Logs:    docker logs -f npm    docker logs -f dockhand    docker logs -f authentik-server
-  Restart: cd ${STACK_DIR} && docker compose -f docker-compose.npm.yml restart
+  Restart: docker compose -p npm -f ${STACK_DIR}/docker-compose.npm.yml restart   (per-stack project: -p npm|crowdsec|authentik|dockhand)
   FW:      ${fw_cmd}
   CrowdSec: docker exec crowdsec cscli metrics   docker exec crowdsec cscli alerts list
   Log:     ${LOG_FILE}
