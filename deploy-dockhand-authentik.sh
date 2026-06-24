@@ -12,12 +12,15 @@ fi
 #                                  Cloudflare Worker bouncer (edge IP-ban enforcement).
 #                                  If unset, the script prompts; blank = configure later.
 #     CF_BOUNCER_ACTION=ban        edge action for banned IPs: ban | captcha (default ban)
+#     CROWDSEC_ENROLL_KEY=<key>    optional CrowdSec Console enroll key from
+#                                  app.crowdsec.net (Security Engines > Enroll). If set,
+#                                  the instance auto-enrolls; else enroll manually later.
 #     LOCK_HTTP_TO_CLOUDFLARE=true restrict 80/443 to Cloudflare IP ranges in the
 #                                  firewall (default false; turn on once all DNS is proxied)
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.7.4-hardened-cloudflare-authentik"
+readonly SCRIPT_VERSION="4.8.0-hardened-cloudflare-authentik"
 readonly SCRIPT_NAME="deploy-dockhand-authentik.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/dockhand-stack"
@@ -176,9 +179,14 @@ _on_exit() {
     printf "${C_B}  ${C_YEL}Authentik password:   %s${C_R}\n" "$authentik_pass"
     printf "${C_B}  ${C_RED}Change this password after first login!${C_R}\n"
     printf "\n"
-    printf "${C_B}  ${C_YEL}-- First login / 2FA --${C_R}\n"
+    printf "${C_B}  ${C_YEL}-- First login / MFA (ENFORCED) --${C_R}\n"
     printf "${C_B}  Browse to https://authentik.%s and log in as akadmin.${C_R}\n" "$DOMAIN"
-    printf "${C_B}  Set up a TOTP authenticator in the Authentik UI (akadmin -> MFA devices).${C_R}\n"
+    printf "${C_B}  MFA is ENFORCED: you are REQUIRED to enroll a TOTP authenticator on first\n"
+    printf "  login (have your authenticator app ready). Applies to every user.${C_R}\n"
+    if [[ -s "${AUTHENTIK_DIR}/.akadmin_recovery_url" ]]; then
+      printf "${C_B}  ${C_RED}Recovery URL (use ONLY if you lose the TOTP device) - SAVE IT SECURELY:${C_R}\n"
+      printf "${C_B}  %s${C_R}\n" "$(cat "${AUTHENTIK_DIR}/.akadmin_recovery_url" 2>/dev/null)"
+    fi
     printf "\n"
     printf "${C_B}  All credentials are stored (mode 600) under: %s${C_R}\n" "$STACK_DIR"
   fi
@@ -500,6 +508,18 @@ setup_dockhand() {
   # If you genuinely need write access to host files from the Dockhand UI,
   # change "/:/host:ro" to "/:/host" below and re-run:
   #   docker compose -p dockhand -f /opt/dockhand-stack/docker-compose.dockhand.yml up -d --force-recreate
+  #
+  # STACK-DIR mount (identical path, RW): without this, the infra stacks
+  # (npm/authentik/crowdsec/dockhand) show as UNTAGGED and cannot be adopted in
+  # the Dockhand UI. Reason: their compose-project labels point at the HOST path
+  # ${STACK_DIR}/docker-compose.*.yml; Dockhand's HostPath resolver can only reach
+  # that via the read-only /host mount, so it can see-but-not-edit the compose and
+  # refuses to manage the stack. Bind-mounting ${STACK_DIR} at the IDENTICAL path
+  # RW makes the label path resolve to a writable file -> the stacks become
+  # editable + adoptable. docker.sock already makes Dockhand root-equivalent, so
+  # this opens no new attack path beyond the existing one.
+  # /opt/apps is mounted the same way so host-deployed APP stacks (deployed with
+  # `docker compose` under /opt/apps/<app>/) are likewise adoptable, not untagged.
   cat > "${STACK_DIR}/docker-compose.dockhand.yml" << 'COMPOSE_DOCKHAND'
 services:
   dockhand:
@@ -511,6 +531,8 @@ services:
       - no-new-privileges:true
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - /opt/dockhand-stack:/opt/dockhand-stack
+      - /opt/apps:/opt/apps
       - ./dockhand-data:/app/data
       - /:/host:ro
     networks:
@@ -1161,6 +1183,42 @@ bootstrap_authentik() {
   done; printf "\r" >&2
   $healthy && success "Authentik outpost healthy - Dockhand forward-auth is live" \
             || warn "Outpost not healthy yet. It may still be starting - check: docker logs authentik-server"
+
+  # 7. Enforce TOTP MFA for every user (fail-safe; never locks anyone out).
+  enforce_authentik_mfa
+}
+
+enforce_authentik_mfa() {
+  # Force TOTP MFA for ALL Authentik users (incl. akadmin) on next login by
+  # flipping the default authentication flow's Authenticator Validation stage from
+  # not_configured_action=skip (MFA optional) to =configure WITH the TOTP setup
+  # stage attached -> users without a device are forced to enroll inline (no
+  # lockout). Stage PKs are resolved by their stable slug. Fully fail-safe: any
+  # failure leaves MFA OPTIONAL and warns, never a half-broken login flow.
+  local vpk tpk got rec
+  vpk=$(_ak_api "/stages/authenticator/validate/" 2>/dev/null | jq -r '.results[]? | select(.name=="default-authentication-mfa-validation") | .pk' 2>/dev/null | head -1)
+  tpk=$(_ak_api "/stages/authenticator/totp/" 2>/dev/null | jq -r '.results[]? | select(.name=="default-authenticator-totp-setup") | .pk' 2>/dev/null | head -1)
+  if [[ -z "$vpk" || -z "$tpk" ]]; then
+    warn "Could not resolve Authentik MFA stages - MFA left OPTIONAL. Enforce later in the UI:"
+    warn "  Flows & Stages > Stages > default-authentication-mfa-validation > 'Not configured action' = Configure + add the TOTP setup stage."
+    return 0
+  fi
+  _ak_api "/stages/authenticator/validate/${vpk}/" -X PATCH \
+    -d "$(jq -nc --arg t "$tpk" '{not_configured_action:"configure", configuration_stages:[$t]}')" >/dev/null 2>&1 || true
+  got=$(_ak_api "/stages/authenticator/validate/${vpk}/" 2>/dev/null | jq -r '.not_configured_action // empty' 2>/dev/null)
+  if [[ "$got" != "configure" ]]; then
+    warn "Authentik MFA enforcement did not apply - MFA left OPTIONAL. Set it in the UI (see hint above)."
+    return 0
+  fi
+  success "Authentik MFA ENFORCED - every user (incl. akadmin) must enroll TOTP on next login"
+  # Lockout escape hatch: a one-time akadmin recovery URL (valid ~1y) in case the
+  # TOTP device is ever lost. Saved mode-600 + surfaced in the final summary.
+  rec=$(docker exec authentik-server ak create_recovery_key 1 akadmin 2>/dev/null | grep -oE '/recovery/use-token/[^ "]+' | head -1)
+  if [[ -n "$rec" ]]; then
+    printf 'https://authentik.%s%s\n' "$DOMAIN" "$rec" > "${AUTHENTIK_DIR}/.akadmin_recovery_url"
+    chmod 600 "${AUTHENTIK_DIR}/.akadmin_recovery_url" 2>/dev/null || true
+    info "akadmin recovery URL saved to ${AUTHENTIK_DIR}/.akadmin_recovery_url (use if the TOTP device is lost)"
+  fi
 }
 
 setup_authentik_snippets() {
@@ -1396,7 +1454,7 @@ ${NPM_LOGS_DIR}/*.log {
     create 0644 root root
     sharedscripts
     postrotate
-        docker kill --signal='USR1' npm 2>/dev/null || true
+        docker exec npm nginx -s reload 2>/dev/null || true
     endscript
 }
 EOF
@@ -1669,9 +1727,13 @@ setup_cloudflare_bouncer() {
     printf "\n${C_B}Cloudflare Worker bouncer${C_R} blocks banned IPs at Cloudflare's edge.\n" >&2
     printf "It needs a Cloudflare ${C_B}User${C_R} API token (My Profile > API Tokens, NOT an\n" >&2
     printf "Account token). Supplying it now will deploy a Worker + KV to your account.\n" >&2
-    printf "Required perms: Account(Workers KV Storage:Edit, Workers Scripts:Edit,\n" >&2
-    printf "  Turnstile:Edit, Account Settings:Read, Account Analytics:Read),\n" >&2
+    printf "${C_B}Required perms${C_R} (CrowdSec's official set - the bouncer validates ALL of\n" >&2
+    printf "these, so do not drop any): Account(Workers KV Storage:Edit, Workers\n" >&2
+    printf "  Scripts:Edit, Turnstile:Edit, Account Settings:Read, Account Analytics:Read),\n" >&2
     printf "  User(User Details:Read), Zone(DNS:Read, Workers Routes:Edit, Zone:Read)\n" >&2
+    printf "${C_B}Minimize by SCOPE${C_R} (not by removing perms): under 'Account Resources'\n" >&2
+    printf "  pick ${C_B}Include > <your account>${C_R} only, and under 'Zone Resources' pick\n" >&2
+    printf "  ${C_B}Include > Specific zone > ${DOMAIN}${C_R} only - never 'All accounts/zones'.\n" >&2
     printf "Leave blank to skip the live deploy and finish later.\n" >&2
     read -rsp "Cloudflare API token (hidden, Enter to skip): " CF_API_TOKEN >&2 || true
     printf "\n" >&2
@@ -1733,6 +1795,12 @@ setup_cloudflare_bouncer() {
     zone_id=$(echo "$zjson" | jq -r '.result[0].id // empty' 2>/dev/null || true)
     account_id=$(echo "$zjson" | jq -r '.result[0].account.id // empty' 2>/dev/null || true)
     account_name=$(echo "$zjson" | jq -r '.result[0].account.name // empty' 2>/dev/null || true)
+    # The worker-bouncer config validator FATALs on account_name chars outside
+    # [A-Za-z0-9 ._-()&+@:,]. Cloudflare account names routinely contain an
+    # apostrophe ("Bob's Account") -> the bouncer postinst crashes, which leaves
+    # dpkg half-configured and makes EVERY later apt-get install exit 1 (silently
+    # breaking AIDE etc. in harden.sh). Strip the disallowed chars here.
+    account_name=$(printf '%s' "$account_name" | tr -cd 'A-Za-z0-9 ._()&+@:,-')
     if [[ -n "$zone_id" ]]; then
       success "Found Cloudflare zone for ${DOMAIN} (zone ${zone_id:0:8}...)"
     else
@@ -1860,15 +1928,30 @@ setup_crowdsec_console() {
   printf "\r" >&2
 
   if ! $console_ready; then
-    warn "CrowdSec LAPI not ready - Console enrollment skipped. Enroll manually later with: docker exec crowdsec cscli console enroll --auto"
+    warn "CrowdSec LAPI not ready - Console enrollment skipped. Enroll later: docker exec crowdsec cscli console enroll <YOUR_ENROLL_KEY>"
     return 0
   fi
 
-  if docker exec crowdsec cscli console enroll --auto &>/dev/null; then
-    success "CrowdSec enrolled in Console"
-    info "View alerts, decisions and metrics at: https://app.crowdsec.net/"
+  # Console enrollment REQUIRES a per-account enroll key from https://app.crowdsec.net
+  # (Security Engines > Enroll your instance). There is NO key-less auto-enroll -
+  # the old `cscli console enroll --auto` (no key) ALWAYS failed, which is why
+  # auto-enroll never worked; only the manual key flow does. Provide the key via
+  # CROWDSEC_ENROLL_KEY to enroll automatically; otherwise print the manual steps.
+  local enroll_key="${CROWDSEC_ENROLL_KEY:-}"
+  if [[ -z "$enroll_key" ]]; then
+    info "Console enrollment skipped (optional). To enroll your instance:"
+    info "  1) https://app.crowdsec.net  >  Security Engines  >  Enroll your instance  (copy the key, starts 'cs...')"
+    info "  2) docker exec crowdsec cscli console enroll <KEY>"
+    info "  3) Back in the Console, click Accept to approve this engine."
+    info "  (or re-run this deploy with CROWDSEC_ENROLL_KEY=<KEY> to do it automatically.)"
+    return 0
+  fi
+
+  if docker exec crowdsec cscli console enroll "$enroll_key" &>/dev/null; then
+    success "CrowdSec enrolled in Console - click Accept at https://app.crowdsec.net to approve it"
   else
-    warn "CrowdSec Console enrollment failed or already enrolled. Check: docker logs crowdsec"
+    warn "Console enrollment failed (already enrolled, or bad/expired key). Check: docker logs crowdsec"
+    warn "  Retry: docker exec crowdsec cscli console enroll <KEY>"
   fi
 }
 
@@ -2134,10 +2217,12 @@ ${C_B}Authentik${C_R}
   Data:       ${AUTHENTIK_DIR}/{media,templates,blueprints,certs,postgres,redis}
   Bootstrap:  Proxy provider 'dockhand' + embedded outpost created via admin API
 
-${C_B}CrowdSec Console${C_R}
+${C_B}CrowdSec Console${C_R} (optional cloud dashboard)
   URL:      https://app.crowdsec.net/
-  Note:     This CrowdSec instance is enrolled in the Console (cloud dashboard).
-            If enrollment failed, run: docker exec crowdsec cscli console enroll --auto
+  Enroll:   1) app.crowdsec.net > Security Engines > Enroll your instance (copy key)
+            2) docker exec crowdsec cscli console enroll <KEY>
+            3) click Accept in the Console to approve this engine
+            (or re-run with CROWDSEC_ENROLL_KEY=<KEY> to enroll automatically)
 
 ${C_B}Cloudflare Worker bouncer${C_R}
   Role:     Blocks CrowdSec-banned IPs at Cloudflare's edge (before your VPS).
@@ -2156,7 +2241,7 @@ ${C_B}${C_YEL}Done automatically:${C_R}
   - Let's Encrypt SSL certificates requested and forced (where DNS resolved)
   - NPM admin password changed to a random value (saved mode 600)
   - Authentik akadmin password randomized (saved mode 600)
-  - CrowdSec Console enrollment attempted
+  - CrowdSec Console enrolled (only if CROWDSEC_ENROLL_KEY was provided; else manual)
   - Authentik 2FA protecting Dockhand (nginx forward-auth + embedded proxy outpost)
   - CrowdSec bans enforced incl. Docker-published ports (DOCKER-USER chain)
   - CrowdSec DETECTION wired for SSH + system logs (rsyslog + auth.log/syslog acquisition)

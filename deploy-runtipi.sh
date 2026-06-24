@@ -1113,7 +1113,7 @@ ${NPM_LOGS_DIR}/*.log {
     create 0644 root root
     sharedscripts
     postrotate
-        docker kill --signal='USR1' npm 2>/dev/null || true
+        docker exec npm nginx -s reload 2>/dev/null || true
     endscript
 }
 EOF
@@ -1424,6 +1424,10 @@ setup_cloudflare_bouncer() {
     zone_id=$(echo "$zjson" | jq -r '.result[0].id // empty' 2>/dev/null || true)
     account_id=$(echo "$zjson" | jq -r '.result[0].account.id // empty' 2>/dev/null || true)
     account_name=$(echo "$zjson" | jq -r '.result[0].account.name // empty' 2>/dev/null || true)
+    # Strip chars the worker-bouncer config validator rejects (e.g. an apostrophe
+    # in "Bob's Account") — otherwise its postinst FATALs, wedging dpkg + breaking
+    # later apt installs. Allowed: letters digits space . _ - ( ) & + @ : ,
+    account_name=$(printf '%s' "$account_name" | tr -cd 'A-Za-z0-9 ._()&+@:,-')
     if [[ -n "$zone_id" ]]; then
       success "Found Cloudflare zone for ${DOMAIN} (zone ${zone_id:0:8}...)"
     else

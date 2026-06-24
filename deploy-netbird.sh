@@ -1874,7 +1874,7 @@ ${TRAEFIK_LOG_DIR}/*.log {
     create 0644 root root
     sharedscripts
     postrotate
-        docker kill --signal='USR1' traefik 2>/dev/null || true
+        docker kill --signal='HUP' traefik 2>/dev/null || true
     endscript
 }
 EOF
@@ -2145,6 +2145,10 @@ setup_cloudflare_bouncer() {
     zone_id=$(echo "$zjson" | jq -r '.result[0].id // empty' 2>/dev/null || true)
     account_id=$(echo "$zjson" | jq -r '.result[0].account.id // empty' 2>/dev/null || true)
     account_name=$(echo "$zjson" | jq -r '.result[0].account.name // empty' 2>/dev/null || true)
+    # Strip chars the worker-bouncer config validator rejects (e.g. an apostrophe
+    # in "Bob's Account") — otherwise its postinst FATALs, wedging dpkg + breaking
+    # later apt installs. Allowed: letters digits space . _ - ( ) & + @ : ,
+    account_name=$(printf '%s' "$account_name" | tr -cd 'A-Za-z0-9 ._()&+@:,-')
     # Sanitize account_name: the CrowdSec CF bouncer rejects characters outside
     # [A-Za-z0-9 ._-()&+@:,]. Cloudflare account names can contain apostrophes
     # (e.g. "user@gmail.com's Account") which crash its config parser with a

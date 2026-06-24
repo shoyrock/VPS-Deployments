@@ -11,13 +11,24 @@ IFS=$'\n\t'
 readonly LOGFILE="/var/log/harden.log"
 readonly BAKSUF=".harden-backup-$(date +%Y%m%d-%H%M%S)"
 readonly GEOIP_DIR="/usr/local/bin/geoip-block"
-# NPM admin panel (port 81) exposure:
-#   0 = publish on 0.0.0.0:81  -> reachable at http://<vps-ip>:81 (convenient; the
-#       login is exposed to the internet, so set a STRONG password + keep CrowdSec).
-#   1 = bind to 127.0.0.1:81   -> admin reachable ONLY via SSH tunnel (most secure):
+# NPM admin panel (port 81) exposure. DEFAULT 1 (locked down): dockerd publishes
+# 81 on 0.0.0.0, BYPASSING UFW, so the only thing keeping the admin login off the
+# internet is the cloud provider's security list. That is a single point of
+# failure (and absent on providers without a cloud firewall) -> bind to localhost
+# by default and reach it over an SSH tunnel.
+#   1 = bind to 127.0.0.1:81   -> admin reachable ONLY via SSH tunnel (default, most secure):
 #       ssh -L 8181:127.0.0.1:81 root@<vps-ip>  then open http://localhost:8181
-# Override per run, e.g.:  LOCKDOWN_NPM_ADMIN=1 bash harden.sh
-LOCKDOWN_NPM_ADMIN="${LOCKDOWN_NPM_ADMIN:-0}"
+#   0 = publish on 0.0.0.0:81  -> reachable at http://<vps-ip>:81 (convenient but the
+#       login faces the internet unless a cloud firewall blocks 81; set a STRONG password).
+# Override per run, e.g.:  LOCKDOWN_NPM_ADMIN=0 bash harden.sh
+LOCKDOWN_NPM_ADMIN="${LOCKDOWN_NPM_ADMIN:-1}"
+# GeoIP allowlist (harden_geoip): default-DENY — block ALL countries except the
+# ones you allow. Gates 443 (web, via DOCKER-USER since NPM is a container) and,
+# by default, 22 (SSH, via INPUT). Port 80 stays OPEN so Let's Encrypt HTTP-01
+# keeps working. Overrides:
+#   GEOIP_ALLOW="us,ca,gb"   non-interactive: skip the continent menu entirely.
+#   GEOIP_GATE_SSH=0         do NOT geo-gate SSH (port 22). Default 1 (gate it).
+GEOIP_GATE_SSH="${GEOIP_GATE_SSH:-1}"
 # Colors (TTY only)
 if [[ -t 1 ]]; then
   readonly C_RST='\033[0m' C_BLD='\033[1m' C_GRN='\033[1;32m'
@@ -109,7 +120,7 @@ user_confirm() {
     printf "  OS: %s | Backup suffix: %s\n" "$OS_FAMILY" "$BAKSUF"
     printf "  Log: %s\n\n" "$LOGFILE"
     printf "Measures:\n"
-    printf "  Kernel sysctl         Firewall rate limit   GeoIP blocking\n"
+    printf "  Kernel sysctl         Firewall rate limit   GeoIP allowlist (deny-all)\n"
     printf "  CrowdSec (local)      AIDE file integrity   Auto security updates\n"
     printf "  NPM admin port (81)   Docker hardening      Daily local backups\n"
     printf "  SSH daemon hardening  (key-only root, password auth off if key present)\n\n"
@@ -257,83 +268,606 @@ harden_firewall() {
 }
 
 # ---------------------------------------------------------------------------
-# 4. GeoIP Blocking (free ipdeny lists) — rollback: rm $GEOIP_DIR
+# 4. GeoIP ALLOWLIST (default-deny; free ipdeny.com lists) — rollback:
+#    GEOIP_DISABLE=1 bash $GEOIP_DIR/apply-geoip.sh ; rm -rf $GEOIP_DIR
+#    Blocks ALL countries except the ones you select. Gates 443 (web — filtered
+#    in DOCKER-USER because NPM is a container and bypasses INPUT) and, by
+#    default, 22 (SSH — INPUT). Port 80 is LEFT OPEN so Let's Encrypt HTTP-01
+#    validation (arrives from many countries) keeps working; 80 only serves the
+#    ACME challenge + a 301 redirect, no app content. Always-allowed carve-outs:
+#    established conns, loopback, RFC1918/docker nets, Cloudflare edge ranges.
+#    Set GEOIP_ALLOW="us,ca,gb" to skip the menu.
 # ---------------------------------------------------------------------------
+
+# ------- country data: single source of truth (code | continent# | Name) -----
+# Continents: 1 North America  2 South America  3 Europe  4 Asia  5 Africa  6 Oceania
+# (codes are ipdeny.com zone filenames). Both the menu and the name lookups are
+# derived from this one table, so there is no drift between them.
+geoip_country_table() {
+    cat <<'TBL'
+us|1|United States
+ca|1|Canada
+mx|1|Mexico
+gt|1|Guatemala
+bz|1|Belize
+sv|1|El Salvador
+hn|1|Honduras
+ni|1|Nicaragua
+cr|1|Costa Rica
+pa|1|Panama
+bs|1|Bahamas
+cu|1|Cuba
+jm|1|Jamaica
+ht|1|Haiti
+do|1|Dominican Republic
+tt|1|Trinidad and Tobago
+bb|1|Barbados
+pr|1|Puerto Rico
+gl|1|Greenland
+bm|1|Bermuda
+ag|1|Antigua and Barbuda
+dm|1|Dominica
+gd|1|Grenada
+kn|1|Saint Kitts and Nevis
+lc|1|Saint Lucia
+vc|1|Saint Vincent and the Grenadines
+br|2|Brazil
+ar|2|Argentina
+cl|2|Chile
+co|2|Colombia
+pe|2|Peru
+ve|2|Venezuela
+ec|2|Ecuador
+bo|2|Bolivia
+py|2|Paraguay
+uy|2|Uruguay
+gy|2|Guyana
+sr|2|Suriname
+gb|3|United Kingdom
+ie|3|Ireland
+fr|3|France
+de|3|Germany
+es|3|Spain
+pt|3|Portugal
+it|3|Italy
+nl|3|Netherlands
+be|3|Belgium
+lu|3|Luxembourg
+ch|3|Switzerland
+at|3|Austria
+dk|3|Denmark
+se|3|Sweden
+no|3|Norway
+fi|3|Finland
+is|3|Iceland
+pl|3|Poland
+cz|3|Czechia
+sk|3|Slovakia
+hu|3|Hungary
+ro|3|Romania
+bg|3|Bulgaria
+gr|3|Greece
+hr|3|Croatia
+si|3|Slovenia
+rs|3|Serbia
+ba|3|Bosnia and Herzegovina
+me|3|Montenegro
+mk|3|North Macedonia
+al|3|Albania
+ee|3|Estonia
+lv|3|Latvia
+lt|3|Lithuania
+ua|3|Ukraine
+by|3|Belarus
+md|3|Moldova
+cy|3|Cyprus
+mt|3|Malta
+li|3|Liechtenstein
+mc|3|Monaco
+ad|3|Andorra
+sm|3|San Marino
+ru|3|Russia
+cn|4|China
+jp|4|Japan
+kr|4|South Korea
+kp|4|North Korea
+in|4|India
+pk|4|Pakistan
+bd|4|Bangladesh
+lk|4|Sri Lanka
+np|4|Nepal
+bt|4|Bhutan
+mv|4|Maldives
+mm|4|Myanmar
+th|4|Thailand
+vn|4|Vietnam
+la|4|Laos
+kh|4|Cambodia
+my|4|Malaysia
+sg|4|Singapore
+id|4|Indonesia
+ph|4|Philippines
+bn|4|Brunei
+mn|4|Mongolia
+kz|4|Kazakhstan
+uz|4|Uzbekistan
+tm|4|Turkmenistan
+tj|4|Tajikistan
+kg|4|Kyrgyzstan
+af|4|Afghanistan
+ir|4|Iran
+iq|4|Iraq
+sa|4|Saudi Arabia
+ae|4|United Arab Emirates
+qa|4|Qatar
+bh|4|Bahrain
+kw|4|Kuwait
+om|4|Oman
+ye|4|Yemen
+jo|4|Jordan
+il|4|Israel
+lb|4|Lebanon
+sy|4|Syria
+tr|4|Turkey
+ge|4|Georgia
+am|4|Armenia
+az|4|Azerbaijan
+hk|4|Hong Kong
+tw|4|Taiwan
+za|5|South Africa
+eg|5|Egypt
+ng|5|Nigeria
+ke|5|Kenya
+gh|5|Ghana
+et|5|Ethiopia
+tz|5|Tanzania
+ug|5|Uganda
+dz|5|Algeria
+ma|5|Morocco
+tn|5|Tunisia
+ly|5|Libya
+sd|5|Sudan
+sn|5|Senegal
+ci|5|Ivory Coast
+cm|5|Cameroon
+ao|5|Angola
+mz|5|Mozambique
+zm|5|Zambia
+zw|5|Zimbabwe
+bw|5|Botswana
+na|5|Namibia
+mw|5|Malawi
+rw|5|Rwanda
+so|5|Somalia
+cd|5|DR Congo
+cg|5|Congo
+ga|5|Gabon
+ml|5|Mali
+bf|5|Burkina Faso
+ne|5|Niger
+td|5|Chad
+mr|5|Mauritania
+gm|5|Gambia
+gw|5|Guinea-Bissau
+sl|5|Sierra Leone
+lr|5|Liberia
+tg|5|Togo
+bj|5|Benin
+mg|5|Madagascar
+mu|5|Mauritius
+au|6|Australia
+nz|6|New Zealand
+pg|6|Papua New Guinea
+fj|6|Fiji
+sb|6|Solomon Islands
+vu|6|Vanuatu
+nc|6|New Caledonia
+pf|6|French Polynesia
+ws|6|Samoa
+to|6|Tonga
+ki|6|Kiribati
+fm|6|Micronesia
+mh|6|Marshall Islands
+nr|6|Nauru
+pw|6|Palau
+tv|6|Tuvalu
+TBL
+}
+
+geoip_continent_name() {
+    case "$1" in
+        1) echo "North America" ;; 2) echo "South America" ;; 3) echo "Europe" ;;
+        4) echo "Asia" ;; 5) echo "Africa" ;; 6) echo "Oceania" ;; *) echo "?" ;;
+    esac
+}
+# Space-separated iso2 codes belonging to continent $1.
+geoip_continent_codes() { geoip_country_table | awk -F'|' -v k="$1" '$2==k{printf "%s ",$1}'; }
+# Human name for one iso2 code (empty if unknown).
+geoip_name() { geoip_country_table | awk -F'|' -v c="$1" '$1==c{print $3; exit}'; }
+# Continent number for one iso2 code (empty if unknown).
+geoip_continent_of() { geoip_country_table | awk -F'|' -v c="$1" '$1==c{print $2; exit}'; }
+# Map a list of codes -> "Name, Name, Name" (falls back to the code if unknown).
+geoip_names() {
+    local IFS=$' \t\n' out="" c nm
+    for c in $1; do nm=$(geoip_name "$c"); [[ -z "$nm" ]] && nm="$c"; out+=", $nm"; done
+    printf '%s' "${out#, }"
+}
+
+# Best-effort: the IP of the admin running THIS session, so we can pre-allow the
+# country you're connecting from. sudo (auto-elevate) wipes SSH_* env, so fall
+# back to utmp (who) and the live :22 socket (ss).
+geoip_client_ip() {
+    local ip=""
+    [[ -n "${SSH_CONNECTION:-}" ]] && ip="${SSH_CONNECTION%% *}"
+    [[ -z "$ip" ]] && ip=$(who am i 2>/dev/null | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -1)
+    [[ -z "$ip" ]] && ip=$(who      2>/dev/null | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -1)
+    [[ -z "$ip" ]] && ip=$(ss -tnH 2>/dev/null | awk '$1=="ESTAB" && $4 ~ /:22$/ {print $5}' | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}' | head -1)
+    printf '%s' "$ip"
+}
+# ISO2 country of an IP via ipapi.co (best effort; empty on failure/private IP).
+geoip_country_of_ip() {
+    [[ -z "${1:-}" ]] && return 0
+    curl -fsSL --max-time 8 "https://ipapi.co/${1}/country/" 2>/dev/null | tr 'A-Z' 'a-z' | grep -E '^[a-z]{2}$' || true
+}
+
+# Build the allowed-country list into global GEOIP_SELECTED (space-sep iso2).
+# GEOIP_MYCC (set by harden_geoip) = the country you're connecting from.
+geoip_select_countries() {
+    local IFS=$' \t\n'
+    GEOIP_SELECTED=""
+    # Non-interactive override (mirrors the CF_API_TOKEN env pattern).
+    if [[ -n "${GEOIP_ALLOW:-}" ]]; then
+        GEOIP_SELECTED=$(printf '%s' "$GEOIP_ALLOW" | tr 'A-Z,;' 'a-z  ' | tr -s ' ' | sed 's/^ //;s/ $//') || GEOIP_SELECTED=""
+        info "GEOIP_ALLOW set — allowing: $(geoip_names "$GEOIP_SELECTED")"
+        return
+    fi
+    if [[ ! -t 0 ]]; then
+        warn "No TTY and GEOIP_ALLOW unset — skipping GeoIP allowlist (a default-deny with no list would block everything)"
+        return
+    fi
+
+    # Pre-allow the country (and offer the whole region) you're connecting from.
+    local seedcc="${GEOIP_MYCC:-}" seedcont=""
+    if [[ -n "$seedcc" ]]; then
+        seedcont=$(geoip_continent_of "$seedcc")
+        GEOIP_SELECTED=" $seedcc"
+        printf "\n${C_GRN}Detected your connection from: %s (%s) — pre-allowed.${C_RST}\n" "$(geoip_name "$seedcc")" "$seedcc"
+        if [[ -n "$seedcont" ]]; then
+            local regans
+            read -rp "Allow your whole region ($(geoip_continent_name "$seedcont")) too? [Y/n]: " regans
+            [[ "$regans" =~ ^[Nn]$ ]] || GEOIP_SELECTED+=" $(geoip_continent_codes "$seedcont")"
+        fi
+    fi
+
+    printf "\n${C_BLD}GeoIP allowlist — block ALL countries except the ones you allow.${C_RST}\n"
+    printf "Choose more continents to add countries from (or just confirm at the end):\n\n"
+    local i star
+    for i in 1 2 3 4 5 6; do
+        star=""; [[ -n "$seedcont" && "$i" == "$seedcont" ]] && star="   ${C_GRN}<- your region${C_RST}"
+        printf "  %s) %s%b\n" "$i" "$(geoip_continent_name "$i")" "$star"
+    done
+    printf "\n"
+    local picks
+    read -rp "Continents to choose from (e.g. 1 3; blank to skip): " picks
+    picks=$(printf '%s' "$picks" | tr ',' ' ')
+
+    local p codes ans n code sel idx
+    local -a arr
+    for p in $picks; do
+        codes=$(geoip_continent_codes "$p")
+        [[ -z "${codes// /}" ]] && { warn "Skipping invalid choice: $p"; continue; }
+        read -ra arr <<< "$codes"
+        printf "\n${C_BLD}%s${C_RST} (%s countries)\n" "$(geoip_continent_name "$p")" "${#arr[@]}"
+        read -rp "Allow ALL of $(geoip_continent_name "$p")? [Y/n]: " ans
+        if [[ "$ans" =~ ^[Nn]$ ]]; then
+            n=1
+            for code in "${arr[@]}"; do printf "  %2s) %s\n" "$n" "$(geoip_name "$code")"; n=$((n+1)); done
+            read -rp "  Numbers to ALLOW (e.g. 1 5 9): " sel
+            sel=$(printf '%s' "$sel" | tr ',' ' ')
+            for idx in $sel; do
+                [[ "$idx" =~ ^[0-9]+$ ]] || continue
+                code="${arr[$((idx-1))]:-}"
+                [[ -n "$code" ]] && GEOIP_SELECTED+=" $code"
+            done
+        else
+            GEOIP_SELECTED+=" $codes"
+        fi
+    done
+
+    # Escape hatch: extra countries anywhere, typed by NAME (or code).
+    local extra tok mc
+    local -a extra_arr
+    read -rp $'\nExtra countries by NAME (e.g. Japan, Australia) or blank: ' extra
+    if [[ -n "${extra// /}" ]]; then
+        IFS=',' read -ra extra_arr <<< "$extra"
+        for tok in "${extra_arr[@]}"; do
+            tok=$(printf '%s' "$tok" | sed 's/^ *//;s/ *$//' | tr 'A-Z' 'a-z')
+            [[ -z "$tok" ]] && continue
+            if [[ "$tok" =~ ^[a-z]{2}$ && -n "$(geoip_name "$tok")" ]]; then GEOIP_SELECTED+=" $tok"; continue; fi
+            mc=$(geoip_country_table | awk -F'|' -v n="$tok" 'tolower($3)==n{print $1; exit}')
+            [[ -z "$mc" ]] && mc=$(geoip_country_table | awk -F'|' -v n="$tok" 'index(tolower($3),n)>0{print $1; exit}')
+            if [[ -n "$mc" ]]; then GEOIP_SELECTED+=" $mc"; else warn "  No match for '$tok' — skipped"; fi
+        done
+    fi
+
+    # Dedupe + keep only valid 2-letter codes.
+    GEOIP_SELECTED=$(printf '%s\n' $GEOIP_SELECTED | grep -E '^[a-z]{2}$' | sort -u | tr '\n' ' ' | sed 's/ $//') || GEOIP_SELECTED=""
+
+    # Final review (by name) + explicit confirm.
+    printf "\n${C_BLD}Final allow-list (%s countries):${C_RST}\n  %s\n" "$(printf '%s' "$GEOIP_SELECTED" | wc -w)" "$(geoip_names "$GEOIP_SELECTED")"
+    local conf
+    read -rp "Apply this allowlist? [y/N]: " conf
+    [[ "$conf" =~ ^[Yy]$ ]] || { warn "Allowlist not confirmed — GeoIP will be disabled."; GEOIP_SELECTED=""; }
+}
+
 harden_geoip() {
-    info "=== Setting up GeoIP blocking ==="
+    local IFS=$' \t\n'
+    info "=== Setting up GeoIP allowlist (default-deny) ==="
     mkdir -p "$GEOIP_DIR"
+
+    # Detect the country THIS admin session connects from — used both to pre-allow
+    # your region and for the lockout guard. The SSH gate filters by SOURCE IP, so
+    # we check the CLIENT's country, NOT the box's hosting country.
+    local GEOIP_MYIP GEOIP_MYCC
+    GEOIP_MYIP=$(geoip_client_ip)
+    GEOIP_MYCC=$(geoip_country_of_ip "$GEOIP_MYIP")
+
+    geoip_select_countries
+    if [[ -z "${GEOIP_SELECTED:-}" ]]; then
+        warn "No countries selected — GeoIP allowlist DISABLED (nothing blocked). Removing any prior geo rules."
+        [[ -x "${GEOIP_DIR}/apply-geoip.sh" ]] && GEOIP_DISABLE=1 bash "${GEOIP_DIR}/apply-geoip.sh" >> "$LOGFILE" 2>&1 || true
+        (crontab -l 2>/dev/null | grep -vF "apply-geoip" || true) | crontab - 2>/dev/null || true
+        return
+    fi
+
+    # Lockout guard: SSH (22) is geo-gated. If the country you're connecting from
+    # is NOT in the list, applying this drops your NEXT SSH connection.
+    if [[ -n "$GEOIP_MYCC" && " $GEOIP_SELECTED " != *" $GEOIP_MYCC "* ]]; then
+        printf "\n${C_RED}${C_BLD}⚠️  LOCKOUT WARNING${C_RST}\n"
+        printf "${C_RED}You're connecting from %s (%s / IP %s) — NOT in your allow list.${C_RST}\n" "$(geoip_name "$GEOIP_MYCC")" "$GEOIP_MYCC" "${GEOIP_MYIP:-unknown}"
+        printf "${C_RED}SSH (22) is geo-gated, so applying this can lock YOU out. Recovery = your provider's web/serial console.${C_RST}\n"
+        if [[ -t 0 ]]; then
+            local sure
+            read -rp "Type 'yes' to apply anyway, anything else to abort GeoIP: " sure
+            [[ "$sure" == "yes" ]] || { warn "GeoIP allowlist aborted by user."; return; }
+        else
+            warn "Non-interactive: proceeding despite connecting-country mismatch (GEOIP_ALLOW set explicitly)."
+        fi
+    fi
+
     if ! command -v ipset &>/dev/null; then
         info "Installing ipset"
         [[ "$OS_FAMILY" == "debian" ]] && apt-get update -qq >> "$LOGFILE" 2>&1
-        $PKG_INSTALL ipset >> "$LOGFILE" 2>&1 || warn "ipset install failed — GeoIP will fall back to plain iptables (slower, still works)"
+        $PKG_INSTALL ipset >> "$LOGFILE" 2>&1 || { warn "ipset install failed — GeoIP allowlist requires ipset; skipping"; return; }
     fi
-    local c updated=0
-    for c in cn ru kp ir; do
-        curl -fsSL --max-time 30 "https://www.ipdeny.com/ipblocks/data/countries/${c}.zone" -o "${GEOIP_DIR}/${c}.zone" >> "$LOGFILE" 2>&1 && {
-            updated=$((updated+1))
-            _log "GeoIP zone downloaded: ${c}.zone"
-        } || warn "Failed to download zone: $c"
-    done
-    [[ "$updated" -eq 0 ]] && { warn "No GeoIP zones downloaded — skipping"; return; }
 
-    cat > "${GEOIP_DIR}/apply-geoip.sh" << 'GEOEOF'
+    # Write the apply script. The header carries the dynamic config; the body is
+    # literal (refresh zones -> build sets -> install the default-deny gate).
+    cat > "${GEOIP_DIR}/apply-geoip.sh" << GEOHEAD
 #!/usr/bin/env bash
-# Apply GeoIP DROP rules. Prefers ipset (one hash:net set + one rule = fast);
-# falls back to a plain iptables chain (one DROP per subnet) if ipset is missing,
-# so GeoIP is never silently skipped. ipdeny.com zones are IPv4 CIDR lists, so
-# this is IPv4/iptables only.
-DIR="/usr/local/bin/geoip-block" SET="geoip_block" CHAIN="GEOIP_BLOCK" LOG="/var/log/harden.log"
-COUNTRIES="cn ru kp ir"
+# GENERATED by harden.sh — GeoIP default-deny allowlist. Re-run to refresh.
+COUNTRIES="${GEOIP_SELECTED}"
+GATE_SSH="${GEOIP_GATE_SSH:-1}"
+GEOHEAD
+    cat >> "${GEOIP_DIR}/apply-geoip.sh" << 'GEOEOF'
+DIR="/usr/local/bin/geoip-block"
+ALLOW="geoip_allow" CFSET="geoip_cf" GATE="GEOIP_GATE" LOG="/var/log/harden.log"
+ALLOW6="geoip_allow6" CFSET6="geoip_cf6" GATE6="GEOIP_GATE6"
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') GeoIP: $*" >> "$LOG"; }
 
-command -v iptables &>/dev/null || { echo "$(date '+%Y-%m-%d %H:%M:%S') GeoIP: iptables missing — skipping" >> "$LOG"; exit 0; }
+command -v iptables &>/dev/null || { log "iptables missing — skipping"; exit 0; }
+command -v ipset    &>/dev/null || { log "ipset missing — skipping"; exit 0; }
+# Dual-stack: enforce the SAME country allowlist over IPv6 via ip6tables, so a box
+# with a public IPv6 address isn't a trivial geo-bypass (host SSH listens on [::]:22).
+# Best-effort + fully guarded below; completely inert on v4-only hosts.
+HAVE6=0; command -v ip6tables &>/dev/null && HAVE6=1
 
-if command -v ipset &>/dev/null; then
-    # Fast path: load a temp set then atomically swap — no window where a country is unblocked.
-    ipset create "${SET}_tmp" hash:net -exist
-    ipset flush  "${SET}_tmp"
-    for c in $COUNTRIES; do
-        [[ -f "${DIR}/${c}.zone" ]] || continue
-        while IFS= read -r subnet; do
-            [[ -z "$subnet" || "$subnet" =~ ^# ]] && continue
-            ipset add "${SET}_tmp" "$subnet" -exist 2>/dev/null || true
-        done < "${DIR}/${c}.zone"
-    done
-    ipset create "$SET" hash:net -exist
-    ipset swap "${SET}_tmp" "$SET"
-    ipset destroy "${SET}_tmp" 2>/dev/null || true
-    iptables -C INPUT -m set --match-set "$SET" src -j DROP 2>/dev/null || \
-        iptables -I INPUT -m set --match-set "$SET" src -j DROP
-    echo "$(date '+%Y-%m-%d %H:%M:%S') GeoIP applied via ipset ($(ipset list "$SET" 2>/dev/null | grep -c '/') subnets)" >> "$LOG"
-else
-    # Fallback: dedicated iptables chain, one DROP per subnet (slower, larger ruleset).
-    iptables -N "$CHAIN" 2>/dev/null || iptables -F "$CHAIN"
-    iptables -C INPUT -j "$CHAIN" 2>/dev/null || iptables -I INPUT -j "$CHAIN"
-    n=0
-    for c in $COUNTRIES; do
-        [[ -f "${DIR}/${c}.zone" ]] || continue
-        while IFS= read -r subnet; do
-            [[ -z "$subnet" || "$subnet" =~ ^# ]] && continue
-            iptables -A "$CHAIN" -s "$subnet" -j DROP 2>/dev/null && n=$((n+1)) || true
-        done < "${DIR}/${c}.zone"
-    done
-    echo "$(date '+%Y-%m-%d %H:%M:%S') GeoIP applied via iptables fallback ($n rules; install ipset for efficiency)" >> "$LOG"
+# Remove every geo rule/chain (fail-open). Sets are left intact unless disabling.
+geo_teardown() {
+    iptables -D INPUT       -p tcp --dport 443 -j "$GATE" 2>/dev/null || true
+    iptables -D INPUT       -p tcp --dport 22  -j "$GATE" 2>/dev/null || true
+    iptables -D DOCKER-USER -p tcp --dport 443 -j "$GATE" 2>/dev/null || true
+    iptables -F "$GATE" 2>/dev/null || true
+    iptables -X "$GATE" 2>/dev/null || true
+    if [[ "$HAVE6" == "1" ]]; then
+        ip6tables -D INPUT       -p tcp --dport 443 -j "$GATE6" 2>/dev/null || true
+        ip6tables -D INPUT       -p tcp --dport 22  -j "$GATE6" 2>/dev/null || true
+        ip6tables -D DOCKER-USER -p tcp --dport 443 -j "$GATE6" 2>/dev/null || true
+        ip6tables -F "$GATE6" 2>/dev/null || true
+        ip6tables -X "$GATE6" 2>/dev/null || true
+    fi
+}
+
+# Disable mode: rip everything out and stop.
+if [[ "${GEOIP_DISABLE:-0}" == "1" ]]; then
+    geo_teardown
+    ipset destroy "$ALLOW" 2>/dev/null || true
+    ipset destroy "$CFSET" 2>/dev/null || true
+    ipset destroy "$ALLOW6" 2>/dev/null || true
+    ipset destroy "$CFSET6" 2>/dev/null || true
+    log "disabled (all geo rules removed)"
+    exit 0
 fi
+
+# Clean up the OLD blocklist model if a previous harden.sh left it behind.
+iptables -D INPUT -m set --match-set geoip_block src -j DROP 2>/dev/null || true
+ipset destroy geoip_block 2>/dev/null || true
+iptables -D INPUT -j GEOIP_BLOCK 2>/dev/null || true
+iptables -F GEOIP_BLOCK 2>/dev/null || true
+iptables -X GEOIP_BLOCK 2>/dev/null || true
+
+# Refresh country zones (keep the cached copy if a download fails). Prefer the
+# AGGREGATED list (merged CIDRs — far fewer entries than the raw per-country
+# list, which can exceed an ipset's element cap); fall back to the full list.
+mkdir -p "$DIR"
+for c in $COUNTRIES; do
+    got=0
+    for url in "aggregated/${c}-aggregated.zone" "countries/${c}.zone"; do
+        if curl -fsSL --max-time 30 "https://www.ipdeny.com/ipblocks/data/${url}" -o "${DIR}/${c}.zone.tmp"; then
+            mv "${DIR}/${c}.zone.tmp" "${DIR}/${c}.zone"; got=1; break
+        fi
+    done
+    [[ "$got" -eq 0 ]] && { rm -f "${DIR}/${c}.zone.tmp"; log "zone download failed: $c (using cached copy if present)"; }
+done
+
+# Build the allow set atomically via a SINGLE ipset restore (one process — a
+# per-line `ipset add` would fork tens of thousands of times for a big country).
+build="${DIR}/.allow.restore"
+{
+    # maxelem well above any realistic multi-country allowlist (default 65536 is
+    # too small — a single large country overflows it and the set silently truncates).
+    echo "create ${ALLOW}_tmp hash:net hashsize 65536 maxelem 1048576 -exist"
+    echo "flush ${ALLOW}_tmp"
+    for c in $COUNTRIES; do
+        [[ -f "${DIR}/${c}.zone" ]] || continue
+        sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "${DIR}/${c}.zone" | sed "s#^#add ${ALLOW}_tmp #"
+    done
+} > "$build"
+allow_n=$(grep -c '^add ' "$build" || true)
+# SAFETY: never install a default-deny gate with an EMPTY allow set (= total lockout).
+if [[ "$allow_n" -eq 0 ]]; then
+    rm -f "$build"
+    geo_teardown
+    log "ERROR allow set empty — gate NOT applied (fail-open) to avoid lockout"
+    exit 1
+fi
+ipset restore -exist < "$build"
+rm -f "$build"
+# Create the live set only if absent (a plain create -exist still errors when an
+# older set has different header params; the swap below carries the new content).
+ipset list -n "$ALLOW" &>/dev/null || ipset create "$ALLOW" hash:net hashsize 65536 maxelem 1048576
+ipset swap "${ALLOW}_tmp" "$ALLOW"
+ipset destroy "${ALLOW}_tmp" 2>/dev/null || true
+
+# Build the Cloudflare carve-out set (best effort — so CF-proxied traffic, which
+# reaches origin from CF POPs worldwide, is never geo-dropped).
+ipset create "${CFSET}_tmp" hash:net -exist
+ipset flush  "${CFSET}_tmp"
+if curl -fsSL --max-time 15 https://www.cloudflare.com/ips-v4 -o /tmp/cf-v4.txt 2>/dev/null; then
+    { echo "create ${CFSET}_tmp hash:net -exist"
+      sed -e '/^[[:space:]]*$/d' /tmp/cf-v4.txt | sed "s#^#add ${CFSET}_tmp #"
+    } | ipset restore -exist
+    rm -f /tmp/cf-v4.txt
+fi
+ipset list -n "$CFSET" &>/dev/null || ipset create "$CFSET" hash:net
+ipset swap "${CFSET}_tmp" "$CFSET"
+ipset destroy "${CFSET}_tmp" 2>/dev/null || true
+
+# (Re)build the gate chain. Every RETURN is an "allowed" exit; the final DROP is
+# the default-deny. ESTABLISHED first so a live SSH session is never cut.
+iptables -N "$GATE" 2>/dev/null || iptables -F "$GATE"
+iptables -A "$GATE" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+iptables -A "$GATE" -i lo -j RETURN
+iptables -A "$GATE" -s 127.0.0.0/8    -j RETURN
+iptables -A "$GATE" -s 10.0.0.0/8     -j RETURN
+iptables -A "$GATE" -s 172.16.0.0/12  -j RETURN
+iptables -A "$GATE" -s 192.168.0.0/16 -j RETURN
+iptables -A "$GATE" -m set --match-set "$CFSET" src -j RETURN
+iptables -A "$GATE" -m set --match-set "$ALLOW" src -j RETURN
+iptables -A "$GATE" -j DROP
+
+# Hook the gate. Web 443: NPM is a container, so filter in DOCKER-USER (INPUT
+# never sees forwarded container traffic). SSH 22: host service -> INPUT.
+if iptables -L DOCKER-USER -n &>/dev/null; then
+    iptables -C DOCKER-USER -p tcp --dport 443 -j "$GATE" 2>/dev/null || iptables -I DOCKER-USER -p tcp --dport 443 -j "$GATE"
+fi
+iptables -C INPUT -p tcp --dport 443 -j "$GATE" 2>/dev/null || iptables -I INPUT -p tcp --dport 443 -j "$GATE"
+if [[ "$GATE_SSH" == "1" ]]; then
+    iptables -C INPUT -p tcp --dport 22 -j "$GATE" 2>/dev/null || iptables -I INPUT -p tcp --dport 22 -j "$GATE"
+else
+    iptables -D INPUT -p tcp --dport 22 -j "$GATE" 2>/dev/null || true
+fi
+
+# ---------- IPv6 (dual-stack): mirror the allowlist via ip6tables ----------
+# Fully guarded: if no v6 ranges build, IPv6 is left UNGATED (never lock). Only TCP
+# 443/22 enter the chain, so ICMPv6/NDP/multicast are never touched. Carve-outs
+# MUST include link-local (fe80::/10) + ULA (fc00::/7) or v6 would break.
+if [[ "$HAVE6" == "1" ]]; then
+    for c in $COUNTRIES; do
+        got6=0
+        for url in "ipv6/ipaddresses/aggregated/${c}-aggregated.zone" "ipv6/ipaddresses/${c}.zone"; do
+            if curl -fsSL --max-time 30 "https://www.ipdeny.com/${url}" -o "${DIR}/${c}.v6.zone.tmp"; then
+                mv "${DIR}/${c}.v6.zone.tmp" "${DIR}/${c}.v6.zone"; got6=1; break
+            fi
+        done
+        [[ "$got6" -eq 0 ]] && rm -f "${DIR}/${c}.v6.zone.tmp"
+    done
+    build6="${DIR}/.allow6.restore"
+    {
+        echo "create ${ALLOW6}_tmp hash:net family inet6 hashsize 16384 maxelem 1048576 -exist"
+        echo "flush ${ALLOW6}_tmp"
+        for c in $COUNTRIES; do
+            [[ -f "${DIR}/${c}.v6.zone" ]] || continue
+            sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "${DIR}/${c}.v6.zone" | sed "s#^#add ${ALLOW6}_tmp #"
+        done
+    } > "$build6"
+    allow6_n=$(grep -c '^add ' "$build6" || true)
+    if [[ "$allow6_n" -gt 0 ]]; then
+        ipset restore -exist < "$build6"
+        ipset list -n "$ALLOW6" &>/dev/null || ipset create "$ALLOW6" hash:net family inet6 hashsize 16384 maxelem 1048576
+        ipset swap "${ALLOW6}_tmp" "$ALLOW6"
+        ipset destroy "${ALLOW6}_tmp" 2>/dev/null || true
+        # Cloudflare IPv6 carve-out
+        ipset create "${CFSET6}_tmp" hash:net family inet6 -exist; ipset flush "${CFSET6}_tmp"
+        if curl -fsSL --max-time 15 https://www.cloudflare.com/ips-v6 -o /tmp/cf-v6.txt 2>/dev/null; then
+            { echo "create ${CFSET6}_tmp hash:net family inet6 -exist"
+              sed -e '/^[[:space:]]*$/d' /tmp/cf-v6.txt | sed "s#^#add ${CFSET6}_tmp #"
+            } | ipset restore -exist
+            rm -f /tmp/cf-v6.txt
+        fi
+        ipset list -n "$CFSET6" &>/dev/null || ipset create "$CFSET6" hash:net family inet6
+        ipset swap "${CFSET6}_tmp" "$CFSET6"
+        ipset destroy "${CFSET6}_tmp" 2>/dev/null || true
+        ip6tables -N "$GATE6" 2>/dev/null || ip6tables -F "$GATE6"
+        ip6tables -A "$GATE6" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+        ip6tables -A "$GATE6" -i lo -j RETURN
+        ip6tables -A "$GATE6" -s ::1/128   -j RETURN
+        ip6tables -A "$GATE6" -s fe80::/10 -j RETURN
+        ip6tables -A "$GATE6" -s fc00::/7  -j RETURN
+        ip6tables -A "$GATE6" -m set --match-set "$CFSET6" src -j RETURN
+        ip6tables -A "$GATE6" -m set --match-set "$ALLOW6" src -j RETURN
+        ip6tables -A "$GATE6" -j DROP
+        if ip6tables -L DOCKER-USER -n &>/dev/null; then
+            ip6tables -C DOCKER-USER -p tcp --dport 443 -j "$GATE6" 2>/dev/null || ip6tables -I DOCKER-USER -p tcp --dport 443 -j "$GATE6"
+        fi
+        ip6tables -C INPUT -p tcp --dport 443 -j "$GATE6" 2>/dev/null || ip6tables -I INPUT -p tcp --dport 443 -j "$GATE6"
+        if [[ "$GATE_SSH" == "1" ]]; then
+            ip6tables -C INPUT -p tcp --dport 22 -j "$GATE6" 2>/dev/null || ip6tables -I INPUT -p tcp --dport 22 -j "$GATE6"
+        else
+            ip6tables -D INPUT -p tcp --dport 22 -j "$GATE6" 2>/dev/null || true
+        fi
+        log "IPv6 gate applied — ${allow6_n} v6 subnets"
+    else
+        # No v6 ranges -> leave IPv6 UNGATED (fail-open). Strip any stale v6 gate so
+        # we never DROP against an empty set.
+        ip6tables -D INPUT -p tcp --dport 443 -j "$GATE6" 2>/dev/null || true
+        ip6tables -D INPUT -p tcp --dport 22  -j "$GATE6" 2>/dev/null || true
+        ip6tables -D DOCKER-USER -p tcp --dport 443 -j "$GATE6" 2>/dev/null || true
+        ip6tables -F "$GATE6" 2>/dev/null || true
+        log "IPv6 zones unavailable — IPv6 left ungated (v4 enforced)"
+    fi
+    rm -f "$build6"
+fi
+
+log "applied — ${allow_n} allowed subnets, SSH gate=${GATE_SSH}"
 GEOEOF
     chmod +x "${GEOIP_DIR}/apply-geoip.sh"
-    info "Applying GeoIP blocks (this may take a minute)..."
+
+    info "Applying GeoIP allowlist (downloading zones — may take a minute)..."
     nohup bash "${GEOIP_DIR}/apply-geoip.sh" >> "$LOGFILE" 2>&1 &
-    local geoip_pid=$!
-    local waited=0
-    while kill -0 "$geoip_pid" 2>/dev/null && [[ "$waited" -lt 60 ]]; do
+    local geoip_pid=$! waited=0
+    while kill -0 "$geoip_pid" 2>/dev/null && [[ "$waited" -lt 90 ]]; do
         sleep 1; waited=$((waited + 1))
     done
     kill -0 "$geoip_pid" 2>/dev/null && warn "GeoIP apply still running in background (PID $geoip_pid)"
 
-    local cronline="0 4 * * * ${GEOIP_DIR}/apply-geoip.sh >> /var/log/harden.log 2>&1"
-    (crontab -l 2>/dev/null | grep -vF "apply-geoip" || true; echo "$cronline") | crontab - 2>/dev/null || true
+    # Daily refresh + re-apply on reboot (iptables/ipset rules are not persisted).
+    local cron_daily="0 4 * * * ${GEOIP_DIR}/apply-geoip.sh >> /var/log/harden.log 2>&1"
+    local cron_boot="@reboot sleep 60 && ${GEOIP_DIR}/apply-geoip.sh >> /var/log/harden.log 2>&1"
+    (crontab -l 2>/dev/null | grep -vF "apply-geoip" || true; echo "$cron_daily"; echo "$cron_boot") | crontab - 2>/dev/null || true
 
-    ok "GeoIP blocking configured (${updated} countries, daily refresh)"
-    _log "GeoIP blocking applied for: cn ru kp ir"
+    ok "GeoIP allowlist active (IPv4+IPv6) — allowed: ${GEOIP_SELECTED} (443 + SSH gated, 80 open for ACME, daily refresh)"
+    _log "GeoIP allowlist applied for: ${GEOIP_SELECTED}"
 }
 
 # ---------------------------------------------------------------------------
@@ -392,7 +926,20 @@ install_crowdsec() {
 # ---------------------------------------------------------------------------
 install_aide() {
     info "=== Installing AIDE file integrity monitor ==="
-    command -v aide &>/dev/null || $PKG_INSTALL aide >> "$LOGFILE" 2>&1 || { warn "AIDE install failed — skipping"; return; }
+    if ! command -v aide &>/dev/null; then
+        # ROBUSTNESS: a single pre-existing half-configured package (e.g. a
+        # crash-looping crowdsec bouncer) makes `apt-get install` exit non-zero
+        # even when AIDE itself installs fine — the old `|| { warn; return; }`
+        # then silently skipped AIDE while the summary still claimed it. Clear any
+        # wedged dpkg state first, then judge success by the BINARY, not the exit code.
+        [[ "$OS_FAMILY" == "debian" ]] && DEBIAN_FRONTEND=noninteractive dpkg --configure -a >> "$LOGFILE" 2>&1 || true
+        $PKG_INSTALL aide >> "$LOGFILE" 2>&1 || true
+        if ! command -v aide &>/dev/null && [[ "$OS_FAMILY" == "debian" ]]; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -f -y >> "$LOGFILE" 2>&1 || true
+            $PKG_INSTALL aide >> "$LOGFILE" 2>&1 || true
+        fi
+    fi
+    command -v aide &>/dev/null || { warn "AIDE install failed (apt/dpkg may be wedged by a broken package — run 'sudo dpkg --configure -a', then re-run) — skipping"; return; }
 
     info "Initializing AIDE database (may take a few minutes)..."
     if aideinit 2>/dev/null >> "$LOGFILE" 2>&1; then
@@ -755,7 +1302,7 @@ print_summary() {
     printf "${C_BLD}║  Internal IP:  ${C_BLU}%-16s${C_RST}${C_BLD}                                                   ║${C_RST}\n" "$ip"
     printf "${C_BLD}╠══════════════════════════════════════════════════════════════════════════════╣${C_RST}\n"
     printf "${C_BLD}║  ${C_YLW}Security layers enabled:${C_RST}                                                  ${C_BLD}║${C_RST}\n"
-    printf "${C_BLD}║    • CrowdSec (local IDS)     • GeoIP blocking                               ║${C_RST}\n"
+    printf "${C_BLD}║    • CrowdSec (local IDS)     • GeoIP allowlist (deny-all)                   ║${C_RST}\n"
     printf "${C_BLD}║    • Auto security updates    • AIDE file integrity                          ║${C_RST}\n"
     printf "${C_BLD}║    • Firewall rate limiting   • Docker log rotation                          ║${C_RST}\n"
     printf "${C_BLD}╠══════════════════════════════════════════════════════════════════════════════╣${C_RST}\n"
@@ -768,6 +1315,25 @@ print_summary() {
     fi
     printf "${C_BLD}╚══════════════════════════════════════════════════════════════════════════════╝${C_RST}\n"
     printf "\n"
+    # HONEST status: the box above lists INTENDED layers; this reflects what is
+    # actually present (so a silent install failure can't masquerade as success).
+    local _miss=""
+    command -v aide >/dev/null 2>&1 || _miss+="AIDE "
+    { docker ps --format '{{.Names}}' 2>/dev/null | grep -qx crowdsec || systemctl is-active --quiet crowdsec 2>/dev/null; } || _miss+="CrowdSec "
+    systemctl is-active --quiet crowdsec-firewall-bouncer 2>/dev/null || _miss+="firewall-bouncer "
+    if [[ -n "$_miss" ]]; then
+        printf "${C_RED}${C_BLD}⚠️  Listed above but NOT actually active: ${_miss}${C_RST}\n"
+        printf "   Common cause: a half-configured package wedged apt/dpkg. Fix + retry:\n"
+        printf "     ${C_BLU}sudo dpkg --configure -a && sudo apt-get -f install${C_RST}  then re-run this script\n\n"
+    fi
+    if [[ -x "${GEOIP_DIR}/apply-geoip.sh" ]] && ipset list geoip_allow &>/dev/null; then
+        printf "${C_YLW}${C_BLD}GeoIP allowlist ACTIVE (default-deny):${C_RST}\n"
+        printf "  Allowed: %s\n" "$(geoip_names "$(sed -n 's/^COUNTRIES="\(.*\)"/\1/p' "${GEOIP_DIR}/apply-geoip.sh" | head -1)")"
+        printf "  ${C_RED}SSH (22) is geo-gated.${C_RST} If your home IP's country drops off the list you\n"
+        printf "  lose SSH — recover via your provider's web/serial console, then run:\n"
+        printf "    ${C_BLU}GEOIP_DISABLE=1 bash %s/apply-geoip.sh${C_RST}  (removes all geo rules)\n" "$GEOIP_DIR"
+        printf "  Edit the country list: re-run harden.sh, or set GEOIP_ALLOW=\"us,ca,...\".\n\n"
+    fi
     printf "  Log:     %s\n" "$LOGFILE"
     printf "  Backups: files with suffix %s\n\n" "$BAKSUF"
 
