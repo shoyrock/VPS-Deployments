@@ -23,7 +23,7 @@ IFS=$'\n\t'
 readonly SCRIPT_VERSION="4.8.0-hardened-cloudflare-authentik"
 readonly SCRIPT_NAME="deploy-dockhand-authentik.sh"
 START_TIME=$(date +%s); readonly START_TIME
-readonly STACK_DIR="/opt/dockhand-stack"
+readonly STACK_DIR="/opt/apps/dockhand-stack"   # infra lives UNDER /opt/apps (unified layout)
 readonly NPM_DATA_DIR="${STACK_DIR}/data"
 readonly NPM_LE_DIR="${STACK_DIR}/letsencrypt"
 readonly NPM_LOGS_DIR="${NPM_DATA_DIR}/logs"
@@ -49,6 +49,7 @@ CF_API_TOKEN="${CF_API_TOKEN:-}"                              # CF USER API toke
 CF_BOUNCER_KEY=""                                            # generated; shared LAPI <-> CF bouncer
 CF_BOUNCER_ACTION="${CF_BOUNCER_ACTION:-ban}"                # edge action: ban | captcha
 LOCK_HTTP_TO_CLOUDFLARE="${LOCK_HTTP_TO_CLOUDFLARE:-false}"  # restrict 80/443 to Cloudflare ranges
+NPM_SKIP_SSL="${NPM_SKIP_SSL:-0}"                            # 1 = create proxy hosts HTTP-only (no Let's Encrypt attempt; do SSL manually in the NPM UI later)
 CF_IPS_CACHE=""                                             # filled by get_cloudflare_ips()
 
 # Deployment status tracking for guaranteed completion summary
@@ -159,13 +160,13 @@ _on_exit() {
   printf "${C_B}  VPS IP:   %s${C_R}\n" "$ip"
   printf "${C_B}  External: %s${C_R}\n" "$ext_ip"
   printf "${C_B}  Domain:   %s${C_R}\n" "${DOMAIN:-<not set>}"
-  printf "${C_B}------------------------------------------------------------------------------${C_R}\n"
+  printf '%s\n' "${C_B}------------------------------------------------------------------------------${C_R}"
   printf "${C_B}  NPM Admin:     http://%s:81${C_R}\n" "$ip"
   printf "${C_B}  NPM Login:     admin@example.com / %s${C_R}\n" "$npm_pass"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
     printf "${C_B}  Dockhand:      https://dockhand.%s${C_R}\n" "$DOMAIN"
     printf "${C_B}  Authentik:     https://authentik.%s${C_R}\n" "$DOMAIN"
-    printf "${C_B}------------------------------------------------------------------------------${C_R}\n"
+    printf '%s\n' "${C_B}------------------------------------------------------------------------------${C_R}"
     printf "${C_B}${C_YEL}  Containers (hostname = container name, via NPM proxy network):${C_R}\n"
     printf "${C_B}    npm                  ->  ports 80, 443, 81 (admin)${C_R}\n"
     printf "${C_B}    dockhand             ->  port 3000${C_R}\n"
@@ -174,7 +175,7 @@ _on_exit() {
     printf "${C_B}    authentik-postgres   ->  Authentik DB${C_R}\n"
     printf "${C_B}    authentik-redis      ->  Authentik cache${C_R}\n"
     printf "${C_B}    crowdsec             ->  port 8080 (LAPI, localhost only)${C_R}\n"
-    printf "${C_B}------------------------------------------------------------------------------${C_R}\n"
+    printf '%s\n' "${C_B}------------------------------------------------------------------------------${C_R}"
     printf "${C_B}  ${C_YEL}Authentik admin user: akadmin${C_R}\n"
     printf "${C_B}  ${C_YEL}Authentik password:   %s${C_R}\n" "$authentik_pass"
     printf "${C_B}  ${C_RED}Change this password after first login!${C_R}\n"
@@ -275,7 +276,7 @@ idempotent_cleanup() {
     [[ -n "$(docker volume ls -q 2>/dev/null)" ]] && { not_fresh=1; reasons+=("Docker volumes"); }
     [[ -n "$(docker images -aq 2>/dev/null)"   ]] && { not_fresh=1; reasons+=("Docker images"); }
   fi
-  for d in /opt/*-stack /opt/npm /opt/casaos /var/lib/casaos; do
+  for d in "$STACK_DIR" /opt/*-stack /opt/npm /opt/casaos /var/lib/casaos; do
     [[ -e "$d" ]] && { not_fresh=1; reasons+=("$d"); break; }
   done
   [[ -d /etc/crowdsec || -f /usr/local/bin/crowdsec-firewall-bouncer ]] && { not_fresh=1; reasons+=("CrowdSec install"); }
@@ -315,7 +316,10 @@ idempotent_cleanup() {
   fi
 
   info "Removing ALL previous platform data..."
-  for d in /opt/npm /opt/casaos /var/lib/casaos /opt/casaos-stack /opt/coolify-stack /opt/cosmos-stack /opt/dockge-stack /opt/dockhand-stack /opt/dokploy-stack /opt/portainer-stack /opt/runtipi-stack /opt/freedombox-stack /opt/yunohost-stack /opt/netbird-stack; do
+  # NOTE: only the infra dir ($STACK_DIR = /opt/apps/dockhand-stack) is removed
+  # from under /opt/apps — NEVER /opt/apps itself (that holds your app stacks).
+  # /opt/dockhand-stack is kept in the list to clean up OLD pre-move deployments.
+  for d in "$STACK_DIR" /opt/dockhand-stack /opt/npm /opt/casaos /var/lib/casaos /opt/casaos-stack /opt/coolify-stack /opt/cosmos-stack /opt/dockge-stack /opt/dokploy-stack /opt/portainer-stack /opt/runtipi-stack /opt/freedombox-stack /opt/yunohost-stack /opt/netbird-stack; do
     rm -rf "$d" 2>/dev/null || true
   done
 
@@ -507,19 +511,16 @@ setup_dockhand() {
   # 2FA gates all access and the :ro mount removes the easiest abuse path.
   # If you genuinely need write access to host files from the Dockhand UI,
   # change "/:/host:ro" to "/:/host" below and re-run:
-  #   docker compose -p dockhand -f /opt/dockhand-stack/docker-compose.dockhand.yml up -d --force-recreate
+  #   docker compose -p dockhand -f /opt/apps/dockhand-stack/docker-compose.dockhand.yml up -d --force-recreate
   #
-  # STACK-DIR mount (identical path, RW): without this, the infra stacks
-  # (npm/authentik/crowdsec/dockhand) show as UNTAGGED and cannot be adopted in
-  # the Dockhand UI. Reason: their compose-project labels point at the HOST path
-  # ${STACK_DIR}/docker-compose.*.yml; Dockhand's HostPath resolver can only reach
-  # that via the read-only /host mount, so it can see-but-not-edit the compose and
-  # refuses to manage the stack. Bind-mounting ${STACK_DIR} at the IDENTICAL path
-  # RW makes the label path resolve to a writable file -> the stacks become
-  # editable + adoptable. docker.sock already makes Dockhand root-equivalent, so
-  # this opens no new attack path beyond the existing one.
-  # /opt/apps is mounted the same way so host-deployed APP stacks (deployed with
-  # `docker compose` under /opt/apps/<app>/) are likewise adoptable, not untagged.
+  # /opt/apps mount (identical path, RW): EVERYTHING lives under /opt/apps now -
+  # the infra stacks at ${STACK_DIR} (= /opt/apps/dockhand-stack) and host-deployed
+  # APP stacks at /opt/apps/<app>/. Their compose-project labels point at those
+  # HOST paths; Dockhand's HostPath resolver can only reach them WRITABLY if
+  # /opt/apps is bind-mounted at the IDENTICAL path. Without it the stacks show
+  # UNTAGGED (see-but-not-edit via the read-only /host mount) and can't be adopted.
+  # With it, every stack under /opt/apps is editable + adoptable. docker.sock
+  # already makes Dockhand root-equivalent, so this opens no new attack path.
   cat > "${STACK_DIR}/docker-compose.dockhand.yml" << 'COMPOSE_DOCKHAND'
 services:
   dockhand:
@@ -531,7 +532,6 @@ services:
       - no-new-privileges:true
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - /opt/dockhand-stack:/opt/dockhand-stack
       - /opt/apps:/opt/apps
       - ./dockhand-data:/app/data
       - /:/host:ro
@@ -768,6 +768,10 @@ COMPOSE_CROWDSEC
   # auth_request). Degrades gracefully with manual instructions on any failure.
   bootstrap_authentik
 
+  # Enforce TOTP MFA SEPARATELY from the provider/outpost bootstrap above, so an
+  # early return there (provider/app/outpost hiccup) can never skip MFA. Fail-safe.
+  enforce_authentik_mfa
+
   info "Waiting for NPM admin UI (:81)..."
   for i in $(seq 1 60); do
     printf "\r  ${C_DIM}Waiting for NPM admin UI... %d/60${C_R}" "$i" >&2
@@ -830,6 +834,43 @@ npm_change_password() {
   step "Securing NPM admin password"
   local NEW_PASS JSON LOGIN
   NEW_PASS=$(rand_password 24)
+
+  # NPM 2.15+ ships with NO default user: GET /api/ reports "setup":false and the
+  # FIRST admin is created via an UNAUTHENTICATED POST /api/users (the old
+  # admin@example.com/changeme login can NEVER work on these versions -> was the
+  # cause of "Invalid email or password" + no proxy hosts). Detect that and create
+  # the admin directly with our random password. Older NPM falls through to the
+  # legacy default-login path below.
+  # Read the flag RAW: jq '.setup // empty' would return empty when setup IS false
+  # (jq's // treats boolean false as absent) - the exact case we must catch. Poll a
+  # few times so a not-yet-ready NPM API doesn't fall through to the legacy
+  # (changeme) path, which can NEVER work on NPM 2.15+.
+  local _setup="" _st
+  for _st in 1 2 3 4 5 6 7 8; do
+    _setup=$(_npm_api "/" 2>/dev/null | jq -r '.setup' 2>/dev/null || echo "")
+    [[ "$_setup" == "true" || "$_setup" == "false" ]] && break
+    sleep 3
+  done
+  if [[ "$_setup" == "false" ]]; then
+    printf '%s' "$NEW_PASS" > "${STACK_DIR}/.npm_admin_password"
+    chmod 600 "${STACK_DIR}/.npm_admin_password"
+    NPM_TOKEN=""
+    local _cu _t
+    _cu=$(jq -nc --arg pw "$NEW_PASS" '{name:"Administrator",nickname:"Admin",email:"admin@example.com",roles:["admin"],is_disabled:false,auth:{type:"password",secret:$pw}}')
+    for _t in 1 2 3 4 5; do
+      _npm_api "/users" -d "$_cu" >/dev/null 2>&1 || true
+      LOGIN=$(_npm_api "/tokens" -d "$(jq -nc --arg s "$NEW_PASS" '{identity:"admin@example.com",secret:$s}')" 2>/dev/null) || true
+      NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty' 2>/dev/null)
+      [[ -n "$NPM_TOKEN" ]] && break
+      sleep 3
+    done
+    if [[ -n "$NPM_TOKEN" ]]; then
+      success "NPM first admin created (admin@example.com) - password saved to ${STACK_DIR}/.npm_admin_password (mode 600)"
+      return 0
+    fi
+    warn "NPM setup-mode first-user creation failed; falling back to the legacy default-login path."
+  fi
+
   # NPM's API can briefly reject logins right after a container/daemon restart -
   # and the firewall step runs `systemctl restart docker` just before this. So
   # retry the initial default-credential login instead of giving up on the first
@@ -1088,14 +1129,26 @@ bootstrap_authentik() {
     return 0
   fi
 
+  # Authentik 2024.x makes invalidation_flow REQUIRED for proxy providers; without
+  # it the POST 400s ("invalidation_flow: This field is required.") and forward-auth
+  # silently never gets set up. Resolve the default invalidation flow (slug varies
+  # by version -> fall back to designation=invalidation).
+  local inval_pk=""
+  inval_pk=$(_ak_api "/flows/instances/default-provider-invalidation-flow/" 2>/dev/null | jq -r '.pk // empty' 2>/dev/null || true)
+  [[ -z "$inval_pk" ]] && inval_pk=$(_ak_api "/flows/instances/default-invalidation-flow/" 2>/dev/null | jq -r '.pk // empty' 2>/dev/null || true)
+  [[ -z "$inval_pk" ]] && inval_pk=$(_ak_api "/flows/instances/?designation=invalidation" 2>/dev/null | jq -r '.results[0].pk // empty' 2>/dev/null || true)
+
   # 3. Create a Proxy provider (forward_single = nginx auth_request, single app).
+  #    Include invalidation_flow only when resolved (older Authentik doesn't need it).
   local prov_json prov_pk
   prov_json=$(jq -nc \
     --arg name "dockhand" \
     --arg flow "$flow_pk" \
+    --arg inval "$inval_pk" \
     --arg internal "http://dockhand:3000" \
     --arg external "https://dockhand.${DOMAIN}" \
-    '{name:$name, authorization_flow:$flow, internal_host:$internal, external_host:$external, mode:"forward_single"}')
+    '{name:$name, authorization_flow:$flow, internal_host:$internal, external_host:$external, mode:"forward_single"}
+     + (if $inval != "" then {invalidation_flow:$inval} else {} end)')
   prov_pk=$(_ak_api "/providers/proxy/" -X POST -d "$prov_json" 2>/dev/null \
            | jq -r '.pk // empty' 2>/dev/null || true)
   if [[ -z "$prov_pk" ]]; then
@@ -1183,9 +1236,6 @@ bootstrap_authentik() {
   done; printf "\r" >&2
   $healthy && success "Authentik outpost healthy - Dockhand forward-auth is live" \
             || warn "Outpost not healthy yet. It may still be starting - check: docker logs authentik-server"
-
-  # 7. Enforce TOTP MFA for every user (fail-safe; never locks anyone out).
-  enforce_authentik_mfa
 }
 
 enforce_authentik_mfa() {
@@ -1333,12 +1383,13 @@ automate_npm() {
   local auth_snippet=$'proxy_read_timeout 86400s;\nproxy_send_timeout 86400s;\ninclude /data/nginx/custom/authentik-location.conf;\ninclude /data/nginx/custom/authentik-authrequest.conf;'
   local dockhand_id=""
   dockhand_id=$(npm_create_proxy_host "dockhand.${DOMAIN}" "dockhand" 3000 true "$auth_snippet") || true
-  [[ -n "$dockhand_id" ]] && npm_enable_ssl "$dockhand_id" "dockhand.${DOMAIN}" || true
+  [[ -n "$dockhand_id" && "${NPM_SKIP_SSL:-0}" != "1" ]] && npm_enable_ssl "$dockhand_id" "dockhand.${DOMAIN}" || true
 
   # Authentik admin portal
   local authentik_id=""
   authentik_id=$(npm_create_proxy_host "authentik.${DOMAIN}" "authentik-server" 9000 true "") || true
-  [[ -n "$authentik_id" ]] && npm_enable_ssl "$authentik_id" "authentik.${DOMAIN}" || true
+  [[ -n "$authentik_id" && "${NPM_SKIP_SSL:-0}" != "1" ]] && npm_enable_ssl "$authentik_id" "authentik.${DOMAIN}" || true
+  [[ "${NPM_SKIP_SSL:-0}" == "1" ]] && info "NPM_SKIP_SSL=1 — proxy hosts left HTTP-only; enable SSL later in the NPM UI (or re-run without the flag once DNS resolves)."
 
 
   success "NPM automation completed"
@@ -2067,7 +2118,7 @@ verify_deployment() {
 # -------------------------------------------------------------------------------
 # Install the standalone health + security verifier onto the host so it can be
 # re-run any time (this is the same set of checks, runnable on demand):
-#   sudo bash /opt/dockhand-stack/verify-stack.sh
+#   sudo bash /opt/apps/dockhand-stack/verify-stack.sh
 # -------------------------------------------------------------------------------
 install_verify_script() {
   step "Installing verifier (verify-stack.sh)"
@@ -2075,7 +2126,7 @@ install_verify_script() {
 #!/usr/bin/env bash
 # verify-stack.sh -- health + SECURITY audit for the Dockhand + Authentik + NPM +
 # CrowdSec stack. Installed by deploy-dockhand-authentik.sh. Run as root:
-#   sudo bash /opt/dockhand-stack/verify-stack.sh
+#   sudo bash /opt/apps/dockhand-stack/verify-stack.sh
 # Read-only except self-cleaning CrowdSec ban + ssh-bf detection tests (reserved IPs).
 set -uo pipefail
 C_R='\033[0m'; C_B='\033[1m'; C_G='\033[0;32m'; C_Y='\033[0;33m'; C_RED='\033[0;31m'; C_C='\033[0;36m'
@@ -2087,7 +2138,7 @@ fail(){ printf "${C_RED}[FAIL]${C_R} %s\n" "$*"; F=$((F+1)); }
 hdr(){  printf "\n${C_B}${C_C}== %s ==${C_R}\n" "$*"; }
 [[ "${EUID:-$(id -u)}" -eq 0 ]] || { echo "Run as root: sudo bash $0"; exit 1; }
 command -v docker >/dev/null 2>&1 || { echo "docker not found"; exit 1; }
-STACK_DIR="/opt/dockhand-stack"; AUTHENTIK_DIR="${STACK_DIR}/authentik"
+STACK_DIR="/opt/apps/dockhand-stack"; AUTHENTIK_DIR="${STACK_DIR}/authentik"
 DOMAIN="$(tr -d '\n' < /etc/vps-deploy-domain 2>/dev/null || true)"
 printf "${C_B}Dockhand stack health + security audit${C_R}  domain=${DOMAIN:-<unknown>}\n"
 hdr "Containers"
