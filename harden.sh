@@ -110,7 +110,15 @@ preflight() {
     fi
 
     mkdir -p "$(dirname "$LOGFILE")" && touch "$LOGFILE" 2>/dev/null || { error "Cannot write $LOGFILE"; exit 1; }
-    [[ "$OS_FAMILY" == "debian" ]] && apt-get update -qq >> "$LOGFILE" 2>&1
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+        # Fresh boots run apt-daily/unattended-upgrades which hold the dpkg lock and
+        # make apt-get exit 100. Stop them + set a global lock timeout so every apt
+        # WAITS for the lock (the deploy sets this too; harden may run standalone).
+        systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
+        systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+        printf 'DPkg::Lock::Timeout "300";\n' > /etc/apt/apt.conf.d/99deploy-lock-timeout 2>/dev/null || true
+        apt-get update -qq >> "$LOGFILE" 2>&1
+    fi
     for t in curl wget sed awk; do
         command -v "$t" &>/dev/null && continue
         info "Installing: $t"; _pkg "$t" >> "$LOGFILE" 2>&1 || warn "Failed to install $t"

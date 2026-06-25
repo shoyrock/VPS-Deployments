@@ -435,6 +435,11 @@ system_update() {
   if [[ "$OS_FAMILY" == "debian" ]]; then
     # Guard: repair dpkg if cleanup left a half-configured package behind.
     DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confold </dev/null 2>/dev/null || true
+    # Fresh boots run apt-daily/unattended-upgrades which hold the dpkg lock -> apt
+    # exits 100. Stop them + set a global lock timeout so every apt-get waits.
+    systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
+    systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+    printf 'DPkg::Lock::Timeout "300";\n' > /etc/apt/apt.conf.d/99deploy-lock-timeout
     apt-get update -qq -o DPkg::Lock::Timeout=300 && apt-get upgrade -y -qq -o DPkg::Lock::Timeout=300 && apt-get autoremove -y -qq -o DPkg::Lock::Timeout=300 && apt-get autoclean -qq
   else
     if command -v dnf &>/dev/null; then dnf update -y -q && dnf autoremove -y -q 2>/dev/null || true
