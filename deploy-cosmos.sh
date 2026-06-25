@@ -376,8 +376,7 @@ system_update() {
     # the dpkg lock -> our next apt-get exits 100 and the deploy aborts. Stop those
     # timers/services and set a GLOBAL lock timeout so every apt-get WAITS for the
     # lock (up to 5 min) instead of failing instantly.
-    systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
-    systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+    systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
     printf 'DPkg::Lock::Timeout "300";
 ' > /etc/apt/apt.conf.d/99deploy-lock-timeout
     apt-get update -qq && apt-get upgrade -y -qq && apt-get autoremove -y -qq && apt-get autoclean -qq

@@ -403,14 +403,15 @@ system_update() {
   export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
   info "Updating packages - this may take a few minutes, please wait..."
   if [[ "$OS_FAMILY" == "debian" ]]; then
-    # Fresh Ubuntu/Debian boots auto-run apt-daily + unattended-upgrades, which grab
-    # the dpkg lock. Without this, our very next "apt-get install" exits 100 and the
-    # whole deploy aborts at the Dependencies step (seen on a fresh Oracle VPS). Stop
-    # those timers/services and set a GLOBAL lock timeout so EVERY apt-get in this run
-    # WAITS for the lock (up to 5 min) instead of failing instantly. The apt.conf
-    # drop-in persists, so install_dependencies / docker / ufw all inherit it.
-    systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
-    systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+    # Fresh Ubuntu/Debian boots auto-run apt-daily, which grabs the dpkg lock — our
+    # very next "apt-get install" then exits 100 and the whole deploy aborts at the
+    # Dependencies step (seen on a fresh Oracle VPS). Stop ONLY the in-progress
+    # apt-daily run to release the lock now, and set a GLOBAL lock timeout so every
+    # apt-get in this run WAITS for the lock (up to 5 min) instead of failing. The
+    # apt.conf drop-in persists, so install_dependencies / docker / ufw inherit it.
+    # IMPORTANT: do NOT stop/disable the apt-daily TIMERS or unattended-upgrades —
+    # that would kill scheduled security auto-updates (harden re-enables + verifies).
+    systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
     printf 'DPkg::Lock::Timeout "300";\n' > /etc/apt/apt.conf.d/99deploy-lock-timeout
     # Guard: repair dpkg if cleanup left a half-configured package behind.
     DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confold </dev/null 2>/dev/null || true

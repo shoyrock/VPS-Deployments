@@ -114,8 +114,7 @@ preflight() {
         # Fresh boots run apt-daily/unattended-upgrades which hold the dpkg lock and
         # make apt-get exit 100. Stop them + set a global lock timeout so every apt
         # WAITS for the lock (the deploy sets this too; harden may run standalone).
-        systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
-        systemctl disable apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+        systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
         printf 'DPkg::Lock::Timeout "300";\n' > /etc/apt/apt.conf.d/99deploy-lock-timeout 2>/dev/null || true
         apt-get update -qq >> "$LOGFILE" 2>&1
     fi
@@ -1026,6 +1025,11 @@ APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::Download-Upgradeable-Packages "1";
 AUTOUPG
+        # Ensure the schedulers are actually ON. A fresh box has them enabled, but an
+        # earlier deploy/harden run may have left them stopped/disabled while dodging
+        # the apt lock — re-enable so scheduled security updates really fire.
+        systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >> "$LOGFILE" 2>&1 || true
+        systemctl start unattended-upgrades.service >> "$LOGFILE" 2>&1 || true
         ok "Unattended-upgrades configured"
     else
         _pkg dnf-automatic >> "$LOGFILE" 2>&1 || { warn "dnf-automatic install failed"; return; }
