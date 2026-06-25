@@ -162,15 +162,16 @@ _on_exit() {
   printf "${C_B}  External: %s${C_R}\n" "$ext_ip"
   printf "${C_B}  Domain:   %s${C_R}\n" "${DOMAIN:-<not set>}"
   printf '%s\n' "${C_B}------------------------------------------------------------------------------${C_R}"
+  printf "${C_B}  ${C_RED}>> Use http:// (NOT https://) — SSL is not configured yet. See the SSL note below.${C_R}\n"
   if [[ "${EXPOSE_NPM_ADMIN:-1}" == "1" && -n "${DOMAIN:-}" ]]; then
-    printf "${C_B}  NPM Admin:     https://npm.%s   (turn ON NPM's 2FA — it's internet-facing)${C_R}\n" "$DOMAIN"
+    printf "${C_B}  NPM Admin:     http://npm.%s   (turn ON NPM's 2FA — it's internet-facing)${C_R}\n" "$DOMAIN"
   else
     printf "${C_B}  NPM Admin:     SSH tunnel: ssh -L 8181:127.0.0.1:81 ubuntu@%s -> http://localhost:8181${C_R}\n" "$ip"
   fi
   printf "${C_B}  NPM Login:     admin@example.com / %s${C_R}\n" "$npm_pass"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
-    printf "${C_B}  Dockhand:      https://dockhand.%s${C_R}\n" "$DOMAIN"
-    printf "${C_B}  Authentik:     https://authentik.%s${C_R}\n" "$DOMAIN"
+    printf "${C_B}  Dockhand:      http://dockhand.%s${C_R}\n" "$DOMAIN"
+    printf "${C_B}  Authentik:     http://authentik.%s${C_R}\n" "$DOMAIN"
     printf '%s\n' "${C_B}------------------------------------------------------------------------------${C_R}"
     printf "${C_B}${C_YEL}  Containers (hostname = container name, via NPM proxy network):${C_R}\n"
     printf "${C_B}    npm                  ->  ports 80, 443, 81 (admin)${C_R}\n"
@@ -186,13 +187,20 @@ _on_exit() {
     printf "${C_B}  ${C_RED}Change this password after first login!${C_R}\n"
     printf "\n"
     printf "${C_B}  ${C_YEL}-- First login / MFA (ENFORCED) --${C_R}\n"
-    printf "${C_B}  Browse to https://authentik.%s and log in as akadmin.${C_R}\n" "$DOMAIN"
+    printf "${C_B}  Browse to http://authentik.%s and log in as akadmin.${C_R}\n" "$DOMAIN"
     printf "${C_B}  MFA is ENFORCED: you are REQUIRED to enroll a TOTP authenticator on first\n"
     printf "  login (have your authenticator app ready). Applies to every user.${C_R}\n"
     if [[ -s "${AUTHENTIK_DIR}/.akadmin_recovery_url" ]]; then
       printf "${C_B}  ${C_RED}Recovery URL (use ONLY if you lose the TOTP device) - SAVE IT SECURELY:${C_R}\n"
       printf "${C_B}  %s${C_R}\n" "$(cat "${AUTHENTIK_DIR}/.akadmin_recovery_url" 2>/dev/null)"
     fi
+    printf "\n"
+    printf "${C_B}  ${C_YEL}-- HTTPS / SSL (read this) --${C_R}\n"
+    printf "${C_B}  Proxy hosts are ${C_RED}HTTP-only right now${C_R}${C_B} (no certificate). Your browser defaults\n"
+    printf "  to https, which will FAIL with no cert — so use ${C_RED}http://${C_R}${C_B} for every URL above\n"
+    printf "  until you add SSL. To enable HTTPS: open NPM admin -> the host -> SSL tab ->\n"
+    printf "  'Request a new SSL Certificate' (Let's Encrypt; DNS must point at this server,\n"
+    printf "  port 80 reachable). After that the host auto-redirects http -> https.${C_R}\n"
     printf "\n"
     printf "${C_B}  All credentials are stored (mode 600) under: %s${C_R}\n" "$STACK_DIR"
   fi
@@ -1291,8 +1299,11 @@ setup_authentik_snippets() {
 location /outpost.goauthentik.io/ {
     proxy_pass http://authentik-server:9000/outpost.goauthentik.io/;
     proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+    add_header Set-Cookie $auth_cookie;
+    auth_request_set $auth_cookie $upstream_http_set_cookie;
+    proxy_pass_request_body off;
+    proxy_set_header Content-Length "";
 }
 location = /outpost.goauthentik.io/auth/nginx {
     internal;
@@ -1304,20 +1315,30 @@ location = /outpost.goauthentik.io/auth/nginx {
     proxy_pass_request_body off;
     proxy_set_header Content-Length "";
 }
+# Authentik 2024.x: the /auth/nginx 401 NO LONGER returns a Location header, so the
+# old "error_page 401 =302 $upstream_http_location" produced a blank redirect (dead
+# end). Build the redirect to the outpost start URL ourselves (rd = original request).
+location @goauthentik_proxy_signin {
+    internal;
+    add_header Set-Cookie $auth_cookie;
+    return 302 /outpost.goauthentik.io/start?rd=$request_uri;
+    auth_request_set $auth_cookie $upstream_http_set_cookie;
+}
 SNIPPET
 
   cat > "${AUTHENTIK_SNIPPETS_DIR}/authentik-authrequest.conf" << 'SNIPPET'
 auth_request /outpost.goauthentik.io/auth/nginx;
-auth_request_set $authentik_username $upstream_http_remote_user;
-auth_request_set $authentik_groups $upstream_http_remote_groups;
-auth_request_set $authentik_email $upstream_http_remote_email;
-auth_request_set $authentik_name $upstream_http_remote_name;
+error_page 401 = @goauthentik_proxy_signin;
+auth_request_set $auth_cookie $upstream_http_set_cookie;
+add_header Set-Cookie $auth_cookie;
+auth_request_set $authentik_username $upstream_http_x_authentik_username;
+auth_request_set $authentik_groups   $upstream_http_x_authentik_groups;
+auth_request_set $authentik_email    $upstream_http_x_authentik_email;
+auth_request_set $authentik_name     $upstream_http_x_authentik_name;
 proxy_set_header X-authentik-username $authentik_username;
-proxy_set_header X-authentik-groups $authentik_groups;
-proxy_set_header X-authentik-email $authentik_email;
-proxy_set_header X-authentik-name $authentik_name;
-auth_request_set $redirect_url $upstream_http_location;
-error_page 401 =302 $redirect_url;
+proxy_set_header X-authentik-groups   $authentik_groups;
+proxy_set_header X-authentik-email    $authentik_email;
+proxy_set_header X-authentik-name     $authentik_name;
 SNIPPET
 
   # Copy to NPM's custom config directory so they're accessible inside the container

@@ -32,6 +32,8 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script depl
 
 > **Deploy order (fresh VPS):** `deploy-*.sh` → your app stacks under `/opt/apps/<app>` → **`harden.sh`** (run it directly for the country picker). Then enable NPM 2FA, enroll Authentik TOTP, and point DNS so SSL issues.
 
+> ⚠️ **First access uses `http://`, not `https://`.** Proxy hosts are created **HTTP-only** (no SSL cert yet). Browsers default to `https`, which fails when there's no certificate — so explicitly use **`http://npm.<domain>`**, `http://dockhand.<domain>`, etc. until you enable SSL. **To add HTTPS:** NPM admin → the host → **SSL** tab → *Request a new SSL Certificate* (Let's Encrypt; DNS must point at the box + port 80 reachable). The host then auto-redirects `http → https`.
+
 ---
 
 ## Quick Start (one-liner)
