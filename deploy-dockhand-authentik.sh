@@ -50,6 +50,7 @@ CF_BOUNCER_KEY=""                                            # generated; shared
 CF_BOUNCER_ACTION="${CF_BOUNCER_ACTION:-ban}"                # edge action: ban | captcha
 LOCK_HTTP_TO_CLOUDFLARE="${LOCK_HTTP_TO_CLOUDFLARE:-false}"  # restrict 80/443 to Cloudflare ranges
 NPM_SKIP_SSL="${NPM_SKIP_SSL:-0}"                            # 1 = create proxy hosts HTTP-only (no Let's Encrypt attempt; do SSL manually in the NPM UI later)
+EXPOSE_NPM_ADMIN="${EXPOSE_NPM_ADMIN:-1}"                    # 1 = publish the NPM admin UI at npm.<domain> (NPM's OWN login, NO Authentik). 0 = SSH-tunnel only.
 CF_IPS_CACHE=""                                             # filled by get_cloudflare_ips()
 
 # Deployment status tracking for guaranteed completion summary
@@ -161,7 +162,11 @@ _on_exit() {
   printf "${C_B}  External: %s${C_R}\n" "$ext_ip"
   printf "${C_B}  Domain:   %s${C_R}\n" "${DOMAIN:-<not set>}"
   printf '%s\n' "${C_B}------------------------------------------------------------------------------${C_R}"
-  printf "${C_B}  NPM Admin:     http://%s:81${C_R}\n" "$ip"
+  if [[ "${EXPOSE_NPM_ADMIN:-1}" == "1" && -n "${DOMAIN:-}" ]]; then
+    printf "${C_B}  NPM Admin:     https://npm.%s   (turn ON NPM's 2FA — it's internet-facing)${C_R}\n" "$DOMAIN"
+  else
+    printf "${C_B}  NPM Admin:     SSH tunnel: ssh -L 8181:127.0.0.1:81 ubuntu@%s -> http://localhost:8181${C_R}\n" "$ip"
+  fi
   printf "${C_B}  NPM Login:     admin@example.com / %s${C_R}\n" "$npm_pass"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
     printf "${C_B}  Dockhand:      https://dockhand.%s${C_R}\n" "$DOMAIN"
@@ -657,7 +662,10 @@ services:
     ports:
       - 0.0.0.0:80:80
       - 0.0.0.0:443:443
-      - 0.0.0.0:81:81
+      # Admin UI bound to LOCALHOST only: it's reached via the npm.<domain> proxy
+      # host (created below) + SSH tunnel, so 81 is never on 0.0.0.0 / never needs
+      # to be opened in the cloud firewall. The deploy's own API calls use 127.0.0.1:81.
+      - 127.0.0.1:81:81
     volumes:
       - ./data:/data
       - ./letsencrypt:/etc/letsencrypt
@@ -1389,6 +1397,20 @@ automate_npm() {
   local authentik_id=""
   authentik_id=$(npm_create_proxy_host "authentik.${DOMAIN}" "authentik-server" 9000 true "") || true
   [[ -n "$authentik_id" && "${NPM_SKIP_SSL:-0}" != "1" ]] && npm_enable_ssl "$authentik_id" "authentik.${DOMAIN}" || true
+
+  # NPM admin panel at npm.<domain> with NPM's OWN login - DELIBERATELY no Authentik
+  # forward-auth. NPM is the recovery/control plane (it owns all routing + certs), so
+  # it must NOT depend on Authentik (a single point of failure): if Authentik ever
+  # breaks you can still log into NPM and fix routing. Port 81 stays bound to
+  # 127.0.0.1; this proxies to it internally (forward 127.0.0.1:81), so 81 never has
+  # to be opened. Disable with EXPOSE_NPM_ADMIN=0 (then it's SSH-tunnel-only).
+  if [[ "${EXPOSE_NPM_ADMIN:-1}" == "1" ]]; then
+    local npm_id=""
+    npm_id=$(npm_create_proxy_host "npm.${DOMAIN}" "127.0.0.1" 81 true "") || true
+    [[ -n "$npm_id" && "${NPM_SKIP_SSL:-0}" != "1" ]] && npm_enable_ssl "$npm_id" "npm.${DOMAIN}" || true
+    [[ -n "$npm_id" ]] && warn "NPM admin is now at https://npm.${DOMAIN} (NPM's own login). ENABLE NPM's built-in 2FA in the UI (Users > Edit > 2FA) — this login is internet-facing."
+  fi
+
   [[ "${NPM_SKIP_SSL:-0}" == "1" ]] && info "NPM_SKIP_SSL=1 — proxy hosts left HTTP-only; enable SSL later in the NPM UI (or re-run without the flag once DNS resolves)."
 
 

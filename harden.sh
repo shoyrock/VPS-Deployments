@@ -87,7 +87,7 @@ preflight() {
     # Detect if deployment scripts have been run first
     # ---------------------------------------------------------------------------
     local deployed=false
-    for d in /opt/dockhand-stack /opt/portainer-stack /opt/dockge-stack /opt/cosmos-stack /opt/coolify-stack /opt/dokploy-stack /opt/casaos-stack /opt/runtipi-stack /opt/yunohost-stack /opt/freedombox-stack /opt/netbird-stack; do
+    for d in /opt/apps/dockhand-stack /opt/dockhand-stack /opt/portainer-stack /opt/dockge-stack /opt/cosmos-stack /opt/coolify-stack /opt/dokploy-stack /opt/casaos-stack /opt/runtipi-stack /opt/yunohost-stack /opt/freedombox-stack /opt/netbird-stack; do
         [[ -d "$d" ]] && deployed=true && break
     done
     command -v docker &>/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -qE 'npm|portainer|dockge|coolify|dockhand|cosmos|dokploy|casaos|runtipi|yunohost|freedombox|netbird-server|traefik|authentik' && deployed=true
@@ -933,13 +933,36 @@ install_aide() {
         # then silently skipped AIDE while the summary still claimed it. Clear any
         # wedged dpkg state first, then judge success by the BINARY, not the exit code.
         [[ "$OS_FAMILY" == "debian" ]] && DEBIAN_FRONTEND=noninteractive dpkg --configure -a >> "$LOGFILE" 2>&1 || true
-        $PKG_INSTALL aide >> "$LOGFILE" 2>&1 || true
+        # --no-install-recommends: AIDE's recommends pull a full MTA (postfix),
+        # which then LISTENS on :25 - a surface we never want. Reports go to the
+        # cron log file, so no MTA is required.
+        if [[ "$OS_FAMILY" == "debian" ]]; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends aide aide-common >> "$LOGFILE" 2>&1 || true
+        else
+            $PKG_INSTALL aide >> "$LOGFILE" 2>&1 || true
+        fi
         if ! command -v aide &>/dev/null && [[ "$OS_FAMILY" == "debian" ]]; then
             DEBIAN_FRONTEND=noninteractive apt-get install -f -y >> "$LOGFILE" 2>&1 || true
-            $PKG_INSTALL aide >> "$LOGFILE" 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends aide aide-common >> "$LOGFILE" 2>&1 || true
         fi
     fi
     command -v aide &>/dev/null || { warn "AIDE install failed (apt/dpkg may be wedged by a broken package — run 'sudo dpkg --configure -a', then re-run) — skipping"; return; }
+
+    # DEFENSIVE: if an MTA (postfix) was pulled in regardless, bind it to loopback
+    # so it is not a public :25 surface.
+    if command -v postconf &>/dev/null; then
+        postconf -e 'inet_interfaces = loopback-only' >> "$LOGFILE" 2>&1 || true
+        systemctl restart postfix >> "$LOGFILE" 2>&1 || true
+        ok "Postfix (if present) bound to loopback-only (no public :25)"
+    fi
+
+    # EXCLUDE mutable container data: AIDE monitors SYSTEM files, not app data. On a
+    # Docker host this (a) lets the DB init in seconds instead of scanning tens of GB
+    # and (b) stops a daily alert firing for every normal container/DB write.
+    if [[ -d /etc/aide/aide.conf.d ]]; then
+        printf '%s\n' '!/opt/apps' '!/var/lib/docker' '!/var/lib/containerd' '!/var/lib/crowdsec' '!/var/log' \
+            > /etc/aide/aide.conf.d/99_harden_exclude_volatile 2>/dev/null || true
+    fi
 
     info "Initializing AIDE database (may take a few minutes)..."
     if aideinit 2>/dev/null >> "$LOGFILE" 2>&1; then
@@ -1017,7 +1040,7 @@ lockdown_npm_admin() {
         info "=== Exposing NPM admin panel on 0.0.0.0:81 ==="
         target='0.0.0.0:81:81';   want='0\.0\.0\.0:81:81'
     fi
-    local paths=(/opt/dockhand-stack /opt/portainer-stack /opt/dockge-stack /opt/cosmos-stack /opt/coolify-stack /opt/dokploy-stack /opt/casaos-stack /opt/runtipi-stack /opt/yunohost-stack /opt/freedombox-stack /opt/npm /root/npm /home/*/npm /opt/nginx-proxy-manager)
+    local paths=(/opt/apps/dockhand-stack /opt/dockhand-stack /opt/portainer-stack /opt/dockge-stack /opt/cosmos-stack /opt/coolify-stack /opt/dokploy-stack /opt/casaos-stack /opt/runtipi-stack /opt/yunohost-stack /opt/freedombox-stack /opt/npm /root/npm /home/*/npm /opt/nginx-proxy-manager)
     [[ -n "${NPM_DIR:-}" ]] && paths=("$NPM_DIR" "${paths[@]}")
     local found=0 p dcf
     for p in "${paths[@]}"; do
@@ -1037,8 +1060,17 @@ lockdown_npm_admin() {
             sed -i -E "s#(^[[:space:]]*-[[:space:]]*\"?)81:81#\1${target}#" "$dcf" 2>/dev/null || true
             info "Updated: $dcf -> ${target}"
             if command -v docker &>/dev/null; then
-                (cd "$p" && docker compose -f "$dcf" up -d >> "$LOGFILE" 2>&1) || \
-                    (cd "$p" && docker-compose -f "$dcf" up -d >> "$LOGFILE" 2>&1) || \
+                # CRITICAL: recreate under the SAME compose project the stack was
+                # deployed with (e.g. `-p npm`), inferred from the running container's
+                # label. Without -p, `up -d` uses the directory name as the project,
+                # targets a DIFFERENT project, and the real container is never
+                # recreated -> the edited 127.0.0.1 binding never takes effect and
+                # port 81 stays public.
+                local _cid _proj=""
+                _cid=$(docker ps -aq --filter "label=com.docker.compose.project.config_files=$dcf" 2>/dev/null | head -1)
+                [[ -n "$_cid" ]] && _proj=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$_cid" 2>/dev/null || true)
+                (cd "$p" && docker compose ${_proj:+-p "$_proj"} -f "$dcf" up -d >> "$LOGFILE" 2>&1) || \
+                    (cd "$p" && docker-compose ${_proj:+-p "$_proj"} -f "$dcf" up -d >> "$LOGFILE" 2>&1) || \
                     warn "Docker compose failed for $p"
             fi
         done
@@ -1118,10 +1150,17 @@ LIMITS
     # NFS is actually in use (rpcbind is required for NFS client/server).
     if mount 2>/dev/null | grep -qE ' type nfs| type nfs4' || grep -qsE '\snfs[4 ]' /etc/fstab 2>/dev/null; then
         info "rpcbind left enabled (NFS mount detected)"
-    elif systemctl list-unit-files 2>/dev/null | grep -q '^rpcbind'; then
-        systemctl disable --now rpcbind.socket rpcbind 2>/dev/null || true
-        systemctl mask rpcbind.socket rpcbind 2>/dev/null || true
-        ok "rpcbind (port 111) disabled + masked (no NFS in use)"
+    elif systemctl list-unit-files 2>/dev/null | grep -qiE '^rpcbind'; then
+        # mask --now masks AND stops in one step; mask the SOCKET too (the service's
+        # activation trigger) or socket-activation re-opens :111. Then verify it
+        # actually closed (a non-robust disable was leaving 111 up).
+        systemctl mask --now rpcbind.socket rpcbind.service 2>/dev/null || true
+        systemctl stop rpcbind.socket rpcbind.service 2>/dev/null || true
+        if ss -tlnH 2>/dev/null | grep -q ':111 '; then
+            warn "rpcbind still on :111 after mask — check 'systemctl status rpcbind.socket'"
+        else
+            ok "rpcbind (port 111) masked + stopped (no NFS in use)"
+        fi
     fi
     ok "Misc hardening applied (permissions, core dumps, MOTD)"
     _log "Misc hardening applied"
