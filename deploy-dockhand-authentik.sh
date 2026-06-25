@@ -652,7 +652,10 @@ services:
     env_file: ./authentik/authentik.env
     user: root
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      # docker.sock intentionally NOT mounted. The worker only needs it for the Docker
+      # OUTPOST controller, which this stack does not use (embedded outpost runs inside
+      # authentik-server). Dropping it removes root-equivalent host access from the
+      # worker -- one less thing an attacker can pivot through.
       - ./authentik/media:/media
       - ./authentik/templates:/templates
       - ./authentik/blueprints:/blueprints/custom
@@ -1294,6 +1297,15 @@ enforce_authentik_mfa() {
     chmod 600 "${AUTHENTIK_DIR}/.akadmin_recovery_url" 2>/dev/null || true
     info "akadmin recovery URL saved to ${AUTHENTIK_DIR}/.akadmin_recovery_url (use if the TOTP device is lost)"
   fi
+  # authentik-worker has NO docker.sock mounted (embedded outpost needs no Docker
+  # controller). Authentik's default blueprint still creates a "Local Docker
+  # connection" service connection that then FAILS its health-check task every cycle
+  # (noisy DockerException spam in the worker). Delete it so logs stay clean — the
+  # embedded outpost (the forward-auth provider) is unaffected.
+  local scpk
+  for scpk in $(_ak_api "/outposts/service_connections/docker/" 2>/dev/null | jq -r '.results[]?.pk' 2>/dev/null); do
+    _ak_api "/outposts/service_connections/docker/${scpk}/" -X DELETE >/dev/null 2>&1 || true
+  done
 }
 
 setup_authentik_snippets() {

@@ -1170,15 +1170,18 @@ LIMITS
     if mount 2>/dev/null | grep -qE ' type nfs| type nfs4' || grep -qsE '\snfs[4 ]' /etc/fstab 2>/dev/null; then
         info "rpcbind left enabled (NFS mount detected)"
     elif systemctl list-unit-files 2>/dev/null | grep -qiE '^rpcbind'; then
-        # mask --now masks AND stops in one step; mask the SOCKET too (the service's
-        # activation trigger) or socket-activation re-opens :111. Then verify it
-        # actually closed (a non-robust disable was leaving 111 up).
+        # nfs-common Depends on rpcbind, so masking alone is NOT enough — the package
+        # stays installed and socket-activation/apt upgrades re-open :111 (harden's own
+        # verify was catching this: "FAIL: rpcbind off"). We only reach here when NO
+        # NFS is in use (checked above), so PURGE both for good; then mask any leftover
+        # unit and verify :111 is actually closed.
+        [[ "$OS_FAMILY" == "debian" ]] && DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq -o DPkg::Lock::Timeout=300 nfs-common rpcbind </dev/null >>"$LOGFILE" 2>&1 || true
         systemctl mask --now rpcbind.socket rpcbind.service 2>/dev/null || true
         systemctl stop rpcbind.socket rpcbind.service 2>/dev/null || true
         if ss -tlnH 2>/dev/null | grep -q ':111 '; then
-            warn "rpcbind still on :111 after mask — check 'systemctl status rpcbind.socket'"
+            warn "rpcbind still on :111 — check 'systemctl status rpcbind.socket'"
         else
-            ok "rpcbind (port 111) masked + stopped (no NFS in use)"
+            ok "rpcbind (port 111) removed (purged nfs-common+rpcbind, no NFS in use)"
         fi
     fi
     ok "Misc hardening applied (permissions, core dumps, MOTD)"
