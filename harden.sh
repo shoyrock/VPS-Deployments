@@ -45,6 +45,12 @@ get_external_ip() {
 }
 
 OS_FAMILY="" PKG_MANAGER="" PKG_INSTALL=""
+# Install wrapper. The global IFS=$'\n\t' means an unquoted "$PKG_INSTALL" (which
+# holds SPACES, e.g. "apt-get install -y -qq") would NOT word-split, so bash tried
+# to exec the whole string as ONE command -> "apt-get install -y -qq: command not
+# found", silently failing every package install on a fresh box. Reset IFS locally
+# so it splits into argv, then append the package(s).
+_pkg() { local IFS=$' \t\n'; $PKG_INSTALL "$@"; }
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -107,7 +113,7 @@ preflight() {
     [[ "$OS_FAMILY" == "debian" ]] && apt-get update -qq >> "$LOGFILE" 2>&1
     for t in curl wget sed awk; do
         command -v "$t" &>/dev/null && continue
-        info "Installing: $t"; $PKG_INSTALL "$t" >> "$LOGFILE" 2>&1 || warn "Failed to install $t"
+        info "Installing: $t"; _pkg "$t" >> "$LOGFILE" 2>&1 || warn "Failed to install $t"
     done
     ok "Pre-flight complete"
 }
@@ -228,7 +234,7 @@ harden_firewall() {
 
     local p
     if [[ "$OS_FAMILY" == "debian" ]]; then
-        command -v ufw &>/dev/null || { info "Installing UFW"; $PKG_INSTALL ufw >> "$LOGFILE" 2>&1; }
+        command -v ufw &>/dev/null || { info "Installing UFW"; _pkg ufw >> "$LOGFILE" 2>&1; }
         # NOTE: Docker publishes container ports straight into the DOCKER iptables
         # chain, BYPASSING UFW INPUT. These rules document intent + protect host-bound
         # services; CrowdSec's firewall bouncer (DOCKER-USER chain) is the real
@@ -251,7 +257,7 @@ harden_firewall() {
         ufw --force enable >> "$LOGFILE" 2>&1 || true
         ok "UFW configured (SSH + ${pub[*]})"
     else
-        systemctl is-active --quiet firewalld 2>/dev/null || { $PKG_INSTALL firewalld >> "$LOGFILE" 2>&1; systemctl enable --now firewalld >> "$LOGFILE" 2>&1; }
+        systemctl is-active --quiet firewalld 2>/dev/null || { _pkg firewalld >> "$LOGFILE" 2>&1; systemctl enable --now firewalld >> "$LOGFILE" 2>&1; }
         firewall-cmd --permanent --add-rich-rule='rule service name=ssh limit value=6/m accept' >> "$LOGFILE" 2>&1 || true
         firewall-cmd --permanent --add-service=ssh >> "$LOGFILE" 2>&1 || true
         for p in "${pub[@]}"; do
@@ -638,7 +644,7 @@ harden_geoip() {
     if ! command -v ipset &>/dev/null; then
         info "Installing ipset"
         [[ "$OS_FAMILY" == "debian" ]] && apt-get update -qq >> "$LOGFILE" 2>&1
-        $PKG_INSTALL ipset >> "$LOGFILE" 2>&1 || { warn "ipset install failed — GeoIP allowlist requires ipset; skipping"; return; }
+        _pkg ipset >> "$LOGFILE" 2>&1 || { warn "ipset install failed — GeoIP allowlist requires ipset; skipping"; return; }
     fi
 
     # Write the apply script. The header carries the dynamic config; the body is
@@ -902,7 +908,7 @@ install_crowdsec() {
         ok "CrowdSec already installed"
     else
         curl -s https://install.crowdsec.net | bash -s -- -d "$OS_FAMILY" >> "$LOGFILE" 2>&1 || { warn "CrowdSec repo failed — skipping"; return; }
-        $PKG_INSTALL crowdsec >> "$LOGFILE" 2>&1 || { warn "CrowdSec install failed — skipping"; return; }
+        _pkg crowdsec >> "$LOGFILE" 2>&1 || { warn "CrowdSec install failed — skipping"; return; }
         ok "CrowdSec installed"
     fi
     cscli collections install crowdsecurity/sshd 2>/dev/null || true
@@ -910,9 +916,9 @@ install_crowdsec() {
     cscli collections install crowdsecurity/linux 2>/dev/null || true
 
     if [[ "$OS_FAMILY" == "debian" ]]; then
-        dpkg -l crowdsec-firewall-bouncer-iptables &>/dev/null || $PKG_INSTALL crowdsec-firewall-bouncer-iptables >> "$LOGFILE" 2>&1 || true
+        dpkg -l crowdsec-firewall-bouncer-iptables &>/dev/null || _pkg crowdsec-firewall-bouncer-iptables >> "$LOGFILE" 2>&1 || true
     else
-        rpm -q crowdsec-firewall-bouncer-iptables &>/dev/null || $PKG_INSTALL crowdsec-firewall-bouncer-iptables >> "$LOGFILE" 2>&1 || true
+        rpm -q crowdsec-firewall-bouncer-iptables &>/dev/null || _pkg crowdsec-firewall-bouncer-iptables >> "$LOGFILE" 2>&1 || true
     fi
     systemctl enable --now crowdsec >> "$LOGFILE" 2>&1 || true
     systemctl enable --now crowdsec-firewall-bouncer 2>/dev/null || true
@@ -939,7 +945,7 @@ install_aide() {
         if [[ "$OS_FAMILY" == "debian" ]]; then
             DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends aide aide-common >> "$LOGFILE" 2>&1 || true
         else
-            $PKG_INSTALL aide >> "$LOGFILE" 2>&1 || true
+            _pkg aide >> "$LOGFILE" 2>&1 || true
         fi
         if ! command -v aide &>/dev/null && [[ "$OS_FAMILY" == "debian" ]]; then
             DEBIAN_FRONTEND=noninteractive apt-get install -f -y >> "$LOGFILE" 2>&1 || true
@@ -965,9 +971,14 @@ install_aide() {
     fi
 
     info "Initializing AIDE database (may take a few minutes)..."
-    if aideinit 2>/dev/null >> "$LOGFILE" 2>&1; then
+    # A leftover db.new makes aideinit print "Overwrite existing ... [Yn]?" and BLOCK
+    # on stdin - and because output is redirected to the log, that prompt is INVISIBLE
+    # on screen so it looks like a silent hang. Remove the stale db.new and feed
+    # /dev/null + -y/-f so it can NEVER prompt.
+    rm -f /var/lib/aide/aide.db.new /var/lib/aide/aide.db.new.gz 2>/dev/null || true
+    if aideinit -y -f < /dev/null >> "$LOGFILE" 2>&1 || aideinit < /dev/null >> "$LOGFILE" 2>&1; then
         ok "AIDE database initialized (aideinit)"
-    elif aide --init 2>/dev/null >> "$LOGFILE" 2>&1; then
+    elif aide --init < /dev/null 2>/dev/null >> "$LOGFILE" 2>&1; then
         local dbout; dbout=$(grep "^database_out=" /etc/aide/aide.conf 2>/dev/null | cut -d= -f2 | tr -d ' ' || echo "/var/lib/aide/aide.db.new")
         [[ -f "$dbout" ]] && cp -a "$dbout" "${dbout%.new}" 2>/dev/null || true
         ok "AIDE database initialized (aide --init)"
@@ -987,7 +998,7 @@ install_aide() {
 setup_auto_updates() {
     info "=== Configuring automatic security updates ==="
     if [[ "$OS_FAMILY" == "debian" ]]; then
-        $PKG_INSTALL unattended-upgrades apt-listchanges >> "$LOGFILE" 2>&1 || true
+        _pkg unattended-upgrades apt-listchanges >> "$LOGFILE" 2>&1 || true
         cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'UNATTENDED'
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}-security";
@@ -1009,7 +1020,7 @@ APT::Periodic::Download-Upgradeable-Packages "1";
 AUTOUPG
         ok "Unattended-upgrades configured"
     else
-        $PKG_INSTALL dnf-automatic >> "$LOGFILE" 2>&1 || { warn "dnf-automatic install failed"; return; }
+        _pkg dnf-automatic >> "$LOGFILE" 2>&1 || { warn "dnf-automatic install failed"; return; }
         cat > /etc/dnf/automatic.conf << 'DNFAUTO'
 [commands]
 upgrade_type = security
