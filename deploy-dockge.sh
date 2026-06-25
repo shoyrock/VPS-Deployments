@@ -715,6 +715,34 @@ npm_change_password() {
   step "Securing NPM admin password"
   local NEW_PASS JSON LOGIN
   NEW_PASS=$(rand_password 24)
+  # NPM 2.15+ ships with NO default user: GET /api/ reports "setup":false and the
+  # first admin is created via an UNAUTHENTICATED POST /api/users (admin@example.com/
+  # changeme can NEVER log in there -> "Invalid email or password" + no proxy hosts).
+  # Read .setup RAW (jq '.setup // empty' wrongly returns empty when it IS false), poll
+  # until the API is ready, then create the admin with our random password.
+  local _setup="" _st _cu _t
+  for _st in 1 2 3 4 5 6 7 8; do
+    _setup=$(_npm_api "/" 2>/dev/null | jq -r '.setup' 2>/dev/null || echo "")
+    [[ "$_setup" == "true" || "$_setup" == "false" ]] && break
+    sleep 3
+  done
+  if [[ "$_setup" == "false" ]]; then
+    printf '%s' "$NEW_PASS" > "${STACK_DIR}/.npm_admin_password"; chmod 600 "${STACK_DIR}/.npm_admin_password"
+    NPM_TOKEN=""
+    _cu=$(jq -nc --arg pw "$NEW_PASS" '{name:"Administrator",nickname:"Admin",email:"admin@example.com",roles:["admin"],is_disabled:false,auth:{type:"password",secret:$pw}}')
+    for _t in 1 2 3 4 5; do
+      _npm_api "/users" -d "$_cu" >/dev/null 2>&1 || true
+      LOGIN=$(_npm_api "/tokens" -d "$(jq -nc --arg s "$NEW_PASS" '{identity:"admin@example.com",secret:$s}')" 2>/dev/null) || true
+      NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty' 2>/dev/null)
+      [[ -n "$NPM_TOKEN" ]] && break
+      sleep 3
+    done
+    if [[ -n "$NPM_TOKEN" ]]; then
+      success "NPM first admin created (admin@example.com) - saved to ${STACK_DIR}/.npm_admin_password (mode 600)"
+      return 0
+    fi
+    warn "NPM setup-mode first-user creation failed; trying the legacy default-login path."
+  fi
   JSON='{"identity":"admin@example.com","secret":"changeme"}'
   LOGIN=$(_npm_api "/tokens" -d "$JSON" 2>/dev/null) || true
   NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty')

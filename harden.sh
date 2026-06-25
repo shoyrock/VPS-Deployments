@@ -1268,8 +1268,11 @@ verify_hardening() {
     fi
 
     # 3. GeoIP
-    _check "GeoIP zone files"        "[[ -f /usr/local/bin/geoip-block/cn.zone ]]"
-    _check "GeoIP rule active"       "iptables -C INPUT -m set --match-set geoip_block src -j DROP 2>/dev/null || iptables -L GEOIP_BLOCK -n >/dev/null 2>&1"
+    # GeoIP is now a default-deny ALLOWLIST (GEOIP_GATE chain + geoip_allow ipset),
+    # and it's OPTIONAL. PASS when the gate is active OR when GeoIP wasn't enabled
+    # (no geoip_allow set) - only FAIL if a set exists but the gate isn't hooked.
+    _check "GeoIP zone files"        "ls /usr/local/bin/geoip-block/*.zone >/dev/null 2>&1 || ! ipset list -n 2>/dev/null | grep -q geoip_allow"
+    _check "GeoIP allowlist active"  "iptables -L GEOIP_GATE -n >/dev/null 2>&1 || ! ipset list -n 2>/dev/null | grep -q geoip_allow"
     _check "rpcbind (port 111) off"  "mount 2>/dev/null | grep -qE ' type nfs' || ! ss -tlnH 2>/dev/null | grep -q ':111 '"
 
     # 4. CrowdSec

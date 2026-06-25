@@ -1,4 +1,4 @@
-# VPS Deployment Scripts — v4.8.0-hardened-cloudflare
+# VPS Deployment Scripts — v4.9.0-hardened-cloudflare
 
 > ⚠️ **SECURITY DISCLAIMER — READ BEFORE USING**
 >
@@ -13,6 +13,24 @@
 ---
 
 One-shot, hardened deployment scripts for fresh VPS instances. Every script deploys **Nginx Proxy Manager** (reverse proxy + SSL), an **identity provider** (Authelia SSO + 2FA, or Authentik on the authentik variants), **CrowdSec** (IPS with NPM-aware collections + firewall bouncer), and **firewall rules**.
+
+---
+
+## What's New in v4.9.0
+
+**`deploy-dockhand-authentik.sh`** *(live-redeployed + audited on a real VPS)*
+- **Unified layout** — infra installs under **`/opt/apps/dockhand-stack`** (everything under `/opt/apps`).
+- **NPM admin at `npm.<domain>`** — auto-created proxy host using NPM's *own* login (deliberately **NOT** behind Authentik, so the control plane never depends on a single point of failure). Port **81 is bound to `127.0.0.1` by default — never opened.** `EXPOSE_NPM_ADMIN=0` to keep it SSH-tunnel-only; `NPM_SKIP_SSL=1` for HTTP-only hosts.
+- **Authentik MFA enforced automatically** at deploy (TOTP required on first login) + an akadmin **recovery URL** in the summary.
+- **NPM 2.15+ support** — creates the first admin via the API (NPM 2.15 dropped the `admin@example.com/changeme` default that the old automation relied on). **Ported to all 12 deploy scripts.**
+- Authentik proxy provider now sends the required `invalidation_flow` (AK 2024.x); Dockhand `/opt/apps` mount so host-deployed stacks are adoptable, not "untagged".
+
+**`harden.sh`**
+- **GeoIP default-deny ALLOWLIST with an interactive country picker** (continents → countries by name; auto-pre-allows the country you connect from). **IPv4 + IPv6** dual-stack. Run `harden.sh` **directly in a terminal** to get the picker, or `GEOIP_ALLOW="us,ca" ./harden.sh` non-interactively.
+- NPM-81 lockdown default **ON**; resilient AIDE (non-interactive, excludes container data, no MTA on `:25`); rpcbind masked; honest verify summary.
+- Fixed: a global `IFS` quirk that silently broke package installs on a fresh box, and an invisible AIDE "overwrite?" prompt that looked like a hang.
+
+> **Deploy order (fresh VPS):** `deploy-*.sh` → your app stacks under `/opt/apps/<app>` → **`harden.sh`** (run it directly for the country picker). Then enable NPM 2FA, enroll Authentik TOTP, and point DNS so SSL issues.
 
 ---
 
@@ -41,7 +59,7 @@ Prefer `wget`? `wget -qO- <url> | bash` works the same way.
 | Script | Deploys | Stack Dir | Notes |
 |--------|---------|-----------|-------|
 | `deploy-dockhand.sh` | NPM + Dockhand + Authelia + CrowdSec | `/opt/dockhand-stack/` | Docker manager with host file access |
-| `deploy-dockhand-authentik.sh` | NPM + Dockhand + Authentik + CrowdSec | `/opt/dockhand-stack/` | ⚠️ **Authentik variant** — same stack as `deploy-dockhand.sh` but swaps Authelia → Authentik (full IdP: postgres + redis + server + worker). Dockhand gated by Authentik nginx forward-auth. **Staging — test in a VM first** |
+| `deploy-dockhand-authentik.sh` | NPM + Dockhand + Authentik + CrowdSec | `/opt/dockhand-stack/` | ✅ **Flagship / most-tested (v4.8.0).** Full Authentik IdP (postgres + redis + server + worker); Dockhand gated by Authentik nginx forward-auth. **Live-audited on a real VPS** — CrowdSec detection **and** enforcement verified, SSH + web attacks actively banned. The recommended stack. **Fresh VPS only** (wipes Docker + firewall). Prereqs for the edge bouncer: enable Cloudflare **Workers Analytics Engine**, and use **DNS-01** certs when DNS is proxied through Cloudflare. |
 | `deploy-netbird.sh` | Traefik + Authentik + NetBird (+ built-in reverse proxy) + Dockhand + CrowdSec | `/opt/netbird-stack/` | ⚠️ Zero-trust variant. **NetBird's reverse proxy is the app ingress** (apps exposed via its dashboard, not Traefik labels). **Staging — test in a VM first** |
 | `deploy-portainer.sh` | NPM + Portainer + Authelia + CrowdSec | `/opt/portainer-stack/` | Visual container management |
 | `deploy-dockge.sh` | NPM + Dockge + Authelia + CrowdSec | `/opt/dockge-stack/` | Compose stack manager |
@@ -62,7 +80,7 @@ Prefer `wget`? `wget -qO- <url> | bash` works the same way.
 
 Ports bound to `127.0.0.1` (CrowdSec LAPI 8080, Authentik 9000, …) are **never** opened. Individual tool containers otherwise have **no public host ports** — they talk internally over Docker's `proxy` network by container hostname.
 
-> **Note on port 81:** the NPM admin panel is published on `0.0.0.0:81` so you can reach it at `http://<vps-ip>:81` right after deploy to finish configuration. `harden.sh` leaves it exposed **by default** (`LOCKDOWN_NPM_ADMIN=0`) because it's needed during setup. To bind it to `127.0.0.1` (SSH-tunnel-only) once your proxy hosts are set up, run `LOCKDOWN_NPM_ADMIN=1 ./harden.sh`, then reach it via `ssh -L 8181:127.0.0.1:81 root@<vps>` → `http://localhost:8181`. Re-running with the other value flips it back (idempotent).
+> **Note on port 81 (v4.9.0):** `deploy-dockhand-authentik.sh` now publishes the NPM admin panel on **`127.0.0.1:81`** (localhost-only) and auto-creates a **`npm.<domain>`** proxy host so you reach the admin UI through NPM itself (its own login) — **port 81 never needs to be opened.** The deploy uses `127.0.0.1:81` internally for its API calls. `harden.sh` also defaults to `LOCKDOWN_NPM_ADMIN=1` (re-binds 81 to localhost for any older stack that still published it on `0.0.0.0`). Reach the admin panel at `https://npm.<domain>` (enable NPM's own 2FA — it's internet-facing), or via SSH tunnel: `ssh -L 8181:127.0.0.1:81 <user>@<vps>` → `http://localhost:8181`.
 
 ---
 
@@ -164,15 +182,20 @@ INTERNET → UFW/Firewalld → NPM (80/443/81) → Docker proxy network
 
 ## Accessing the NPM Admin Panel
 
-The NPM admin UI is published on port **81**. After deploy, reach it at:
+As of **v4.9.0**, `deploy-dockhand-authentik.sh` keeps port **81 on `127.0.0.1` (localhost-only)** and auto-creates a proxy host so the admin UI is reachable **through NPM** — port 81 is never exposed. Two ways in:
 
+**1. Via the domain (default):**
 ```
-http://<your-vps-ip>:81
+https://npm.<your-domain>
+```
+Log in with `admin@example.com` and the password in `STACK_DIR/.npm_admin_password`. This host uses **NPM's own login (no Authentik)** — so NPM, your recovery/control plane, never depends on the IdP. **Turn on NPM's built-in 2FA** (Users → Edit → 2FA) since it's internet-facing. Set `EXPOSE_NPM_ADMIN=0` at deploy to skip this host (tunnel-only).
+
+**2. Via SSH tunnel (nothing exposed):**
+```
+ssh -L 8181:127.0.0.1:81 <user>@<vps>   →   http://localhost:8181
 ```
 
-Log in with `admin@example.com` and the password stored in `STACK_DIR/.npm_admin_password`. Use it to add/edit proxy hosts and SSL certs.
-
-> **Note — port 81 is public.** While open, the admin panel is reachable from the internet and is a standing attack surface. `harden.sh` leaves 81 exposed **by default** (`LOCKDOWN_NPM_ADMIN=0`) since it's needed during setup. Recommended: finish your proxy-host configuration, then lock it down with **`LOCKDOWN_NPM_ADMIN=1 ./harden.sh`** — its `lockdown_npm_admin` step re-binds 81 to `127.0.0.1`. After that, reach the panel via SSH tunnel: `ssh -L 8181:127.0.0.1:81 root@<vps>` then `http://localhost:8181`. Re-run with `LOCKDOWN_NPM_ADMIN=0` to re-expose. (Note: configuring your *apps* never needs port 81 — they're reached at their own subdomains through NPM.)
+> Configuring your *apps* never needs port 81 — they're reached at their own subdomains through NPM. On older/other stacks that still publish 81 on `0.0.0.0`, `harden.sh` (default `LOCKDOWN_NPM_ADMIN=1`) re-binds it to localhost.
 
 ---
 

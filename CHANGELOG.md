@@ -1,5 +1,39 @@
 # Changelog
 
+## v4.9.0 — live-redeploy fixes + GeoIP allowlist + NPM-admin-via-domain
+
+Validated by repeated full redeploys + a security audit on a real VPS.
+
+### deploy-dockhand-authentik.sh
+- **Layout:** `STACK_DIR` moved to **`/opt/apps/dockhand-stack`** (everything under `/opt/apps`). Detect/destroy/mount/verify paths + `harden.sh` lockdown path lists updated to match. Dockhand bind-mounts `/opt/apps` (identical path, RW) so host-deployed stacks are adoptable, not "untagged".
+- **NPM admin via the domain:** auto-creates **`npm.<domain>`** → NPM admin (NPM's *own* login, no Authentik forward-auth — the control plane must not depend on the IdP). Port **81 published on `127.0.0.1`** by default. Flags: `EXPOSE_NPM_ADMIN` (default 1), `NPM_SKIP_SSL` (HTTP-only hosts).
+- **NPM 2.15+ first-user:** NPM dropped the `admin@example.com/changeme` default (`/api/ → "setup":false`); deploy now creates the first admin via the API. (jq gotcha fixed: `'.setup // empty'` returns empty when it IS `false`.)
+- **Authentik:** MFA **enforced** during bootstrap (TOTP-on-first-login, fail-safe) + akadmin recovery URL in the summary; proxy provider sends the now-required `invalidation_flow` (AK 2024.x); MFA enforcement decoupled from the provider step so an early return can't skip it.
+- Worker-bouncer `account_name` sanitize (apostrophe FATALed it → wedged dpkg → silently broke AIDE). **Ported to all 12 deploy scripts.**
+- Cosmetic: `printf "${C_B}---…"` no longer errors (`printf: --:`) when colors are empty (logged output).
+
+### All 12 deploy-*.sh
+- **NPM 2.15+ first-user creation ported to every script** (they all deploy NPM and would otherwise fail automation on `changeme`).
+
+### harden.sh
+- **GeoIP: default-deny ALLOWLIST with an interactive country picker** (continents → countries by name, auto-pre-allows the connecting country, lockout-guarded) replacing the old cn/ru/kp/ir blocklist. **IPv4 + IPv6** dual-stack (ipdeny v6 zones + ip6tables). Picker needs a TTY; `GEOIP_ALLOW="us,ca"` for non-interactive. `aggregated` zones + `maxelem` so big countries don't truncate.
+- NPM-81 lockdown default **ON**; AIDE resilient + non-interactive (removes stale db, `--no-install-recommends` so no postfix on `:25`, excludes `/opt/apps` + container data); rpcbind `mask --now`; postfix loopback-only; honest "not actually active" summary.
+- **Bug fixes:** `IFS=$'\n\t'` made unquoted `$PKG_INSTALL` (with spaces) fail every package install on a fresh box → wrapped in `_pkg`. AIDE's "Overwrite [Yn]?" prompt went to the log (invisible hang) → fixed. GeoIP verify check updated for the allowlist (`GEOIP_GATE`/`geoip_allow`).
+
+### VPS Compose (companion app stacks)
+- `/opt/apps/<app>/` layout; paperless secrets moved to `.env`; backup-tool repos pinned **outside** `/opt/apps` (no self-backup); duplicacy `docker.sock` removed.
+
+## deploy-dockhand-authentik.sh — 4.7.4 → 4.8.0
+
+### CrowdSec Console auto-enroll fixed (it never worked)
+- `setup_crowdsec_console` ran `cscli console enroll --auto` with **no enrollment key**. Console enroll *requires* a per-account key from app.crowdsec.net — `--auto` is not a key — so it failed every time (that's why only the manual flow worked). Now: pass your key via `CROWDSEC_ENROLL_KEY=<key>` to enroll automatically (`cscli console enroll <key>`), otherwise it prints the correct 3-step manual flow. Stale `--auto` instruction in the summary replaced; new env var documented.
+
+### Cloudflare token guidance — minimize by SCOPE, not by dropping perms
+- Confirmed against CrowdSec's official docs that the 9 permissions the script already lists ARE the required set (the bouncer's config-generator validates all of them, even for ban-only — so Turnstile/DNS/etc. can't be dropped). The token prompt now tells you to minimize the **scope** instead: restrict *Account Resources* to your one account and *Zone Resources* to your one domain (never "All accounts/zones"). That's the real least-privilege lever.
+
+### Status
+- Promoted to the **flagship / recommended** stack in the README: hardened, live-audited on a real VPS (CrowdSec detection + enforcement verified, real attacks banned). Fresh-VPS-only; edge bouncer needs Workers Analytics Engine + DNS-01 certs behind Cloudflare.
+
 ## install.sh — NEW one-line bootstrapper
 
 `curl -fsSL https://raw.githubusercontent.com/shoyrock/VPS-Deployments/main/install.sh | bash` (or `wget -qO- ... | bash`). Ensures root (re-execs via sudo, re-fetching since the script arrives over a pipe), installs curl/ca-certificates if missing, downloads `deploy.sh` to `/opt/vps-deploy`, and launches the menu reading from `/dev/tty` (so prompts work behind `curl | bash`). Pass a tool name to skip straight to it: `... | bash -s -- dockhand-authentik`. README gained a Quick Start section.
