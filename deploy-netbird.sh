@@ -1809,7 +1809,7 @@ setup_firewall() {
   # rpcbind (port 111) ships enabled on many cloud images (Oracle/others) and is a
   # known DDoS-amplification + info-disclosure surface we never use. UFW already
   # blocks it from outside, but disable it outright so it isn't even listening.
-  if systemctl list-unit-files 2>/dev/null | grep -q '^rpcbind'; then
+  if systemctl list-unit-files 2>/dev/null | grep -E '^rpcbind' >/dev/null 2>&1; then
     systemctl disable --now rpcbind.socket rpcbind 2>/dev/null || true
     success "rpcbind (port 111) disabled"
   fi

@@ -96,7 +96,7 @@ preflight() {
     for d in /opt/apps/dockhand-stack /opt/dockhand-stack /opt/portainer-stack /opt/dockge-stack /opt/cosmos-stack /opt/coolify-stack /opt/dokploy-stack /opt/casaos-stack /opt/runtipi-stack /opt/yunohost-stack /opt/freedombox-stack /opt/netbird-stack; do
         [[ -d "$d" ]] && deployed=true && break
     done
-    command -v docker &>/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -qE 'npm|portainer|dockge|coolify|dockhand|cosmos|dokploy|casaos|runtipi|yunohost|freedombox|netbird-server|traefik|authentik' && deployed=true
+    command -v docker &>/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'npm|portainer|dockge|coolify|dockhand|cosmos|dokploy|casaos|runtipi|yunohost|freedombox|netbird-server|traefik|authentik' >/dev/null 2>&1 && deployed=true
 
     if [[ "$deployed" == false ]]; then
         echo ""
@@ -894,11 +894,11 @@ install_crowdsec() {
     # two LAPIs and two firewall backends (nft vs iptables) collide and silently
     # break enforcement. Instead just rebuild the existing bouncer's rules, which
     # the `ufw --force reset` + GeoIP step above flushed, and return.
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx crowdsec \
-       || systemctl list-unit-files 2>/dev/null | grep -q '^crowdsec-firewall-bouncer' \
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -x crowdsec >/dev/null 2>&1 \
+       || systemctl list-unit-files 2>/dev/null | grep -E '^crowdsec-firewall-bouncer' >/dev/null 2>&1 \
        || [[ -f /etc/crowdsec/crowdsec-firewall-bouncer.yaml ]]; then
         ok "Existing CrowdSec + firewall bouncer detected (from deploy) — not installing a parallel native instance"
-        if systemctl list-unit-files 2>/dev/null | grep -q '^crowdsec-firewall-bouncer'; then
+        if systemctl list-unit-files 2>/dev/null | grep -E '^crowdsec-firewall-bouncer' >/dev/null 2>&1; then
             # Rebuild the bouncer's nft table on top of the new UFW/GeoIP ruleset.
             if systemctl restart crowdsec-firewall-bouncer >> "$LOGFILE" 2>&1; then
                 ok "Firewall bouncer restarted — ban rules rebuilt after firewall reset"
@@ -1171,18 +1171,25 @@ LIMITS
     # on 0.0.0.0:111 (+ [::]:111) - a classic DDoS-amplification + info-disclosure
     # surface - yet nothing on a single-host Docker deploy needs it. Skip only if
     # NFS is actually in use (rpcbind is required for NFS client/server).
-    if mount 2>/dev/null | grep -qE ' type nfs| type nfs4' || grep -qsE '\snfs[4 ]' /etc/fstab 2>/dev/null; then
+    # CRITICAL: capture into vars + use `grep` (NOT `grep -q`). Under `set -o pipefail`,
+    # `systemctl list-unit-files | grep -q '^rpcbind'` had grep -q close the pipe on the
+    # first match -> SIGPIPE killed systemctl (exit 141) -> pipefail made the whole
+    # condition FALSE -> this entire block SILENTLY never ran, so rpcbind stayed up on
+    # EVERY box (the purge line was here but unreached). grep without -q drains all input.
+    local _nfs_in_use _rpc_units
+    _nfs_in_use=$( { mount 2>/dev/null | grep -E ' type nfs| type nfs4'; grep -hsE '\snfs[4 ]' /etc/fstab 2>/dev/null; } || true )
+    _rpc_units=$(systemctl list-unit-files 2>/dev/null | grep -iE '^rpcbind' || true)
+    if [[ -n "$_nfs_in_use" ]]; then
         info "rpcbind left enabled (NFS mount detected)"
-    elif systemctl list-unit-files 2>/dev/null | grep -qiE '^rpcbind'; then
+    elif [[ -n "$_rpc_units" ]]; then
         # nfs-common Depends on rpcbind, so masking alone is NOT enough — the package
-        # stays installed and socket-activation/apt upgrades re-open :111 (harden's own
-        # verify was catching this: "FAIL: rpcbind off"). We only reach here when NO
-        # NFS is in use (checked above), so PURGE both for good; then mask any leftover
-        # unit and verify :111 is actually closed.
+        # stays installed and socket-activation/apt upgrades re-open :111. We only reach
+        # here when NO NFS is in use (checked above), so PURGE both for good; then mask
+        # any leftover unit and verify :111 is actually closed.
         [[ "$OS_FAMILY" == "debian" ]] && DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq -o DPkg::Lock::Timeout=300 nfs-common rpcbind </dev/null >>"$LOGFILE" 2>&1 || true
         systemctl mask --now rpcbind.socket rpcbind.service 2>/dev/null || true
         systemctl stop rpcbind.socket rpcbind.service 2>/dev/null || true
-        if ss -tlnH 2>/dev/null | grep -q ':111 '; then
+        if ss -tlnH 2>/dev/null | grep -E ':111 ' >/dev/null; then
             warn "rpcbind still on :111 — check 'systemctl status rpcbind.socket'"
         else
             ok "rpcbind (port 111) removed (purged nfs-common+rpcbind, no NFS in use)"

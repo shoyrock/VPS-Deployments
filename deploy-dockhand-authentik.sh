@@ -2233,7 +2233,7 @@ if systemctl is-active --quiet crowdsec-firewall-bouncer; then
   docker exec crowdsec cscli decisions delete --ip 192.0.2.1 >/dev/null 2>&1
   [[ $banned == yes ]] && pass "live ban enforced (round-trip OK)" || fail "live ban NOT enforced"
 else fail "firewall bouncer service NOT active"; fi
-if systemctl list-unit-files 2>/dev/null | grep -q crowdsec-cloudflare-worker-bouncer; then
+if systemctl list-unit-files 2>/dev/null | grep crowdsec-cloudflare-worker-bouncer >/dev/null 2>&1; then
   if systemctl is-active --quiet crowdsec-cloudflare-worker-bouncer; then pass "CF worker bouncer active (edge)"
   else warn "CF worker bouncer installed but not active (enable Cloudflare Analytics Engine? journalctl -u crowdsec-cloudflare-worker-bouncer -n 40)"; fi
 fi
