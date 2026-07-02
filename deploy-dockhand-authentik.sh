@@ -36,9 +36,16 @@ readonly AUTHENTIK_BLUEPRINTS_DIR="${AUTHENTIK_DIR}/blueprints"
 readonly AUTHENTIK_CERTS_DIR="${AUTHENTIK_DIR}/certs"
 readonly AUTHENTIK_SNIPPETS_DIR="${AUTHENTIK_DIR}/snippets"
 readonly DOMAIN_PERSIST_FILE="/etc/vps-deploy-domain"
+readonly EMAIL_PERSIST_FILE="/etc/vps-deploy-email"
 readonly LOG_FILE="/var/log/vps-deploy.log"
 
 DOMAIN=""  # Set at runtime via user prompt
+# Let's Encrypt / NPM admin account email. MUST be a real, valid address:
+# Let's Encrypt REJECTS placeholder domains like admin@example.com at ACME
+# account registration ("invalid email address"), which fails EVERY cert
+# request (HTTP-01 and DNS-01 alike). Set LETSENCRYPT_EMAIL=you@domain to skip
+# the prompt for unattended runs.
+LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
 
 # --- Authentik (IdP) bootstrap (tokens generated at runtime) ------------------
 AUTHENTIK_BOOTSTRAP_TOKEN=""    # generated; akadmin API token for Authentik API
@@ -168,7 +175,7 @@ _on_exit() {
   else
     printf "${C_B}  NPM Admin:     SSH tunnel: ssh -L 8181:127.0.0.1:81 ubuntu@%s -> http://localhost:8181${C_R}\n" "$ip"
   fi
-  printf "${C_B}  NPM Login:     admin@example.com / %s${C_R}\n" "$npm_pass"
+  printf "${C_B}  NPM Login:     %s / %s${C_R}\n" "${LETSENCRYPT_EMAIL:-admin@example.com}" "$npm_pass"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
     printf "${C_B}  Dockhand:      http://dockhand.%s${C_R}\n" "$DOMAIN"
     printf "${C_B}  Authentik:     http://authentik.%s${C_R}\n" "$DOMAIN"
@@ -523,6 +530,51 @@ get_user_domain() {
   success "Domain set to: $DOMAIN"
 }
 
+# Validate an email for Let's Encrypt: must look like a real address AND must NOT
+# use a reserved/placeholder domain (example.com/net/org, localhost, .invalid,
+# .test, .local) — LE's ACME server rejects those at account registration.
+_valid_le_email() {
+  local e="$1"
+  [[ "$e" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || return 1
+  local dom="${e##*@}"; dom="${dom,,}"
+  case "$dom" in
+    example.com|example.net|example.org|localhost|*.invalid|*.test|*.local|*.example) return 1 ;;
+  esac
+  return 0
+}
+
+get_letsencrypt_email() {
+  # A REAL email is mandatory: Let's Encrypt rejects placeholder addresses at ACME
+  # account registration, which is why cert issuance was failing with an
+  # "Internal Error" in the NPM UI (default account email was admin@example.com).
+  # Precedence: LETSENCRYPT_EMAIL env > persisted file > interactive prompt.
+  if [[ -n "$LETSENCRYPT_EMAIL" ]] && _valid_le_email "$LETSENCRYPT_EMAIL"; then
+    printf '%s' "$LETSENCRYPT_EMAIL" > "${EMAIL_PERSIST_FILE}" 2>/dev/null || true
+    success "Let's Encrypt email: $LETSENCRYPT_EMAIL"
+    return 0
+  fi
+  if [[ -z "$LETSENCRYPT_EMAIL" && -f "${EMAIL_PERSIST_FILE}" ]]; then
+    local saved; saved=$(tr -d '\n' < "${EMAIL_PERSIST_FILE}" 2>/dev/null || true)
+    if _valid_le_email "$saved"; then
+      LETSENCRYPT_EMAIL="$saved"; success "Let's Encrypt email: $LETSENCRYPT_EMAIL (reused)"; return 0
+    fi
+  fi
+  # Non-interactive with no valid env/file: fail loudly rather than ship a broken
+  # (cert-less) deploy — one-shot means SSL must work on this run.
+  if [[ ! -t 0 ]]; then
+    fatal "LETSENCRYPT_EMAIL is unset or invalid and no TTY to prompt. Re-run with LETSENCRYPT_EMAIL=you@yourdomain.com"
+  fi
+  while true; do
+    printf "\n${C_B}Enter a real email for Let's Encrypt${C_R} (cert notices; NOT example.com): " >&2
+    read -r LETSENCRYPT_EMAIL
+    LETSENCRYPT_EMAIL=$(echo "$LETSENCRYPT_EMAIL" | tr -d ' ')
+    if _valid_le_email "$LETSENCRYPT_EMAIL"; then break; fi
+    warn "Invalid or placeholder email (example.com is rejected by Let's Encrypt). Try again."
+  done
+  printf '%s' "$LETSENCRYPT_EMAIL" > "${EMAIL_PERSIST_FILE}" 2>/dev/null || true
+  success "Let's Encrypt email: $LETSENCRYPT_EMAIL"
+}
+
 setup_dockhand() {
   step "Dockhand (standalone)"
   mkdir -p "${DOCKHAND_DATA_DIR}"
@@ -864,6 +916,12 @@ npm_change_password() {
   local NEW_PASS JSON LOGIN
   NEW_PASS=$(rand_password 24)
 
+  # Hard guard: creating the NPM admin with an empty/placeholder email produces an
+  # account we can't log into (and LE can't use) -> automation silently skips and
+  # NO proxy hosts get created (the "Congratulations / host not set up" page). The
+  # email must be resolved by get_letsencrypt_email() before we get here.
+  _valid_le_email "$LETSENCRYPT_EMAIL" || fatal "LETSENCRYPT_EMAIL is unset/invalid ('$LETSENCRYPT_EMAIL'). Cannot create the NPM admin. Set LETSENCRYPT_EMAIL=you@yourdomain.com and re-run."
+
   # NPM 2.15+ ships with NO default user: GET /api/ reports "setup":false and the
   # FIRST admin is created via an UNAUTHENTICATED POST /api/users (the old
   # admin@example.com/changeme login can NEVER work on these versions -> was the
@@ -885,16 +943,19 @@ npm_change_password() {
     chmod 600 "${STACK_DIR}/.npm_admin_password"
     NPM_TOKEN=""
     local _cu _t
-    _cu=$(jq -nc --arg pw "$NEW_PASS" '{name:"Administrator",nickname:"Admin",email:"admin@example.com",roles:["admin"],is_disabled:false,auth:{type:"password",secret:$pw}}')
+    # Create the first admin with the REAL Let's Encrypt email so NPM's own cert
+    # requests (and any issued from the UI) register a valid ACME account. Using
+    # admin@example.com here is what made every cert fail ("invalid email address").
+    _cu=$(jq -nc --arg pw "$NEW_PASS" --arg email "$LETSENCRYPT_EMAIL" '{name:"Administrator",nickname:"Admin",email:$email,roles:["admin"],is_disabled:false,auth:{type:"password",secret:$pw}}')
     for _t in 1 2 3 4 5; do
       _npm_api "/users" -d "$_cu" >/dev/null 2>&1 || true
-      LOGIN=$(_npm_api "/tokens" -d "$(jq -nc --arg s "$NEW_PASS" '{identity:"admin@example.com",secret:$s}')" 2>/dev/null) || true
+      LOGIN=$(_npm_api "/tokens" -d "$(jq -nc --arg id "$LETSENCRYPT_EMAIL" --arg s "$NEW_PASS" '{identity:$id,secret:$s}')" 2>/dev/null) || true
       NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty' 2>/dev/null)
       [[ -n "$NPM_TOKEN" ]] && break
       sleep 3
     done
     if [[ -n "$NPM_TOKEN" ]]; then
-      success "NPM first admin created (admin@example.com) - password saved to ${STACK_DIR}/.npm_admin_password (mode 600)"
+      success "NPM first admin created (${LETSENCRYPT_EMAIL}) - password saved to ${STACK_DIR}/.npm_admin_password (mode 600)"
       return 0
     fi
     warn "NPM setup-mode first-user creation failed; falling back to the legacy default-login path."
@@ -917,10 +978,31 @@ npm_change_password() {
   done
   printf "\r" >&2
   if [[ -z "$NPM_TOKEN" ]]; then
+    # REDEPLOY over PERSISTED NPM data: not setup-mode (admin exists) and not on
+    # 'changeme' (a prior run already secured it). Recover by logging in with the
+    # password THIS script saved last time, trying the real email and the legacy
+    # placeholder. If it works we already own the account and can proceed.
+    local _saved=""
+    [[ -f "${STACK_DIR}/.npm_admin_password" ]] && _saved=$(tr -d '\n' < "${STACK_DIR}/.npm_admin_password" 2>/dev/null || true)
+    if [[ -n "$_saved" ]]; then
+      local _id
+      for _id in "$LETSENCRYPT_EMAIL" "admin@example.com"; do
+        LOGIN=$(_npm_api "/tokens" -d "$(jq -nc --arg id "$_id" --arg s "$_saved" '{identity:$id,secret:$s}')" 2>/dev/null) || true
+        NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty' 2>/dev/null)
+        [[ -n "$NPM_TOKEN" ]] && break
+      done
+    fi
+    if [[ -n "$NPM_TOKEN" ]]; then
+      # Ensure the existing account's email is the real one (older runs used the
+      # placeholder) so cert issuance works, and re-affirm the saved password.
+      _npm_api "/users/1" -X PUT -d "$(jq -nc --arg email "$LETSENCRYPT_EMAIL" '{name:"Administrator",nickname:"Admin",email:$email,roles:["admin"],is_disabled:false}')" >/dev/null 2>&1 || true
+      success "Reused existing NPM admin via saved password (${LETSENCRYPT_EMAIL})"
+      return 0
+    fi
     # Log the raw rejection so the cause is diagnosable (wrong default creds, NPM
     # not ready, API shape change) instead of a blind "skipping".
     _log "WARN" "NPM /tokens login response: $(printf '%s' "$LOGIN" | tr -d '\n' | cut -c1-300)"
-    warn "Could not get NPM token (default admin@example.com/changeme rejected after retries). Raw response in ${LOG_FILE}. Skipping automated NPM setup - change the password manually at :81."
+    warn "Could not get NPM token (setup-mode, 'changeme', and saved-password all failed). Raw response in ${LOG_FILE}. Skipping automated NPM setup - change the password manually at :81, or wipe NPM data and re-run."
     return 1
   fi
 
@@ -931,10 +1013,16 @@ npm_change_password() {
   chmod 600 "${STACK_DIR}/.npm_admin_password"
   JSON=$(jq -nc --arg s "$NEW_PASS" '{type:"password",current:"changeme",secret:$s}')
   _npm_api "/users/1/auth" -X PUT -d "$JSON" >/dev/null 2>&1 || true
+  # Replace the placeholder account email (admin@example.com) with the REAL one so
+  # Let's Encrypt account registration succeeds. Uses the token from the changeme
+  # login, which stays valid across the password change. After this the login
+  # identity is $LETSENCRYPT_EMAIL, so re-auth below uses it.
+  JSON=$(jq -nc --arg email "$LETSENCRYPT_EMAIL" '{name:"Administrator",nickname:"Admin",email:$email,roles:["admin"],is_disabled:false}')
+  _npm_api "/users/1" -X PUT -d "$JSON" >/dev/null 2>&1 || true
   # Re-authenticate with new password (retry: NPM can briefly 401 right after the change)
   NPM_TOKEN=""
   for _ in 1 2 3; do
-    JSON=$(jq -nc --arg s "$NEW_PASS" '{identity:"admin@example.com",secret:$s}')
+    JSON=$(jq -nc --arg id "$LETSENCRYPT_EMAIL" --arg s "$NEW_PASS" '{identity:$id,secret:$s}')
     LOGIN=$(_npm_api "/tokens" -d "$JSON" 2>/dev/null) || true
     NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty')
     [[ -n "$NPM_TOKEN" ]] && break
@@ -995,23 +1083,53 @@ npm_enable_ssl() {
   # 3) merge SSL fields, PUT full object. MUST send all fields because
   # NPM's PUT replaces the resource — a partial set loses forward_host
   # (NPM derives it from domain prefix; breaks on hostnames that differ
-  # from the prefix, e.g. "authentik-server" vs "authentik.onlyfos.com").
+  # from the prefix, e.g. "authentik-server" vs "authentik.example.com").
   local HOST_ID="$1"
   local DOMAIN_NAME="$2"
-  local EMAIL="${3:-admin@${DOMAIN}}"
+  local EMAIL="${3:-$LETSENCRYPT_EMAIL}"
   local JSON RESP CERT_ID HOST_JSON
 
-  JSON=$(jq -nc --arg email "$EMAIL" --arg domain "$DOMAIN_NAME" '{
-    provider: "letsencrypt",
-    nice_name: $domain,
-    domain_names: [$domain],
-    meta: { letsencrypt_email: $email, letsencrypt_agree: true, dns_challenge: false }
-  }')
-  info "Requesting Let's Encrypt certificate for ${DOMAIN_NAME} (can take up to 2 minutes)..."
+  # Challenge selection:
+  #  - CF_API_TOKEN set  -> DNS-01 via Cloudflare. This is the RELIABLE path here:
+  #    every proxy host is gated by Authentik forward-auth (server-level
+  #    auth_request), which 302-redirects the HTTP-01 /.well-known/acme-challenge/
+  #    path before the cert exists, so HTTP-01 validation fails. DNS-01 never
+  #    touches nginx, so it works behind the auth gate (and behind a Cloudflare
+  #    proxied/orange-cloud record).
+  #  - no token          -> HTTP-01 (webroot) fallback.
+  if [[ -n "${CF_API_TOKEN:-}" ]]; then
+    JSON=$(jq -nc --arg email "$EMAIL" --arg domain "$DOMAIN_NAME" --arg tok "$CF_API_TOKEN" '{
+      provider: "letsencrypt",
+      nice_name: $domain,
+      domain_names: [$domain],
+      meta: {
+        letsencrypt_email: $email,
+        letsencrypt_agree: true,
+        dns_challenge: true,
+        dns_provider: "cloudflare",
+        dns_provider_credentials: ("dns_cloudflare_api_token = " + $tok),
+        propagation_seconds: 30
+      }
+    }')
+    info "Requesting Let's Encrypt cert for ${DOMAIN_NAME} via Cloudflare DNS-01 (can take up to 2 minutes)..."
+  else
+    JSON=$(jq -nc --arg email "$EMAIL" --arg domain "$DOMAIN_NAME" '{
+      provider: "letsencrypt",
+      nice_name: $domain,
+      domain_names: [$domain],
+      meta: { letsencrypt_email: $email, letsencrypt_agree: true, dns_challenge: false }
+    }')
+    info "Requesting Let's Encrypt certificate for ${DOMAIN_NAME} via HTTP-01 (can take up to 2 minutes)..."
+  fi
   RESP=$(_npm_api "/nginx/certificates" --max-time 180 -X POST -d "$JSON") || true
   CERT_ID=$(echo "$RESP" | jq -r '.id // empty')
   if [[ -z "$CERT_ID" ]]; then
-    warn "Certificate issuance failed for ${DOMAIN_NAME} (is DNS pointed at this server yet?). Host stays HTTP-only; add SSL in the NPM UI once DNS resolves."
+    _log "WARN" "NPM cert response for ${DOMAIN_NAME}: $(printf '%s' "$RESP" | tr -d '\n' | cut -c1-400)"
+    if [[ -n "${CF_API_TOKEN:-}" ]]; then
+      warn "Cloudflare DNS-01 cert failed for ${DOMAIN_NAME}. Check: CF token has Zone:DNS:Edit on ${DOMAIN}, and the email is valid. Raw response in ${LOG_FILE}. Host stays HTTP-only for now."
+    else
+      warn "HTTP-01 cert failed for ${DOMAIN_NAME} (host is behind Authentik, which can block the ACME challenge). Provide CF_API_TOKEN for reliable DNS-01. Raw response in ${LOG_FILE}. Host stays HTTP-only."
+    fi
     return 1
   fi
 
@@ -2312,7 +2430,7 @@ authentik.${DOMAIN} ->  authentik-server:9000
 
 ${C_B}Nginx Proxy Manager${C_R}
   Admin:   http://${ip}:81
-  Login:   admin@example.com
+  Login:   ${LETSENCRYPT_EMAIL:-admin@example.com}
   Password:${C_YEL} ${npm_password}${C_R}
   HTTP:    http://${ip}:80
   HTTPS:   https://${ip}:443
@@ -2541,6 +2659,10 @@ main() {
   ensure_ip_forwarding
   setup_docker_network
   get_user_domain
+  get_letsencrypt_email   # MUST run on both new-domain AND domain-reuse paths;
+                          # keep it here (not inside get_user_domain, whose reuse
+                          # branch returns early) so LETSENCRYPT_EMAIL is always set
+                          # before NPM admin creation + cert issuance.
   setup_dockhand
   setup_stack
   setup_firewall

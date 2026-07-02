@@ -528,8 +528,6 @@ get_user_domain() {
     fatal "Invalid domain: '$DOMAIN'"
   printf '%s' "$DOMAIN" > "${DOMAIN_PERSIST_FILE}" || warn "Could not persist domain to ${DOMAIN_PERSIST_FILE}"
   success "Domain set to: $DOMAIN"
-
-  get_letsencrypt_email
 }
 
 # Validate an email for Let's Encrypt: must look like a real address AND must NOT
@@ -937,6 +935,12 @@ npm_change_password() {
   local NEW_PASS JSON LOGIN
   NEW_PASS=$(rand_password 24)
 
+  # Hard guard: creating the NPM admin with an empty/placeholder email produces an
+  # account we can't log into (and LE can't use) -> automation silently skips and
+  # NO proxy hosts get created (the "Congratulations / host not set up" page). The
+  # email must be resolved by get_letsencrypt_email() before we get here.
+  _valid_le_email "$LETSENCRYPT_EMAIL" || fatal "LETSENCRYPT_EMAIL is unset/invalid ('$LETSENCRYPT_EMAIL'). Cannot create the NPM admin. Set LETSENCRYPT_EMAIL=you@yourdomain.com and re-run."
+
   # NPM 2.15+ ships with NO default user: GET /api/ reports "setup":false and the
   # FIRST admin is created via an UNAUTHENTICATED POST /api/users (the old
   # admin@example.com/changeme login can NEVER work on these versions -> was the
@@ -993,10 +997,31 @@ npm_change_password() {
   done
   printf "\r" >&2
   if [[ -z "$NPM_TOKEN" ]]; then
+    # REDEPLOY over PERSISTED NPM data: not setup-mode (admin exists) and not on
+    # 'changeme' (a prior run already secured it). Recover by logging in with the
+    # password THIS script saved last time, trying the real email and the legacy
+    # placeholder. If it works we already own the account and can proceed.
+    local _saved=""
+    [[ -f "${STACK_DIR}/.npm_admin_password" ]] && _saved=$(tr -d '\n' < "${STACK_DIR}/.npm_admin_password" 2>/dev/null || true)
+    if [[ -n "$_saved" ]]; then
+      local _id
+      for _id in "$LETSENCRYPT_EMAIL" "admin@example.com"; do
+        LOGIN=$(_npm_api "/tokens" -d "$(jq -nc --arg id "$_id" --arg s "$_saved" '{identity:$id,secret:$s}')" 2>/dev/null) || true
+        NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty' 2>/dev/null)
+        [[ -n "$NPM_TOKEN" ]] && break
+      done
+    fi
+    if [[ -n "$NPM_TOKEN" ]]; then
+      # Ensure the existing account's email is the real one (older runs used the
+      # placeholder) so cert issuance works, and re-affirm the saved password.
+      _npm_api "/users/1" -X PUT -d "$(jq -nc --arg email "$LETSENCRYPT_EMAIL" '{name:"Administrator",nickname:"Admin",email:$email,roles:["admin"],is_disabled:false}')" >/dev/null 2>&1 || true
+      success "Reused existing NPM admin via saved password (${LETSENCRYPT_EMAIL})"
+      return 0
+    fi
     # Log the raw rejection so the cause is diagnosable (wrong default creds, NPM
     # not ready, API shape change) instead of a blind "skipping".
     _log "WARN" "NPM /tokens login response: $(printf '%s' "$LOGIN" | tr -d '\n' | cut -c1-300)"
-    warn "Could not get NPM token (default admin@example.com/changeme rejected after retries). Raw response in ${LOG_FILE}. Skipping automated NPM setup - change the password manually at :81."
+    warn "Could not get NPM token (setup-mode, 'changeme', and saved-password all failed). Raw response in ${LOG_FILE}. Skipping automated NPM setup - change the password manually at :81, or wipe NPM data and re-run."
     return 1
   fi
 
@@ -1077,7 +1102,7 @@ npm_enable_ssl() {
   # 3) merge SSL fields, PUT full object. MUST send all fields because
   # NPM's PUT replaces the resource — a partial set loses forward_host
   # (NPM derives it from domain prefix; breaks on hostnames that differ
-  # from the prefix, e.g. "authentik-server" vs "authentik.onlyfos.com").
+  # from the prefix, e.g. "authentik-server" vs "authentik.example.com").
   local HOST_ID="$1"
   local DOMAIN_NAME="$2"
   local EMAIL="${3:-$LETSENCRYPT_EMAIL}"
@@ -2653,6 +2678,10 @@ main() {
   ensure_ip_forwarding
   setup_docker_network
   get_user_domain
+  get_letsencrypt_email   # MUST run on both new-domain AND domain-reuse paths;
+                          # keep it here (not inside get_user_domain, whose reuse
+                          # branch returns early) so LETSENCRYPT_EMAIL is always set
+                          # before NPM admin creation + cert issuance.
   setup_arcane
   setup_stack
   setup_firewall
