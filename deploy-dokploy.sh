@@ -1656,9 +1656,13 @@ verify_deployment() {
   }
 
   # Containers
-  local want="npm dokploy authelia crowdsec"
+  local want=(npm dokploy authelia crowdsec)
+  # NOTE: must be an array - the global IFS (newline+tab, NO space) means the old
+  # space-separated STRING never word-split: every check ran ONCE against the
+  # whole string and always failed (false "VERIFY FAILED: container ... running").
+  [[ "${INSTALL_CROWDSEC_WEBUI:-1}" == "1" ]] && want+=(crowdsec-web-ui)
   local c
-  for c in $want; do
+  for c in "${want[@]}"; do
     _check "container '$c' running" bash -c "docker ps --format '{{.Names}}' | grep -qx '$c'"
   done
 
@@ -1844,6 +1848,116 @@ ensure_ip_forwarding() {
   else warn "IP forwarding still off (=$ipf) - published ports 80/443/81 may be unreachable"; fi
 }
 
+# -------------------------------------------------------------------------------
+# CrowdSec Web UI (TheDuffman85/crowdsec-web-ui) — installed BY DEFAULT.
+# Dashboard for the CrowdSec LAPI: view/manage decisions (bans), alerts, metrics.
+# It authenticates to the LAPI as a registered MACHINE (watcher) — not a bouncer —
+# over the shared `proxy` network (crowdsec:8080). No published host ports; it is
+# reached through NPM at crowdsec.<domain>.
+#
+# CLEAN REMOVAL (nothing else depends on it):
+#   docker compose -p crowdsec-webui -f <STACK_DIR>/docker-compose.crowdsec-webui.yml down
+#   docker exec crowdsec cscli machines delete crowdsec-web-ui
+#   rm -rf <STACK_DIR>/crowdsec-webui <STACK_DIR>/docker-compose.crowdsec-webui.yml
+#   ...then delete the crowdsec.<domain> proxy host in the NPM UI. Done.
+# Skip the install entirely with INSTALL_CROWDSEC_WEBUI=0.
+# -------------------------------------------------------------------------------
+setup_crowdsec_webui() {
+  step "CrowdSec Web UI (dashboard)"
+  if [[ "${INSTALL_CROWDSEC_WEBUI:-1}" != "1" ]]; then
+    info "INSTALL_CROWDSEC_WEBUI=0 — skipping CrowdSec Web UI"
+    return 0
+  fi
+  if ! docker ps --format '{{.Names}}' | grep -qx "crowdsec"; then
+    warn "CrowdSec container not running — skipping Web UI (re-run the deploy, or install manually later)"
+    return 0
+  fi
+  local ui_dir="${STACK_DIR}/crowdsec-webui"
+  mkdir -p "${ui_dir}/data"
+
+  # Register the UI as a LAPI *machine* (watcher) — NOT a bouncer key. A fresh
+  # password is generated on every deploy; -f /dev/null stops cscli from
+  # overwriting the agent's own credentials file inside the container.
+  local ui_pass
+  ui_pass=$(rand_password 32)
+  docker exec crowdsec cscli machines delete crowdsec-web-ui &>/dev/null || true
+  if ! docker exec crowdsec cscli machines add crowdsec-web-ui --password "${ui_pass}" -f /dev/null &>/dev/null; then
+    warn "Could not register the Web UI machine with the CrowdSec LAPI — skipping."
+    warn "  Manual fix: docker exec crowdsec cscli machines add crowdsec-web-ui --password '<pw>' -f /dev/null"
+    warn "  then put that password in ${ui_dir}/webui.env and re-run: docker compose -p crowdsec-webui -f ${STACK_DIR}/docker-compose.crowdsec-webui.yml up -d"
+    return 0
+  fi
+
+  # AUTH_ENABLED=true = the UI's own login (created on your FIRST visit — do it
+  # before an attacker does). Set to false ONLY if the proxy host is gated by the
+  # identity provider and you accept single-layer auth.
+  cat > "${ui_dir}/webui.env" << WEBUI_ENV
+CROWDSEC_URL=http://crowdsec:8080
+CROWDSEC_USER=crowdsec-web-ui
+CROWDSEC_PASSWORD=${ui_pass}
+CROWDSEC_PROMETHEUS_URL=http://crowdsec:6060/metrics
+AUTH_ENABLED=true
+DB_DIR=/app/data
+WEBUI_ENV
+  chmod 600 "${ui_dir}/webui.env"
+
+  cat > "${STACK_DIR}/docker-compose.crowdsec-webui.yml" << 'COMPOSE_WEBUI'
+services:
+  crowdsec-web-ui:
+    image: ghcr.io/theduffman85/crowdsec-web-ui:latest
+    container_name: crowdsec-web-ui
+    hostname: crowdsec-web-ui
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - ./crowdsec-webui/webui.env
+    volumes:
+      - ./crowdsec-webui/data:/app/data
+    networks:
+      - proxy
+networks:
+  proxy:
+    external: true
+COMPOSE_WEBUI
+
+  info "Pulling CrowdSec Web UI image..."
+  docker compose -p crowdsec-webui -f "${STACK_DIR}/docker-compose.crowdsec-webui.yml" pull >>"${LOG_FILE}" 2>&1 || true
+  if ! docker compose -p crowdsec-webui -f "${STACK_DIR}/docker-compose.crowdsec-webui.yml" up -d >>"${LOG_FILE}" 2>&1; then
+    warn "CrowdSec Web UI failed to start — check: docker logs crowdsec-web-ui"
+    return 0
+  fi
+  local i
+  for i in $(seq 1 15); do
+    docker ps --format '{{.Names}}' | grep -qx "crowdsec-web-ui" && break
+    sleep 2
+  done
+  if docker ps --format '{{.Names}}' | grep -qx "crowdsec-web-ui"; then
+    success "CrowdSec Web UI running (crowdsec-web-ui:3000 on the proxy network)"
+  else
+    warn "CrowdSec Web UI container not up yet — check: docker logs crowdsec-web-ui"
+  fi
+
+  # Proxy host crowdsec.<domain>. Needs the NPM token from automate_npm. When the
+  # Authelia snippets exist they gate the host (the *.<domain> wildcard policy
+  # covers every subdomain automatically); on Authentik stacks the host relies on
+  # the UI's own login instead — gate it behind Authentik later like any other
+  # app (provider + application + the two authentik include lines) if you want.
+  if [[ -n "${NPM_TOKEN:-}" ]]; then
+    local ui_snippet=""
+    if [[ -f "${NPM_DATA_DIR}/nginx/custom/authelia-authrequest.conf" ]]; then
+      ui_snippet=$'include /data/nginx/custom/authelia-location.conf;\ninclude /data/nginx/custom/authelia-authrequest.conf;'
+    fi
+    local ui_id=""
+    ui_id=$(npm_create_proxy_host "crowdsec.${DOMAIN}" "crowdsec-web-ui" 3000 true "$ui_snippet") || true
+    [[ -n "$ui_id" && "${NPM_SKIP_SSL:-0}" != "1" ]] && npm_enable_ssl "$ui_id" "crowdsec.${DOMAIN}" || true
+    [[ -n "$ui_id" ]] && info "CrowdSec dashboard: crowdsec.${DOMAIN} — FIRST VISIT creates the UI admin account, do it now"
+  else
+    info "NPM automation unavailable — add the proxy host manually: crowdsec.${DOMAIN} -> crowdsec-web-ui:3000 (scheme http)"
+  fi
+  return 0
+}
+
 main() {
   printf "\n${C_B}${C_CYN}VPS Deployment -- Docker + NPM + Dokploy + Authelia + CrowdSec${C_R}\n" >&2
   printf "${C_DIM}${SCRIPT_NAME} v${SCRIPT_VERSION}${C_R}\n\n" >&2
@@ -1864,6 +1978,7 @@ main() {
   setup_crowdsec_console
   setup_logrotate
   automate_npm
+  setup_crowdsec_webui
   verify_deployment
   DEPLOY_STATUS="success"
   print_summary

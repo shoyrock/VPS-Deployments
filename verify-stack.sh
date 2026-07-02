@@ -16,7 +16,10 @@ hdr(){  printf "\n${C_B}${C_C}== %s ==${C_R}\n" "$*"; }
 [[ "${EUID:-$(id -u)}" -eq 0 ]] || { echo "Run as root: sudo bash $0"; exit 1; }
 command -v docker >/dev/null 2>&1 || { echo "docker not found"; exit 1; }
 
-STACK_DIR="/opt/dockhand-stack"
+# v4.9.0 moved the stack under /opt/apps; fall back to the pre-move path so this
+# script still verifies older deployments.
+STACK_DIR="/opt/apps/dockhand-stack"
+[[ -d "$STACK_DIR" ]] || STACK_DIR="/opt/dockhand-stack"
 AUTHENTIK_DIR="${STACK_DIR}/authentik"
 DOMAIN="$(tr -d '\n' < /etc/vps-deploy-domain 2>/dev/null || true)"
 printf "${C_B}Dockhand stack health + security audit${C_R}  domain=${DOMAIN:-<unknown>}\n"
@@ -27,6 +30,10 @@ for c in npm dockhand authentik-server authentik-worker authentik-postgres authe
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$c"; then pass "container $c running"
   else fail "container $c NOT running"; fi
 done
+# CrowdSec Web UI is optional/removable: only check when its compose file exists.
+if [[ -f "${STACK_DIR}/docker-compose.crowdsec-webui.yml" ]]; then
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -qx crowdsec-web-ui && pass "container crowdsec-web-ui running" || warn "container crowdsec-web-ui NOT running (removed? see README to reinstall)"
+fi
 
 # ---- B. Service health ----------------------------------------------------
 hdr "Service health"

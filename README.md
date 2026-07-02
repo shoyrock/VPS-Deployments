@@ -1,4 +1,4 @@
-# VPS Deployment Scripts — v4.9.0-hardened-cloudflare
+# VPS Deployment Scripts — v4.10.0-hardened-cloudflare
 
 > ⚠️ **SECURITY DISCLAIMER — READ BEFORE USING**
 >
@@ -15,6 +15,12 @@
 One-shot, hardened deployment scripts for fresh VPS instances. Every script deploys **Nginx Proxy Manager** (reverse proxy + SSL), an **identity provider** (Authelia SSO + 2FA, or Authentik on the authentik variants), **CrowdSec** (IPS with NPM-aware collections + firewall bouncer), and **firewall rules**.
 
 ---
+
+## What's New in v4.10.0
+
+- **CrowdSec Web UI installed by default** on all 11 NPM-based scripts — dashboard at `crowdsec.<domain>` for bans/alerts/metrics, auto-registered with the LAPI, cleanly removable (see the CrowdSec section). Skip with `INSTALL_CROWDSEC_WEBUI=0`.
+- **`harden.sh` detects the real SSH port** (UFW rate-limit + GeoIP SSH gate + verify) — a custom SSH port no longer risks lockout.
+- **NPMplus evaluated, staying on NPM** — see CHANGELOG for the decision record.
 
 ## What's New in v4.9.0
 
@@ -114,6 +120,7 @@ sudo ./deploy-freedombox.sh            # Deploy FreedomBox (Debian 12 only)
 
 **Env vars** (all optional):
 - `FORCE_CLEANUP=1` — skip the destructive-cleanup confirmation (for CI/unattended runs)
+- `INSTALL_CROWDSEC_WEBUI=0` — skip the CrowdSec Web UI dashboard (installed by default; see the CrowdSec section)
 - `CF_API_TOKEN=<token>` — Cloudflare **User** API token; enables the CrowdSec Cloudflare Worker bouncer non-interactively. If unset, the script prompts (blank = configure now, deploy later).
 - `CF_BOUNCER_ACTION=ban|captcha` — edge action for banned IPs (default `ban`; `captcha` challenges instead of blocking).
 - `LOCK_HTTP_TO_CLOUDFLARE=true` — restrict ports 80/443 to Cloudflare's published IP ranges in the firewall (default `false`; turn on once all DNS is proxied through Cloudflare).
@@ -140,6 +147,7 @@ Every script deploys the same core stack plus one platform:
 | **Authelia** *(default)* | `authelia` | SSO login portal + TOTP 2FA on `authelia.YOURDOMAIN.com` |
 | **Authentik** *(authentik variants)* | `authentik-server`, `authentik-worker`, `authentik-postgres`, `authentik-redis` | Full IdP: SSO login portal + TOTP 2FA + OIDC/SAML providers on `authentik.YOURDOMAIN.com` |
 | **CrowdSec** | `crowdsec` | Log-based intrusion detection, SSH + NPM monitoring; enrolled in the CrowdSec Console (cloud) |
+| **CrowdSec Web UI** | `crowdsec-web-ui` | Dashboard for the CrowdSec LAPI at `crowdsec.YOURDOMAIN.com` — view/manage bans, alerts, metrics. Installed by default; `INSTALL_CROWDSEC_WEBUI=0` to skip |
 | **Firewall Bouncer** | systemd service | IP ban enforcement via iptables/nftables |
 | **Your Platform** | varies | e.g. dockhand, portainer, dockge, etc. |
 
@@ -341,6 +349,28 @@ CrowdSec runs as a Docker container with these free, log-based hub collections:
 
 The **firewall bouncer** runs as a systemd service and enforces bans in real time at the iptables/nftables level, including Docker-published ports via the `DOCKER-USER` chain.
 
+### CrowdSec Web UI (installed by default)
+
+Every NPM-based deploy also installs **[CrowdSec Web UI](https://github.com/TheDuffman85/crowdsec-web-ui)** — a dashboard for the CrowdSec LAPI (decisions/bans, alerts, metrics) at **`https://crowdsec.YOURDOMAIN.com`**.
+
+- **First visit creates the UI's admin account** (`AUTH_ENABLED=true`) — do it right after deploy, before someone else does. On Authelia stacks the host is *also* behind Authelia forward-auth; on the Authentik stack it relies on the UI's own login (gate it behind Authentik later like any other app if you prefer).
+- It authenticates to the LAPI as a registered **machine** (watcher), not a bouncer. Credentials: `STACK_DIR/crowdsec-webui/webui.env` (mode 600, random per deploy).
+- Runs as its own compose project — nothing else depends on it.
+
+**Skip it at deploy:** `INSTALL_CROWDSEC_WEBUI=0 sudo ./deploy-*.sh`
+
+**Remove it cleanly later** (no side effects on NPM/CrowdSec/bans):
+
+```bash
+cd /opt/apps/dockhand-stack    # or your platform's STACK_DIR
+docker compose -p crowdsec-webui -f docker-compose.crowdsec-webui.yml down
+docker exec crowdsec cscli machines delete crowdsec-web-ui
+rm -rf crowdsec-webui docker-compose.crowdsec-webui.yml
+# finally: delete the crowdsec.<domain> proxy host in the NPM UI
+```
+
+*(Not installed by `deploy-netbird.sh` — different ingress; use the `VPS Compose/crowdsec-web-ui` stack there manually.)*
+
 ### Cloudflare edge enforcement (optional, free)
 
 Set `CF_API_TOKEN` (a Cloudflare **User** API token) and the deploy installs the **CrowdSec Cloudflare Worker bouncer**, blocking banned IPs at Cloudflare's edge before traffic reaches the VPS. NPM is also configured to restore the real visitor IP from `CF-Connecting-IP` (so bans key on the true client, not Cloudflare). All free, no subscription.
@@ -449,6 +479,7 @@ STACK_DIR/
 ├── docker-compose.npm.yml
 ├── docker-compose.authelia.yml          (or docker-compose.authentik.yml)
 ├── docker-compose.crowdsec.yml
+├── docker-compose.crowdsec-webui.yml    (CrowdSec dashboard — remove cleanly anytime)
 ├── docker-compose.<platform>.yml        (if applicable)
 ├── data/                ← NPM data
 ├── letsencrypt/         ← SSL certificates
