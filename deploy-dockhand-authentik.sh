@@ -1951,10 +1951,13 @@ setup_cloudflare_bouncer() {
     printf "\n${C_B}Cloudflare Worker bouncer${C_R} blocks banned IPs at Cloudflare's edge.\n" >&2
     printf "It needs a Cloudflare ${C_B}User${C_R} API token (My Profile > API Tokens, NOT an\n" >&2
     printf "Account token). Supplying it now will deploy a Worker + KV to your account.\n" >&2
-    printf "${C_B}Required perms${C_R} (CrowdSec's official set - the bouncer validates ALL of\n" >&2
-    printf "these, so do not drop any): Account(Workers KV Storage:Edit, Workers\n" >&2
+    printf "${C_B}Required perms${C_R} (CrowdSec's bouncer set PLUS DNS:Edit for auto-SSL -\n" >&2
+    printf "do not drop any): Account(Workers KV Storage:Edit, Workers\n" >&2
     printf "  Scripts:Edit, Turnstile:Edit, Account Settings:Read, Account Analytics:Read),\n" >&2
-    printf "  User(User Details:Read), Zone(DNS:Read, Workers Routes:Edit, Zone:Read)\n" >&2
+    printf "  User(User Details:Read), Zone(${C_B}DNS:Edit${C_R}, Workers Routes:Edit, Zone:Read)\n" >&2
+    printf "  ${C_B}NOTE:${C_R} Zone ${C_B}DNS:Edit${C_R} (not just DNS:Read) is REQUIRED - this same token\n" >&2
+    printf "  lets NPM auto-issue SSL certs via Cloudflare DNS-01 (writes an ACME TXT\n" >&2
+    printf "  record). With only DNS:Read, cert issuance fails with a Cloudflare 403.\n" >&2
     printf "${C_B}Minimize by SCOPE${C_R} (not by removing perms): under 'Account Resources'\n" >&2
     printf "  pick ${C_B}Include > <your account>${C_R} only, and under 'Zone Resources' pick\n" >&2
     printf "  ${C_B}Include > Specific zone > ${DOMAIN}${C_R} only - never 'All accounts/zones'.\n" >&2
