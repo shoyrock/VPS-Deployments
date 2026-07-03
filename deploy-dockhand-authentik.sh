@@ -1994,6 +1994,12 @@ setup_cloudflare_bouncer() {
   elif [[ "$OS_FAMILY" == "debian" ]]; then
     info "Adding CrowdSec repository + installing the worker bouncer..."
     curl -s https://packagecloud.io/install/repositories/crowdsec/crowdsec/script.deb.sh | bash >>"$LOG_FILE" 2>&1 || true
+    # Stop the package postinst from AUTO-STARTING the service. On accounts without
+    # Workers Analytics Engine the daemon FATALs immediately, and dpkg then prints a
+    # "Job for ... failed" error + exits non-zero (console noise + a half-configured
+    # package). A policy-rc.d returning 101 makes the postinst's service start a
+    # clean no-op; WE start it, controlled + quietly, in step 5.
+    printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d 2>/dev/null && chmod +x /usr/sbin/policy-rc.d 2>/dev/null || true
     # CRITICAL: the package ships its own conffile; our pre-created stub (above)
     # makes dpkg treat it as locally modified, so the postinst conffile handler
     # shows an interactive "(Y/I/N/O/D/Z)?" prompt. DEBIAN_FRONTEND=noninteractive
@@ -2003,6 +2009,7 @@ setup_cloudflare_bouncer() {
       -o Dpkg::Lock::Timeout=300 \
       -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef \
       crowdsec-cloudflare-worker-bouncer </dev/null >>"$LOG_FILE" 2>&1 || true
+    rm -f /usr/sbin/policy-rc.d 2>/dev/null || true
     command -v crowdsec-cloudflare-worker-bouncer &>/dev/null && have_bin=true
   else
     info "Adding CrowdSec repository + installing the worker bouncer..."
@@ -2048,6 +2055,16 @@ setup_cloudflare_bouncer() {
   esac
   local cf_turnstile="false"
   [[ "$CF_BOUNCER_ACTION" == "captcha" ]] && cf_turnstile="true"
+  # Unique Cloudflare resource names per DOMAIN so multiple VPS under ONE Cloudflare
+  # account never clobber each other's Worker/KV. The bouncer's defaults
+  # (crowdsec-cloudflare-worker-bouncer / CROWDSECCFBOUNCERNS) are shared globals -
+  # its own config comments say to change script_name / kv_namespace_name /
+  # decisions_sync_script_name "when sharing a Cloudflare account with another
+  # bouncer instance". Derive DNS-safe, deterministic names from the domain.
+  local wsafe wsafe_up
+  wsafe=$(printf '%s' "${DOMAIN:-crowdsec}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/-\{1,\}/-/g; s/^-//; s/-$//')
+  [[ -n "$wsafe" ]] || wsafe="crowdsec"
+  wsafe_up=$(printf '%s' "$wsafe" | tr 'a-z-' 'A-Z_')
   cat > "$cfg" << CFWB
 crowdsec_config:
   lapi_key: ${CF_BOUNCER_KEY}
@@ -2076,6 +2093,10 @@ cloudflare_config:
             mode: managed
   worker:
     log_only: false
+    # Per-domain names so two VPS on one CF account don't overwrite each other:
+    script_name: crowdsec-${wsafe}
+    kv_namespace_name: CROWDSEC_${wsafe_up}
+    decisions_sync_script_name: crowdsec-sync-${wsafe}
 
 log_level: info
 log_media: stdout
@@ -2088,50 +2109,53 @@ CFWB
   chmod 600 "$cfg"
   success "Wrote ${cfg}"
 
-  # 5. Deploy: starting the daemon creates the CF Worker + KV + route from config.
+  # 5. Deploy. The CF Worker bouncer HARD-REQUIRES Workers Analytics Engine, which
+  #    Cloudflare only enables from the dashboard (no API). Most accounts have it
+  #    OFF, so instead of enabling a service that would crash-loop and spew errors,
+  #    we do ONE controlled foreground run: the bouncer itself is the authority on
+  #    whether this account can deploy the Worker. AE off -> it FATALs in ~3s and we
+  #    skip QUIETLY (edge enforcement is OPTIONAL; the host firewall bouncer already
+  #    enforces every ban). AE on -> the run deploys the Worker and we enable the
+  #    persistent service.
   if $have_bin && [[ -n "$zone_id" && -n "$account_id" ]]; then
     systemctl daemon-reload 2>/dev/null || true
-    systemctl enable crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 \
-      || warn "systemctl enable failed for worker bouncer (unit missing?)"
-    local start_mark; start_mark=$(date '+%Y-%m-%d %H:%M:%S')
-    systemctl restart crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 || true
-    # The unit is Restart=always, so a CRASH-LOOPING service still shows 'active'
-    # for the ~1s window each cycle. A single is-active poll false-reports success.
-    # Sample across ~16s and require it to be running at the END with NO new
-    # restart between samples; also surface known-fatal causes from the journal.
-    local restarts1 restarts2 sub jtail
-    sleep 8
-    restarts1=$(systemctl show -p NRestarts --value crowdsec-cloudflare-worker-bouncer 2>/dev/null || echo 0)
-    sleep 8
-    restarts2=$(systemctl show -p NRestarts --value crowdsec-cloudflare-worker-bouncer 2>/dev/null || echo 0)
-    sub=$(systemctl show -p SubState --value crowdsec-cloudflare-worker-bouncer 2>/dev/null || echo unknown)
-    jtail=$(journalctl -u crowdsec-cloudflare-worker-bouncer --since "$start_mark" --no-pager 2>/dev/null || true)
-    printf '%s\n' "$jtail" >>"$LOG_FILE" 2>/dev/null || true
-    if systemctl is-active --quiet crowdsec-cloudflare-worker-bouncer \
-       && [[ "$sub" == "running" && "$restarts1" == "$restarts2" ]]; then
-      success "Cloudflare Worker bouncer ACTIVE - edge enforcement is live"
-      warn "ACTION REQUIRED (no Cloudflare API for this): set the Worker Route to FAIL OPEN -> CF dashboard > ${DOMAIN} > Workers Routes > edit the crowdsec route > Request limit failure mode > Fail open. Without it a worker error shows visitors a CF 1027 page."
-    elif printf '%s' "$jtail" | grep -qi 'Analytics Engine'; then
-      # Bouncer 0.0.18 hardcodes a Workers Analytics Engine binding; the account
-      # must have AE enabled or every deploy FATALs. No API to enable it.
-      error "Worker bouncer is CRASH-LOOPING: your Cloudflare account has Workers Analytics Engine DISABLED, which this bouncer requires."
-      error "  Enable it (free): Cloudflare dashboard > Workers & Pages > Analytics Engine > Enable,"
-      error "  then RE-RUN this deploy (or just CF_BOUNCER_TOKEN=... bash $0) to install + activate the worker."
-      systemctl stop crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
+    systemctl stop crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
+    local wbbin probe
+    wbbin=$(command -v crowdsec-cloudflare-worker-bouncer 2>/dev/null || echo /usr/bin/crowdsec-cloudflare-worker-bouncer)
+    # AE off -> exits fast; AE on -> deploys the Worker then keeps running until the
+    # timeout stops it (exit 124, no fatal in output).
+    probe=$(timeout 30 "$wbbin" -c "$cfg" 2>&1 || true)
+    printf '%s\n' "$probe" >>"$LOG_FILE" 2>/dev/null || true
+    if printf '%s' "$probe" | grep -qi 'Analytics Engine'; then
+      info "Cloudflare Worker (edge) bouncer skipped - this Cloudflare account has Workers"
+      info "  Analytics Engine disabled (a hard requirement of the worker bouncer; Cloudflare"
+      info "  has no API to enable it). Host-level CrowdSec banning is ACTIVE and enforcing."
+      info "  Want edge enforcement too? Enable it FREE: CF dashboard > Workers & Pages >"
+      info "  Analytics Engine, then re-run this deploy with CF_API_TOKEN set."
+      systemctl disable crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
+      _worker_pkg_clean
+    elif printf '%s' "$probe" | grep -qiE 'level=fatal|panic:|unable to deploy'; then
+      info "Cloudflare Worker (edge) bouncer skipped - deploy check did not succeed (details"
+      info "  in ${LOG_FILE}). Host-level CrowdSec banning is ACTIVE and enforcing all bans."
       systemctl disable crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
       _worker_pkg_clean
     else
-      systemctl stop crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
-      systemctl disable crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
-      _worker_pkg_clean
-      warn "Worker bouncer not stably active (SubState=${sub}, restarts ${restarts1}->${restarts2}); stopped + removed to avoid a crash-loop and keep dpkg clean. See ${LOG_FILE}. Debug: journalctl -u crowdsec-cloudflare-worker-bouncer -n 40"
+      # Deploy check passed (Worker created) -> enable the persistent service.
+      systemctl enable crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 || true
+      systemctl restart crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 || true
+      sleep 5
+      if systemctl is-active --quiet crowdsec-cloudflare-worker-bouncer; then
+        success "Cloudflare Worker bouncer ACTIVE - edge enforcement is live"
+        warn "ACTION (no Cloudflare API for this): set the Worker Route to FAIL OPEN -> CF dashboard > ${DOMAIN} > Workers Routes > edit the crowdsec route > Request limit failure mode > Fail open. Without it a worker error shows visitors a CF 1027 page."
+      else
+        info "Cloudflare Worker bouncer installed but not active yet (see ${LOG_FILE}). Host-level CrowdSec banning is ACTIVE."
+      fi
     fi
   else
-    systemctl stop crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
     systemctl disable crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
     _worker_pkg_clean
-    warn "Cloudflare Worker bouncer NOT deployed (no token/zone supplied). Edge enforcement skipped; the host firewall bouncer still enforces all bans."
-    info "Add it later: enable Analytics Engine, then re-run the deploy with CF_BOUNCER_TOKEN set (it regenerates the config + installs + activates the worker)."
+    info "Cloudflare Worker (edge) bouncer skipped (no token/zone supplied). The host firewall bouncer still enforces all bans."
+    info "Add it later: enable Analytics Engine, then re-run the deploy with CF_API_TOKEN set."
   fi
 }
 
