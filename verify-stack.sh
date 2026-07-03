@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# verify-stack.sh -- health + SECURITY audit for the Dockhand + Authentik + NPM +
-# CrowdSec stack deployed by deploy-dockhand-authentik.sh.
+# verify-stack.sh -- health + SECURITY audit for the <app> + Authentik + NPM +
+# CrowdSec stack deployed by deploy-<app>-authentik.sh (dockhand, arcane, ...).
+# GENERIC: auto-detects which app manager the stack runs (Dockhand, Arcane, ...)
+# so a single verifier works for every deploy-*-authentik.sh variant.
 # Run on the VPS as root:   sudo bash verify-stack.sh
+# Optional override:        APP_NAME=arcane sudo -E bash verify-stack.sh
 # Read-only except a self-cleaning CrowdSec ban round-trip test (192.0.2.1, RFC5737).
 set -uo pipefail
 
@@ -16,17 +19,44 @@ hdr(){  printf "\n${C_B}${C_C}== %s ==${C_R}\n" "$*"; }
 [[ "${EUID:-$(id -u)}" -eq 0 ]] || { echo "Run as root: sudo bash $0"; exit 1; }
 command -v docker >/dev/null 2>&1 || { echo "docker not found"; exit 1; }
 
-# v4.9.0 moved the stack under /opt/apps; fall back to the pre-move path so this
-# script still verifies older deployments.
-STACK_DIR="/opt/apps/dockhand-stack"
-[[ -d "$STACK_DIR" ]] || STACK_DIR="/opt/dockhand-stack"
-AUTHENTIK_DIR="${STACK_DIR}/authentik"
 DOMAIN="$(tr -d '\n' < /etc/vps-deploy-domain 2>/dev/null || true)"
-printf "${C_B}Dockhand stack health + security audit${C_R}  domain=${DOMAIN:-<unknown>}\n"
+
+# --- Detect the app manager (generic across dockhand/arcane/future) ----------
+# Precedence: APP_NAME env  >  /etc/vps-deploy-app (written by the deployer)  >
+# the <app>-stack dir under /opt/apps  >  the sole non-infra container present.
+APP="${APP_NAME:-}"
+[[ -z "$APP" && -f /etc/vps-deploy-app ]] && APP="$(tr -d '\n' < /etc/vps-deploy-app 2>/dev/null || true)"
+
+# Locate the stack dir. Prefer <app>-stack when the app is already known; else the
+# first *-stack under /opt/apps, then the pre-move /opt path.
+STACK_DIR=""
+if [[ -n "$APP" && -d "/opt/apps/${APP}-stack" ]]; then
+  STACK_DIR="/opt/apps/${APP}-stack"
+else
+  for d in /opt/apps/*-stack /opt/*-stack; do [[ -d "$d" ]] && { STACK_DIR="$d"; break; }; done
+fi
+[[ -n "$STACK_DIR" ]] || STACK_DIR="/opt/apps/dockhand-stack"
+
+# Derive the app from the stack dir name if still unknown (/opt/apps/<app>-stack).
+if [[ -z "$APP" ]]; then APP="$(basename "$STACK_DIR")"; APP="${APP%-stack}"; fi
+
+# If the named app container isn't running, fall back to the only container that
+# isn't part of the fixed infra set — that's the app manager, whatever it's called.
+if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$APP"; then
+  _cand="$(docker ps --format '{{.Names}}' 2>/dev/null \
+           | grep -vxE 'npm|authentik-server|authentik-worker|authentik-postgres|crowdsec|crowdsec-web-ui' \
+           | head -n1)"
+  [[ -n "$_cand" ]] && APP="$_cand"
+fi
+[[ -n "$APP" ]] || APP="app"
+AUTHENTIK_DIR="${STACK_DIR}/authentik"
+APP_TITLE="${APP^}"   # Title-case for prose (dockhand -> Dockhand, arcane -> Arcane)
+
+printf "${C_B}%s stack health + security audit${C_R}  app=${APP}  domain=${DOMAIN:-<unknown>}\n" "$APP_TITLE"
 
 # ---- A. Containers --------------------------------------------------------
 hdr "Containers"
-for c in npm dockhand authentik-server authentik-worker authentik-postgres authentik-redis crowdsec; do
+for c in npm "$APP" authentik-server authentik-worker authentik-postgres crowdsec; do
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$c"; then pass "container $c running"
   else fail "container $c NOT running"; fi
 done
@@ -115,24 +145,24 @@ binds="$(ss -tlnH 2>/dev/null | awk '{print $4}')"
 echo "$binds" | grep -qE '0\.0\.0\.0:8080$|\[::\]:8080$|\*:8080$' && fail "CrowdSec LAPI :8080 EXPOSED on all interfaces" || pass "CrowdSec LAPI :8080 not world-listening"
 echo "$binds" | grep -qE '0\.0\.0\.0:9000$|\[::\]:9000$|\*:9000$' && fail "Authentik :9000 EXPOSED on all interfaces" || pass "Authentik :9000 not world-listening"
 echo "$binds" | grep -qE '0\.0\.0\.0:81$|\[::\]:81$|\*:81$'       && warn "NPM admin UI :81 listening on all interfaces -- restrict to LAN/VPN" || pass "NPM admin :81 not world-open"
-# Dockhand host filesystem mount must be read-only
-mnt="$(docker inspect -f '{{range .Mounts}}{{.Destination}}={{.RW}}{{"\n"}}{{end}}' dockhand 2>/dev/null | grep '^/host=')"
+# App host filesystem mount must be read-only
+mnt="$(docker inspect -f '{{range .Mounts}}{{.Destination}}={{.RW}}{{"\n"}}{{end}}' "$APP" 2>/dev/null | grep '^/host=')"
 if [[ -n "$mnt" ]]; then
-  echo "$mnt" | grep -q '=false$' && pass "Dockhand host fs mounted READ-ONLY (/host:ro)" || fail "Dockhand host fs mounted READ-WRITE -- a Dockhand compromise = root on host"
-else warn "Dockhand /host mount not found (ok if intentionally removed)"; fi
-docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' dockhand 2>/dev/null | grep -q '/var/run/docker.sock' \
-  && warn "Dockhand has docker.sock (root-equivalent, by design) -- the auth gate is your ONLY protection" || true
-# Authentik forward-auth gate on the dockhand proxy host
-gate="$(docker exec npm sh -c "grep -lsi 'authentik' /data/nginx/proxy_host/*.conf 2>/dev/null | xargs -r grep -lsi 'dockhand' 2>/dev/null" 2>/dev/null || true)"
-if [[ -n "$gate" ]]; then pass "Authentik forward-auth gate present on dockhand proxy host"
-else fail "dockhand proxy host has NO Authentik gate -- root-access UI is unprotected at the edge"; fi
+  echo "$mnt" | grep -q '=false$' && pass "$APP_TITLE host fs mounted READ-ONLY (/host:ro)" || fail "$APP_TITLE host fs mounted READ-WRITE -- a $APP_TITLE compromise = root on host"
+else warn "$APP_TITLE /host mount not found (ok if intentionally removed)"; fi
+docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$APP" 2>/dev/null | grep -q '/var/run/docker.sock' \
+  && warn "$APP_TITLE has docker.sock (root-equivalent, by design) -- the auth gate is your ONLY protection" || true
+# Authentik forward-auth gate on the app proxy host
+gate="$(docker exec npm sh -c "grep -lsi 'authentik' /data/nginx/proxy_host/*.conf 2>/dev/null | xargs -r grep -lsi '${APP}' 2>/dev/null" 2>/dev/null || true)"
+if [[ -n "$gate" ]]; then pass "Authentik forward-auth gate present on $APP proxy host"
+else fail "$APP proxy host has NO Authentik gate -- root-access UI is unprotected at the edge"; fi
 # best-effort external redirect probe
 if [[ -n "$DOMAIN" ]]; then
   red="$(curl -sk -o /dev/null -w '%{http_code}|%{redirect_url}' --max-time 8 \
-        --resolve "dockhand.${DOMAIN}:443:127.0.0.1" "https://dockhand.${DOMAIN}/" 2>/dev/null || true)"
+        --resolve "${APP}.${DOMAIN}:443:127.0.0.1" "https://${APP}.${DOMAIN}/" 2>/dev/null || true)"
   echo "$red" | grep -qi 'goauthentik\|/outpost' \
-    && pass "dockhand.${DOMAIN} redirects to Authentik (gate live)" \
-    || warn "dockhand.${DOMAIN} did not redirect to Authentik (gate off, or session cached): [$red]"
+    && pass "${APP}.${DOMAIN} redirects to Authentik (gate live)" \
+    || warn "${APP}.${DOMAIN} did not redirect to Authentik (gate off, or session cached): [$red]"
 fi
 # credential file perms
 for f in "${STACK_DIR}/.npm_admin_password" "${AUTHENTIK_DIR}/.akadmin_password" \
@@ -144,12 +174,12 @@ done
 
 # ---- E. Manual checks (cannot be auto-verified) --------------------------
 hdr "Manual checks"
-printf "  - Dockhand built-in auth: Dockhand > Settings > Authentication -> confirm the ENABLE\n"
+printf "  - %s built-in auth: %s > Settings > Authentication -> confirm the ENABLE\n" "$APP_TITLE" "$APP_TITLE"
 printf "    toggle is ON. Creating a user alone does NOT turn auth on.\n"
-printf "  - Keep Dockhand on LOCAL auth (not OIDC/header-trust) so it stays a SECOND, independent\n"
+printf "  - Keep %s on LOCAL auth (not OIDC/header-trust) so it stays a SECOND, independent\n" "$APP_TITLE"
 printf "    layer behind Authentik -- otherwise the two gates collapse into one sign-on.\n"
-printf "  - 2FA: akadmin has a TOTP device in Authentik; Dockhand local user has a strong password.\n"
-printf "  - TLS: https://dockhand.%s shows a valid Let's Encrypt certificate.\n" "${DOMAIN:-<domain>}"
+printf "  - 2FA: akadmin has a TOTP device in Authentik; the %s local user has a strong password.\n" "$APP_TITLE"
+printf "  - TLS: https://%s.%s shows a valid Let's Encrypt certificate.\n" "$APP" "${DOMAIN:-<domain>}"
 
 # ---- Summary --------------------------------------------------------------
 hdr "Summary"

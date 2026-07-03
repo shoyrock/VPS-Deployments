@@ -186,7 +186,6 @@ _on_exit() {
     printf "${C_B}    authentik-server     ->  port 9000 (IdP; localhost-published for bootstrap)${C_R}\n"
     printf "${C_B}    authentik-worker     ->  background tasks${C_R}\n"
     printf "${C_B}    authentik-postgres   ->  Authentik DB${C_R}\n"
-    printf "${C_B}    authentik-redis      ->  Authentik cache${C_R}\n"
     printf "${C_B}    crowdsec             ->  port 8080 (LAPI, localhost only)${C_R}\n"
     printf '%s\n' "${C_B}------------------------------------------------------------------------------${C_R}"
     printf "${C_B}  ${C_YEL}Authentik admin user: akadmin${C_R}\n"
@@ -665,18 +664,11 @@ services:
       - ./authentik/postgres:/var/lib/postgresql/data
     networks:
       - proxy
-  authentik-redis:
-    image: redis:7-alpine
-    container_name: authentik-redis
-    hostname: authentik-redis
-    restart: unless-stopped
-    command: --save 60 1 --loglevel warning
-    volumes:
-      - ./authentik/redis:/data
-    networks:
-      - proxy
+  # NOTE: authentik 2025.x+ removed the external Redis dependency (task queue moved
+  # to a PostgreSQL backend; cache is embedded). authentik's own official compose
+  # ships only postgresql + server + worker, so there is NO redis container here.
   authentik-server:
-    image: ghcr.io/goauthentik/server:2024.12
+    image: ghcr.io/goauthentik/server:2026.5.3
     container_name: authentik-server
     hostname: authentik-server
     restart: unless-stopped
@@ -692,12 +684,10 @@ services:
     depends_on:
       authentik-postgres:
         condition: service_healthy
-      authentik-redis:
-        condition: service_started
     networks:
       - proxy
   authentik-worker:
-    image: ghcr.io/goauthentik/server:2024.12
+    image: ghcr.io/goauthentik/server:2026.5.3
     container_name: authentik-worker
     hostname: authentik-worker
     restart: unless-stopped
@@ -716,8 +706,6 @@ services:
     depends_on:
       authentik-postgres:
         condition: service_healthy
-      authentik-redis:
-        condition: service_started
     networks:
       - proxy
 networks:
@@ -823,7 +811,7 @@ COMPOSE_CROWDSEC
   done
   printf "\r" >&2
 
-  info "Deploying Authentik (postgres + redis + server + worker)..."
+  info "Deploying Authentik (postgres + server + worker)..."
   gen_authentik_files
   setup_authentik_snippets      # write nginx forward-auth snippets into NPM custom dir
   docker compose -p authentik -f "${STACK_DIR}/docker-compose.authentik.yml" pull
@@ -1171,7 +1159,7 @@ gen_authentik_files() {
   ak_secret=$(rand_secret); pg_pass=$(rand_password 32)
   # Unquoted heredoc: the bootstrap token/password + generated secrets are
   # interpolated at runtime. The env file is read by all four Authentik
-  # containers (server, worker, postgres, redis) via env_file in the compose.
+  # containers (server, worker, postgres) via env_file in the compose.
   cat > "${AUTHENTIK_DIR}/authentik.env" << AK_ENV
 AUTHENTIK_SECRET_KEY=${ak_secret}
 AUTHENTIK_ERROR_REPORTING__ENABLED=false
@@ -1179,7 +1167,6 @@ AUTHENTIK_POSTGRESQL__HOST=authentik-postgres
 AUTHENTIK_POSTGRESQL__USER=authentik
 AUTHENTIK_POSTGRESQL__NAME=authentik
 AUTHENTIK_POSTGRESQL__PASSWORD=${pg_pass}
-AUTHENTIK_REDIS__HOST=authentik-redis
 AUTHENTIK_EMAIL__FROM=admin@${DOMAIN}
 AUTHENTIK_BOOTSTRAP_PASSWORD=${AUTHENTIK_BOOTSTRAP_PASSWORD}
 AUTHENTIK_BOOTSTRAP_TOKEN=${AUTHENTIK_BOOTSTRAP_TOKEN}
@@ -2207,7 +2194,7 @@ verify_deployment() {
   # Containers. NOTE: must be an array - the global IFS=$'\n\t' has no space, so a
   # space-separated string would NOT word-split here (every check would run once
   # against the whole string and fail).
-  local want=(npm dockhand authentik-server authentik-worker authentik-postgres authentik-redis crowdsec)
+  local want=(npm dockhand authentik-server authentik-worker authentik-postgres crowdsec)
   [[ "${INSTALL_CROWDSEC_WEBUI:-1}" == "1" ]] && want+=(crowdsec-web-ui)
   local c
   for c in "${want[@]}"; do
@@ -2306,6 +2293,9 @@ verify_deployment() {
 # -------------------------------------------------------------------------------
 install_verify_script() {
   step "Installing verifier (verify-stack.sh)"
+  # Persist the app name so the GENERIC verify-stack.sh knows which manager this
+  # stack runs (dockhand/arcane/...). Derived from STACK_DIR (/opt/apps/<app>-stack).
+  { _appname="$(basename "${STACK_DIR%-stack}")"; printf '%s' "$_appname" > /etc/vps-deploy-app; } 2>/dev/null || true
   cat > "${STACK_DIR}/verify-stack.sh" << 'VERIFY_EOF'
 #!/usr/bin/env bash
 # verify-stack.sh -- health + SECURITY audit for the Dockhand + Authentik + NPM +
@@ -2326,7 +2316,7 @@ STACK_DIR="/opt/apps/dockhand-stack"; AUTHENTIK_DIR="${STACK_DIR}/authentik"
 DOMAIN="$(tr -d '\n' < /etc/vps-deploy-domain 2>/dev/null || true)"
 printf "${C_B}Dockhand stack health + security audit${C_R}  domain=${DOMAIN:-<unknown>}\n"
 hdr "Containers"
-for c in npm dockhand authentik-server authentik-worker authentik-postgres authentik-redis crowdsec; do
+for c in npm dockhand authentik-server authentik-worker authentik-postgres crowdsec; do
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$c"; then pass "container $c running"; else fail "container $c NOT running"; fi
 done
 # CrowdSec Web UI is optional/removable: only check when its compose file exists.
@@ -2450,10 +2440,10 @@ ${C_B}Dockhand${C_R}
 ${C_B}Authentik${C_R}
   URL:        https://authentik.${DOMAIN}
   Admin:      akadmin / ${authentik_pass}  (change after first login)
-  Containers: authentik-server, authentik-worker, authentik-postgres, authentik-redis
+  Containers: authentik-server, authentik-worker, authentik-postgres
   Network:    proxy
   Config:     ${AUTHENTIK_DIR}/authentik.env (mode 600)
-  Data:       ${AUTHENTIK_DIR}/{media,templates,blueprints,certs,postgres,redis}
+  Data:       ${AUTHENTIK_DIR}/{media,templates,blueprints,certs,postgres}
   Bootstrap:  Proxy provider 'dockhand' + embedded outpost created via admin API
 
 ${C_B}CrowdSec Console${C_R} (optional cloud dashboard)
@@ -2472,7 +2462,7 @@ ${C_B}Cloudflare Worker bouncer${C_R}
 
 ${C_B}Firewall${C_R}  $(if [[ "$OS_FAMILY" == "debian" ]]; then echo "UFW"; else echo "firewalld"; fi)
 ${C_B}Docker${C_R}    $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo N/A)
-${C_B}Containers${C_R}  npm, dockhand, authentik-server/worker/postgres/redis, crowdsec
+${C_B}Containers${C_R}  npm, dockhand, authentik-server/worker/postgres, crowdsec
 ${C_B}Network${C_R}   proxy (bridge)
 
 ${C_B}${C_YEL}Done automatically:${C_R}
