@@ -1074,8 +1074,13 @@ npm_enable_ssl() {
   # from the prefix, e.g. "authentik-server" vs "authentik.example.com").
   local HOST_ID="$1"
   local DOMAIN_NAME="$2"
-  local EMAIL="${3:-$LETSENCRYPT_EMAIL}"
   local JSON RESP CERT_ID HOST_JSON
+  # NOTE: NPM takes the Let's Encrypt account email from the logged-in NPM USER
+  # (set to $LETSENCRYPT_EMAIL in npm_change_password), NOT from the cert payload.
+  # NPM's certificate "meta" schema is STRICT (additionalProperties:false) and does
+  # NOT permit letsencrypt_email / letsencrypt_agree -- sending them returns
+  # "data/meta must NOT have additional properties" and the cert is never created.
+  # So meta carries ONLY the schema-valid challenge keys below.
 
   # Challenge selection:
   #  - CF_API_TOKEN set  -> DNS-01 via Cloudflare. This is the RELIABLE path here:
@@ -1086,13 +1091,11 @@ npm_enable_ssl() {
   #    proxied/orange-cloud record).
   #  - no token          -> HTTP-01 (webroot) fallback.
   if [[ -n "${CF_API_TOKEN:-}" ]]; then
-    JSON=$(jq -nc --arg email "$EMAIL" --arg domain "$DOMAIN_NAME" --arg tok "$CF_API_TOKEN" '{
+    JSON=$(jq -nc --arg domain "$DOMAIN_NAME" --arg tok "$CF_API_TOKEN" '{
       provider: "letsencrypt",
       nice_name: $domain,
       domain_names: [$domain],
       meta: {
-        letsencrypt_email: $email,
-        letsencrypt_agree: true,
         dns_challenge: true,
         dns_provider: "cloudflare",
         dns_provider_credentials: ("dns_cloudflare_api_token = " + $tok),
@@ -1101,11 +1104,11 @@ npm_enable_ssl() {
     }')
     info "Requesting Let's Encrypt cert for ${DOMAIN_NAME} via Cloudflare DNS-01 (can take up to 2 minutes)..."
   else
-    JSON=$(jq -nc --arg email "$EMAIL" --arg domain "$DOMAIN_NAME" '{
+    JSON=$(jq -nc --arg domain "$DOMAIN_NAME" '{
       provider: "letsencrypt",
       nice_name: $domain,
       domain_names: [$domain],
-      meta: { letsencrypt_email: $email, letsencrypt_agree: true, dns_challenge: false }
+      meta: { dns_challenge: false }
     }')
     info "Requesting Let's Encrypt certificate for ${DOMAIN_NAME} via HTTP-01 (can take up to 2 minutes)..."
   fi
