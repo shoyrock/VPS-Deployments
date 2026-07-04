@@ -59,7 +59,8 @@ LOCK_HTTP_TO_CLOUDFLARE="${LOCK_HTTP_TO_CLOUDFLARE:-false}"  # restrict 80/443 t
 NPM_SKIP_SSL="${NPM_SKIP_SSL:-0}"                            # 1 = create proxy hosts HTTP-only (no Let's Encrypt attempt; do SSL manually in the NPM UI later)
 EXPOSE_NPM_ADMIN="${EXPOSE_NPM_ADMIN:-1}"                    # 1 = publish the NPM admin UI at npm.<domain> (NPM's OWN login, NO Authentik). 0 = SSH-tunnel only.
 CF_IPS_CACHE=""                                             # filled by get_cloudflare_ips()
-WILDCARD_CERT_ID=""                                         # ONE *.DOMAIN cert (DNS-01), reused for every proxy host
+SSL_WILDCARD="${SSL_WILDCARD:-0}"                           # 1 = one *.DOMAIN wildcard via DNS-01 (needs CF token w/ Zone:DNS:Edit); default 0 = per-host HTTP-01 (no DNS API)
+WILDCARD_CERT_ID=""                                         # set when SSL_WILDCARD succeeds; reused for every host
 
 # Deployment status tracking for guaranteed completion summary
 DEPLOY_STATUS="in_progress"
@@ -536,8 +537,10 @@ get_user_domain() {
   case ".${DOMAIN##*.}" in
     .dev|.app|.page|.foo|.zip|.mov|.new|.day|.boo|.rsvp|.meme|.dad|.phd|.esq|.prof|.how|.nexus|.channel|.search|.ing|.gle|.prod)
       warn "'.${DOMAIN##*.}' is an HSTS-preloaded TLD: browsers FORCE https:// (no http fallback)."
-      warn "  So HTTPS is REQUIRED. This deploy will auto-issue a wildcard cert *.${DOMAIN} via"
-      warn "  Cloudflare DNS-01 - have a Cloudflare API token with Zone:DNS:Edit ready when prompted."
+      warn "  So HTTPS is REQUIRED here. This deploy auto-issues Let's Encrypt certs via HTTP-01"
+      warn "  (no DNS API needed) - just make sure each subdomain (or a wildcard A record) points"
+      warn "  at THIS server and port 80 is reachable. (Prefer one wildcard cert? re-run with"
+      warn "  SSL_WILDCARD=1 + a Cloudflare token that has Zone:DNS:Edit.)"
       ;;
   esac
 }
@@ -1099,100 +1102,115 @@ npm_create_proxy_host() {
 }
 
 npm_ensure_wildcard_cert() {
-  # Issue (or REUSE) ONE wildcard certificate *.DOMAIN via Cloudflare DNS-01 and
-  # cache its id in WILDCARD_CERT_ID. Rationale:
-  #  - ONE request covers EVERY subdomain (arcane, authentik, npm, crowdsec + any
-  #    added later) -> smallest possible Let's Encrypt rate-limit footprint.
-  #  - Wildcards can ONLY be validated by DNS-01 (LE rule) - which is also the only
-  #    method that works behind the Authentik auth gate AND on HSTS-preloaded TLDs
-  #    like .dev/.app/.page (where browsers FORCE https, so SSL is mandatory).
-  #  - On re-runs we REUSE an existing matching cert, so repeated deploys can never
-  #    trip the duplicate-certificate limit.
+  # OPT-IN (SSL_WILDCARD=1): issue/reuse ONE wildcard *.DOMAIN via Cloudflare DNS-01.
+  # Off by default because it needs a CF token with Zone:DNS:Edit; the default path is
+  # per-host HTTP-01 (no DNS API). A wildcard is handy if you'd rather one cert cover
+  # every subdomain. Reuses an existing wildcard on re-runs.
   WILDCARD_CERT_ID=""
-  [[ "${NPM_SKIP_SSL:-0}" == "1" ]] && return 0
+  [[ "${SSL_WILDCARD:-0}" == "1" && "${NPM_SKIP_SSL:-0}" != "1" ]] || return 0
   local certs existing
   certs=$(_npm_api "/nginx/certificates" 2>/dev/null || true)
   existing=$(echo "$certs" | jq -r --arg d "*.${DOMAIN}" \
     '[.[]? | select(.provider=="letsencrypt") | select(((.domain_names // []) | index($d)) != null) | .id] | max // empty' 2>/dev/null || true)
   if [[ -n "$existing" && "$existing" != "null" ]]; then
     WILDCARD_CERT_ID="$existing"
-    success "Reusing existing wildcard certificate *.${DOMAIN} (cert id ${WILDCARD_CERT_ID}) - no new Let's Encrypt request"
+    success "Reusing existing wildcard certificate *.${DOMAIN} (cert id ${WILDCARD_CERT_ID})"
     return 0
   fi
   if [[ -z "${CF_API_TOKEN:-}" ]]; then
-    warn "No Cloudflare token -> cannot auto-issue the wildcard (*.${DOMAIN} REQUIRES DNS-01)."
-    warn "  Hosts stay HTTP-only. On HSTS-preloaded TLDs (.dev/.app/.page) browsers FORCE https,"
-    warn "  so either add a DNS-challenge cert in the NPM UI, or re-run with CF_API_TOKEN set."
+    warn "SSL_WILDCARD=1 but no CF token -> wildcards REQUIRE DNS-01. Falling back to per-host HTTP-01."
     return 1
   fi
-  # NOTE: NPM takes the LE account email from the logged-in NPM USER (set to
-  # $LETSENCRYPT_EMAIL in npm_change_password), NOT the payload. The cert "meta"
-  # schema is STRICT (additionalProperties:false): only dns_challenge / dns_provider
-  # / dns_provider_credentials / propagation_seconds are allowed.
   local json resp
   json=$(jq -nc --arg d "$DOMAIN" --arg tok "$CF_API_TOKEN" '{
-    provider: "letsencrypt",
-    nice_name: ("*." + $d),
-    domain_names: [("*." + $d), $d],
-    meta: {
-      dns_challenge: true,
-      dns_provider: "cloudflare",
-      dns_provider_credentials: ("dns_cloudflare_api_token = " + $tok),
-      propagation_seconds: 30
-    }
+    provider: "letsencrypt", nice_name: ("*." + $d), domain_names: [("*." + $d), $d],
+    meta: { dns_challenge: true, dns_provider: "cloudflare",
+            dns_provider_credentials: ("dns_cloudflare_api_token = " + $tok), propagation_seconds: 30 }
   }')
-  info "Requesting ONE wildcard certificate for *.${DOMAIN} (+ ${DOMAIN}) via Cloudflare DNS-01 (up to ~2 min)..."
+  info "Requesting ONE wildcard certificate for *.${DOMAIN} via Cloudflare DNS-01 (up to ~2 min)..."
   resp=$(_npm_api "/nginx/certificates" --max-time 200 -X POST -d "$json") || true
   WILDCARD_CERT_ID=$(echo "$resp" | jq -r '.id // empty')
   if [[ -z "$WILDCARD_CERT_ID" ]]; then
     _log "WARN" "wildcard cert response: $(printf '%s' "$resp" | tr -d '\n' | cut -c1-400)"
-    warn "Wildcard cert issuance FAILED. Check the CF token has Zone:DNS:Edit on ${DOMAIN}. Raw response in ${LOG_FILE}. Hosts stay HTTP-only."
+    warn "Wildcard cert failed (CF token needs Zone:DNS:Edit on ${DOMAIN}). Falling back to per-host HTTP-01."
     return 1
   fi
-  success "Wildcard certificate issued: *.${DOMAIN} (cert id ${WILDCARD_CERT_ID}) - covers every subdomain"
+  success "Wildcard certificate issued: *.${DOMAIN} (cert id ${WILDCARD_CERT_ID})"
   return 0
 }
 
-npm_enable_ssl() {
-  # Attach the SHARED wildcard certificate (from npm_ensure_wildcard_cert) to a
-  # proxy host - one *.DOMAIN cert serves every host, no per-host LE request. GET the
-  # full host config, merge SSL fields, PUT the whole object back (NPM's PUT replaces
-  # the resource, so all fields must be resent or forward_host is lost).
-  local HOST_ID="$1"
-  local DOMAIN_NAME="$2"
-  local CERT_ID="${3:-$WILDCARD_CERT_ID}"
-  local JSON RESP HOST_JSON
-  if [[ -z "$CERT_ID" ]]; then
-    warn "No wildcard certificate available - ${DOMAIN_NAME} stays HTTP-only (supply a Cloudflare token with Zone:DNS:Edit to auto-issue *.${DOMAIN})."
-    return 1
-  fi
+npm_issue_http01_cert() {
+  # Issue (or REUSE) a per-host HTTP-01 certificate - NO DNS API, NO Cloudflare token.
+  # Let's Encrypt fetches http://<host>/.well-known/acme-challenge/... over port 80,
+  # so it just needs the subdomain's A record pointing at this box (the user sets DNS;
+  # a wildcard A record covers every host). Reuse avoids the duplicate-cert rate limit
+  # on re-runs. NOTE: gated hosts must be cert'd BEFORE the Authentik gate is applied
+  # (the gate 302s the challenge path) - automate_npm orders it that way. Prints id.
+  local dn="$1" certs existing resp cid
+  certs=$(_npm_api "/nginx/certificates" 2>/dev/null || true)
+  existing=$(echo "$certs" | jq -r --arg d "$dn" \
+    '[.[]? | select(.provider=="letsencrypt") | select((.domain_names // [])==[$d]) | .id] | max // empty' 2>/dev/null || true)
+  if [[ -n "$existing" && "$existing" != "null" ]]; then printf '%s' "$existing"; return 0; fi
+  resp=$(_npm_api "/nginx/certificates" --max-time 180 -X POST \
+    -d "$(jq -nc --arg d "$dn" '{provider:"letsencrypt", nice_name:$d, domain_names:[$d], meta:{dns_challenge:false}}')") || true
+  cid=$(echo "$resp" | jq -r '.id // empty')
+  [[ -z "$cid" ]] && _log "WARN" "HTTP-01 cert for ${dn}: $(printf '%s' "$resp" | tr -d '\n' | cut -c1-300)"
+  printf '%s' "$cid"
+}
 
-  HOST_JSON=$(_npm_api "/nginx/proxy-hosts/${HOST_ID}") || true
-  if [[ -z "$HOST_JSON" ]]; then
-    warn "Could not fetch host ${HOST_ID} config to attach SSL — attach manually in NPM UI"
-    return 1
-  fi
-  JSON=$(echo "$HOST_JSON" | jq -c --argjson cert "$CERT_ID" '{
-    domain_names: .domain_names,
-    forward_scheme: .forward_scheme,
-    forward_host: .forward_host,
-    forward_port: .forward_port,
+# Shared PUT that resends every host field (NPM's PUT REPLACES the resource, so a
+# partial body would drop forward_host/advanced_config). $3=cert_id (0=keep/none),
+# $4=ssl_forced, $5=advanced_config (unset = keep existing).
+_npm_put_host() {
+  local HOST_ID="$1" CERT_ID="$2" SSLF="$3" ADV="${4-__KEEP__}" HOST_JSON JSON RESP
+  HOST_JSON=$(_npm_api "/nginx/proxy-hosts/${HOST_ID}") || return 1
+  [[ -z "$HOST_JSON" ]] && return 1
+  JSON=$(echo "$HOST_JSON" | jq -c --argjson cert "$CERT_ID" --argjson sslf "$SSLF" --arg adv "$ADV" '{
+    domain_names, forward_scheme, forward_host, forward_port,
     access_list_id: (.access_list_id // 0),
-    certificate_id: $cert,
-    ssl_forced: true,
+    certificate_id: (if $cert>0 then $cert else (.certificate_id // 0) end),
+    ssl_forced: ($sslf==1),
     caching_enabled: (.caching_enabled // false),
     block_exploits: (.block_exploits // true),
     allow_websocket_upgrade: (.allow_websocket_upgrade // true),
-    http2_support: true,
-    hsts_enabled: true,
-    hsts_subdomains: false,
-    advanced_config: (.advanced_config // "")
+    http2_support: true, hsts_enabled: ($sslf==1), hsts_subdomains: false,
+    advanced_config: (if $adv=="__KEEP__" then (.advanced_config // "") else $adv end)
   }')
   RESP=$(_npm_api "/nginx/proxy-hosts/${HOST_ID}" -X PUT -d "$JSON") || true
-  if [[ -n "$(echo "$RESP" | jq -r '.id // empty')" ]]; then
+  [[ -n "$(echo "$RESP" | jq -r '.id // empty')" ]]
+}
+
+npm_enable_ssl() {
+  # Get a certificate for the host (wildcard if SSL_WILDCARD opt-in succeeded, else
+  # per-host HTTP-01) and attach it + force SSL.
+  local HOST_ID="$1" DOMAIN_NAME="$2" CERT_ID
+  if [[ "${SSL_WILDCARD:-0}" == "1" && -n "$WILDCARD_CERT_ID" ]]; then
+    CERT_ID="$WILDCARD_CERT_ID"
+  else
+    info "Requesting Let's Encrypt cert for ${DOMAIN_NAME} via HTTP-01 (no DNS/token needed)..."
+    CERT_ID=$(npm_issue_http01_cert "$DOMAIN_NAME")
+  fi
+  if [[ -z "$CERT_ID" ]]; then
+    warn "No certificate for ${DOMAIN_NAME} - stays HTTP-only. Check the subdomain's A record points here + port 80 is reachable. Details in ${LOG_FILE}."
+    return 1
+  fi
+  if _npm_put_host "$HOST_ID" "$CERT_ID" 1; then
     success "SSL enabled + forced for ${DOMAIN_NAME} (cert id ${CERT_ID})"
   else
     warn "Could not attach certificate ${CERT_ID} to host ${HOST_ID} - attach it manually in NPM UI"
+  fi
+}
+
+npm_apply_auth_gate() {
+  # Apply the Authentik forward-auth advanced_config to a host AFTER its cert exists.
+  # Doing it before would 302 the HTTP-01 challenge; adding our own acme-exempt
+  # location would duplicate NPM's SSL acme include and break the host. So: cert
+  # first, gate second.
+  local HOST_ID="$1" ADV="$2"
+  if _npm_put_host "$HOST_ID" 0 "$( _npm_api "/nginx/proxy-hosts/${HOST_ID}" | jq -r 'if .ssl_forced then 1 else 0 end' 2>/dev/null || echo 0)" "$ADV"; then
+    success "Authentik forward-auth gate applied to host ${HOST_ID}"
+  else
+    warn "Could not apply the Authentik gate to host ${HOST_ID} - add the advanced config manually in NPM UI"
   fi
 }
 
@@ -1326,77 +1344,52 @@ bootstrap_authentik() {
   [[ -z "$inval_pk" ]] && inval_pk=$(_ak_api "/flows/instances/default-invalidation-flow/" 2>/dev/null | jq -r '.pk // empty' 2>/dev/null || true)
   [[ -z "$inval_pk" ]] && inval_pk=$(_ak_api "/flows/instances/?designation=invalidation" 2>/dev/null | jq -r '.results[0].pk // empty' 2>/dev/null || true)
 
-  # 3. Create a Proxy provider (forward_single = nginx auth_request, single app).
-  #    Include invalidation_flow only when resolved (older Authentik doesn't need it).
-  local prov_json prov_pk
-  prov_json=$(jq -nc \
-    --arg name "arcane" \
-    --arg flow "$flow_pk" \
-    --arg inval "$inval_pk" \
-    --arg internal "http://arcane:3552" \
-    --arg external "https://arcane.${DOMAIN}" \
-    '{name:$name, authorization_flow:$flow, internal_host:$internal, external_host:$external, mode:"forward_single"}
-     + (if $inval != "" then {invalidation_flow:$inval} else {} end)')
-  prov_pk=$(_ak_api "/providers/proxy/" -X POST -d "$prov_json" 2>/dev/null \
-           | jq -r '.pk // empty' 2>/dev/null || true)
-  if [[ -z "$prov_pk" ]]; then
-    # Maybe it already exists from a previous run: look it up by name.
-    prov_pk=$(_ak_api "/providers/proxy/?name=arcane" 2>/dev/null \
-             | jq -r '.results[0].pk // empty' 2>/dev/null || true)
-  fi
-  if [[ -z "$prov_pk" ]]; then
-    warn "Could not create Authentik Proxy provider. Create it in the UI:"
-    warn "  Providers > Create > Proxy: name=arcane, mode=Forward single (nginx),"
-    warn "  internal_host=http://arcane:3552, external_host=https://arcane.${DOMAIN}"
-    return 0
-  fi
-  success "Authentik Proxy provider 'arcane' created (pk ${prov_pk})"
-
-  # 4. Create the Application bound to that provider.
-  local app_json
-  app_json=$(jq -nc --arg name "Arcane" --arg slug "arcane" --argjson prov "$prov_pk" \
-    '{name:$name, slug:$slug, provider:$prov}')
-  _ak_api "/core/applications/" -X POST -d "$app_json" >/dev/null 2>&1 || true
-  if _ak_api "/core/applications/arcane/" 2>/dev/null | jq -e '.pk // empty' >/dev/null 2>/dev/null; then
-    success "Authentik Application 'arcane' created"
-  else
-    warn "Could not create Authentik Application 'arcane'. Create it in the UI (slug=arcane, provider=arcane)."
-    return 0
-  fi
-
-  # 5. Attach the arcane provider to the BUILT-IN embedded outpost.
+  # 3. Resolve the BUILT-IN embedded outpost (shared by every app we gate).
   #    CRITICAL: only the managed embedded outpost (managed ==
-  #    "goauthentik.io/outposts/embedded") actually runs INSIDE authentik-server
-  #    and serves /outpost.goauthentik.io/ (the auth_request endpoint the NPM
-  #    snippet proxies to). Creating a brand-new standalone outpost would leave it
-  #    with NO running instance (no docker/k8s service connection) -> the
-  #    forward-auth subrequest 502s and Arcane's 2FA gate silently never works.
-  #    So: find the embedded outpost and MERGE the arcane provider into it.
-  #    (Outpost pk is a UUID string; provider pk is an integer.)
-  local outpost_pk outpost_list existing_providers merged_providers existing_config merged_config
+  #    "goauthentik.io/outposts/embedded") runs INSIDE authentik-server and serves
+  #    /outpost.goauthentik.io/ (the auth_request endpoint the NPM snippet proxies
+  #    to). A brand-new standalone outpost would have NO running instance -> the
+  #    forward-auth subrequest 502s and the gate silently never works.
+  local outpost_list outpost_pk
   outpost_list=$(_ak_api "/outposts/instances/?page_size=100" 2>/dev/null || true)
-  outpost_pk=$(echo "$outpost_list" \
-    | jq -r '.results[]? | select(.managed=="goauthentik.io/outposts/embedded") | .pk' 2>/dev/null | head -1)
-  # Fallback: first proxy-type outpost, in case the managed flag differs by version.
-  [[ -z "$outpost_pk" ]] && outpost_pk=$(echo "$outpost_list" \
-    | jq -r '.results[]? | select(.type=="proxy") | .pk' 2>/dev/null | head -1)
-  if [[ -z "$outpost_pk" ]]; then
-    warn "Could not find the embedded Authentik outpost. Attach the provider in the UI:"
-    warn "  Outposts > 'authentik Embedded Outpost' > Edit > add the 'arcane' provider."
-    return 0
+  outpost_pk=$(echo "$outpost_list" | jq -r '.results[]? | select(.managed=="goauthentik.io/outposts/embedded") | .pk' 2>/dev/null | head -1)
+  [[ -z "$outpost_pk" ]] && outpost_pk=$(echo "$outpost_list" | jq -r '.results[]? | select(.type=="proxy") | .pk' 2>/dev/null | head -1)
+
+  # Helper: create/reuse a forward_single Proxy provider + its Application. Echoes pk.
+  _ak_provision() {
+    local pname="$1" pslug="$2" pnice="$3" pint="$4" pext="$5" pj pk aj
+    pj=$(jq -nc --arg name "$pname" --arg flow "$flow_pk" --arg inval "$inval_pk" \
+      --arg internal "$pint" --arg external "$pext" \
+      '{name:$name, authorization_flow:$flow, internal_host:$internal, external_host:$external, mode:"forward_single"}
+       + (if $inval != "" then {invalidation_flow:$inval} else {} end)')
+    pk=$(_ak_api "/providers/proxy/" -X POST -d "$pj" 2>/dev/null | jq -r '.pk // empty' 2>/dev/null || true)
+    [[ -z "$pk" ]] && pk=$(_ak_api "/providers/proxy/?name=${pname}" 2>/dev/null | jq -r '.results[0].pk // empty' 2>/dev/null || true)
+    if [[ -z "$pk" ]]; then warn "Could not create Authentik provider '${pname}' (create it in the UI: Proxy, forward_single, internal=${pint}, external=${pext})."; return 1; fi
+    aj=$(jq -nc --arg name "$pnice" --arg slug "$pslug" --argjson prov "$pk" '{name:$name, slug:$slug, provider:$prov}')
+    _ak_api "/core/applications/" -X POST -d "$aj" >/dev/null 2>&1 || true
+    success "Authentik provider+app '${pname}' ready (pk ${pk})"
+    printf '%s' "$pk"
+  }
+
+  # 4. Provision Arcane AND the CrowdSec dashboard. Gating CrowdSec from first boot
+  #    closes the window where a stranger could reach crowdsec.<domain> and create
+  #    its first-run admin account before you finish setting up.
+  local prov_pks=() _p
+  _p=$(_ak_provision "arcane" "arcane" "Arcane" "http://arcane:3552" "https://arcane.${DOMAIN}") && [[ -n "$_p" ]] && prov_pks+=("$_p")
+  if [[ "${INSTALL_CROWDSEC_WEBUI:-1}" == "1" ]]; then
+    _p=$(_ak_provision "crowdsec" "crowdsec" "CrowdSec" "http://crowdsec-web-ui:3000" "https://crowdsec.${DOMAIN}") && [[ -n "$_p" ]] && prov_pks+=("$_p")
   fi
-  # Merge - do NOT clobber providers already attached to the embedded outpost.
-  existing_providers=$(echo "$outpost_list" \
-    | jq -c --arg pk "$outpost_pk" '.results[]? | select(.pk==$pk) | .providers' 2>/dev/null || true)
+  if [[ ${#prov_pks[@]} -eq 0 ]]; then warn "No Authentik providers created; gate apps manually."; return 0; fi
+  if [[ -z "$outpost_pk" ]]; then warn "Embedded outpost not found; attach providers in the UI (Outposts > authentik Embedded Outpost)."; return 0; fi
+
+  # 5. MERGE the new provider pks into the embedded outpost (keep any existing), and
+  #    set authentik_host (empty by default -> "authentik domain not configured").
+  local existing_providers add_json merged_providers existing_config merged_config
+  existing_providers=$(echo "$outpost_list" | jq -c --arg pk "$outpost_pk" '.results[]? | select(.pk==$pk) | .providers' 2>/dev/null || true)
   [[ -z "$existing_providers" || "$existing_providers" == "null" ]] && existing_providers="[]"
-  merged_providers=$(jq -nc --argjson cur "$existing_providers" --argjson p "$prov_pk" \
-    '($cur + [$p]) | unique' 2>/dev/null || echo "[$prov_pk]")
-  # ALSO set the outpost's authentik_host. The embedded outpost ships with an EMPTY
-  # authentik_host, which makes Authentik show "authentik domain is not configured.
-  # Authentication will not work." and breaks redirect URLs. Merge it into the
-  # existing config so the other config keys (log_level, naming template, ...) survive.
-  existing_config=$(echo "$outpost_list" \
-    | jq -c --arg pk "$outpost_pk" '.results[]? | select(.pk==$pk) | .config' 2>/dev/null || true)
+  add_json=$(printf '%s\n' "${prov_pks[@]}" | jq -R 'select(length>0)|tonumber' | jq -s '.')
+  merged_providers=$(jq -nc --argjson cur "$existing_providers" --argjson add "$add_json" '($cur + $add) | unique' 2>/dev/null || echo "$add_json")
+  existing_config=$(echo "$outpost_list" | jq -c --arg pk "$outpost_pk" '.results[]? | select(.pk==$pk) | .config' 2>/dev/null || true)
   [[ -z "$existing_config" || "$existing_config" == "null" ]] && existing_config="{}"
   merged_config=$(jq -nc --argjson cfg "$existing_config" --arg h "https://authentik.${DOMAIN}" \
     '$cfg + {authentik_host:$h, authentik_host_insecure:false}' 2>/dev/null \
@@ -1404,11 +1397,9 @@ bootstrap_authentik() {
   if _ak_api "/outposts/instances/${outpost_pk}/" -X PATCH \
        -d "$(jq -nc --argjson p "$merged_providers" --argjson c "$merged_config" '{providers:$p, config:$c}')" 2>/dev/null \
        | jq -e '.pk // empty' >/dev/null 2>&1; then
-    success "Arcane provider attached + authentik_host set on embedded outpost (pk ${outpost_pk})"
+    success "Providers attached to embedded outpost + authentik_host set (arcane$([[ ${#prov_pks[@]} -gt 1 ]] && printf ' + crowdsec'))"
   else
-    warn "Could not update the embedded outpost - do it in the UI:"
-    warn "  Outposts > 'authentik Embedded Outpost' > Edit > add provider 'arcane' AND"
-    warn "  set authentik_host: https://authentik.${DOMAIN}"
+    warn "Could not update the embedded outpost - add the providers + authentik_host in the UI."
     return 0
   fi
 
@@ -1427,28 +1418,39 @@ bootstrap_authentik() {
 }
 
 enforce_authentik_mfa() {
-  # Force TOTP MFA for ALL Authentik users (incl. akadmin) on next login by
-  # flipping the default authentication flow's Authenticator Validation stage from
-  # not_configured_action=skip (MFA optional) to =configure WITH the TOTP setup
-  # stage attached -> users without a device are forced to enroll inline (no
-  # lockout). Stage PKs are resolved by their stable slug. Fully fail-safe: any
-  # failure leaves MFA OPTIONAL and warns, never a half-broken login flow.
-  local vpk tpk got rec
+  # Force MFA for ALL Authentik users (incl. akadmin) on next login by flipping the
+  # default authentication flow's Authenticator Validation stage from
+  # not_configured_action=skip (MFA optional) to =configure WITH setup stages
+  # attached -> users without a device are forced to enroll inline (no lockout).
+  # Offered methods: TOTP (authenticator app) AND WebAuthn (passkey / hardware
+  # security key / platform biometric). device_classes lists what may VALIDATE.
+  # Stage PKs resolve by their stable default names. Fully fail-safe: any failure
+  # leaves MFA OPTIONAL and warns, never a half-broken login flow.
+  local vpk tpk wpk got rec cfg_stages
   vpk=$(_ak_api "/stages/authenticator/validate/" 2>/dev/null | jq -r '.results[]? | select(.name=="default-authentication-mfa-validation") | .pk' 2>/dev/null | head -1)
   tpk=$(_ak_api "/stages/authenticator/totp/" 2>/dev/null | jq -r '.results[]? | select(.name=="default-authenticator-totp-setup") | .pk' 2>/dev/null | head -1)
+  # WebAuthn setup stage (default blueprint name). Optional: if absent, TOTP-only.
+  wpk=$(_ak_api "/stages/authenticator/webauthn/" 2>/dev/null | jq -r '.results[]? | select(.name=="default-authenticator-webauthn-setup") | .pk' 2>/dev/null | head -1)
   if [[ -z "$vpk" || -z "$tpk" ]]; then
     warn "Could not resolve Authentik MFA stages - MFA left OPTIONAL. Enforce later in the UI:"
-    warn "  Flows & Stages > Stages > default-authentication-mfa-validation > 'Not configured action' = Configure + add the TOTP setup stage."
+    warn "  Flows & Stages > Stages > default-authentication-mfa-validation > 'Not configured action' = Configure + add the TOTP (and WebAuthn) setup stage(s)."
     return 0
   fi
+  # Offer TOTP + WebAuthn (when present) as enrollment options; accept both device
+  # classes (plus static recovery codes) at validation.
+  cfg_stages=$(jq -nc --arg t "$tpk" --arg w "$wpk" '[$t] + (if $w != "" then [$w] else [] end)')
   _ak_api "/stages/authenticator/validate/${vpk}/" -X PATCH \
-    -d "$(jq -nc --arg t "$tpk" '{not_configured_action:"configure", configuration_stages:[$t]}')" >/dev/null 2>&1 || true
+    -d "$(jq -nc --argjson cs "$cfg_stages" '{not_configured_action:"configure", configuration_stages:$cs, device_classes:["static","totp","webauthn"]}')" >/dev/null 2>&1 || true
   got=$(_ak_api "/stages/authenticator/validate/${vpk}/" 2>/dev/null | jq -r '.not_configured_action // empty' 2>/dev/null)
   if [[ "$got" != "configure" ]]; then
     warn "Authentik MFA enforcement did not apply - MFA left OPTIONAL. Set it in the UI (see hint above)."
     return 0
   fi
-  success "Authentik MFA ENFORCED - every user (incl. akadmin) must enroll TOTP on next login"
+  if [[ -n "$wpk" ]]; then
+    success "Authentik MFA ENFORCED - every user (incl. akadmin) must enroll TOTP or a WebAuthn passkey/security key on next login"
+  else
+    success "Authentik MFA ENFORCED - every user (incl. akadmin) must enroll TOTP on next login (WebAuthn stage not found; add it in the UI to also allow passkeys)"
+  fi
   # Lockout escape hatch: a one-time akadmin recovery URL (valid ~1y) in case the
   # TOTP device is ever lost. Saved mode-600 + surfaced in the final summary.
   rec=$(docker exec authentik-server ak create_recovery_key 1 akadmin 2>/dev/null | grep -oE '/recovery/use-token/[^ "]+' | head -1)
@@ -1595,8 +1597,12 @@ automate_npm() {
   # headers are already added by allow_websocket_upgrade:true on the host.
   local auth_snippet=$'proxy_read_timeout 86400s;\nproxy_send_timeout 86400s;\ninclude /data/nginx/custom/authentik-location.conf;\ninclude /data/nginx/custom/authentik-authrequest.conf;'
   local arcane_id=""
-  arcane_id=$(npm_create_proxy_host "arcane.${DOMAIN}" "arcane" 3552 true "$auth_snippet") || true
+  # ORDER MATTERS: create Arcane WITHOUT the auth gate, get its cert via HTTP-01
+  # (the gate would 302 the ACME challenge), THEN apply the Authentik gate. This is
+  # why HTTP-01 works on the gated app without any acme-exempt hack.
+  arcane_id=$(npm_create_proxy_host "arcane.${DOMAIN}" "arcane" 3552 true "") || true
   [[ -n "$arcane_id" && "${NPM_SKIP_SSL:-0}" != "1" ]] && npm_enable_ssl "$arcane_id" "arcane.${DOMAIN}" || true
+  [[ -n "$arcane_id" ]] && npm_apply_auth_gate "$arcane_id" "$auth_snippet" || true
 
   # Authentik admin portal
   local authentik_id=""
@@ -2005,13 +2011,12 @@ setup_cloudflare_bouncer() {
     printf "\n${C_B}Cloudflare Worker bouncer${C_R} blocks banned IPs at Cloudflare's edge.\n" >&2
     printf "It needs a Cloudflare ${C_B}User${C_R} API token (My Profile > API Tokens, NOT an\n" >&2
     printf "Account token). Supplying it now will deploy a Worker + KV to your account.\n" >&2
-    printf "${C_B}Required perms${C_R} (CrowdSec's bouncer set PLUS DNS:Edit for auto-SSL -\n" >&2
+    printf "${C_B}Required perms${C_R} (CrowdSec's official bouncer set -\n" >&2
     printf "do not drop any): Account(Workers KV Storage:Edit, Workers\n" >&2
     printf "  Scripts:Edit, Turnstile:Edit, Account Settings:Read, Account Analytics:Read),\n" >&2
-    printf "  User(User Details:Read), Zone(${C_B}DNS:Edit${C_R}, Workers Routes:Edit, Zone:Read)\n" >&2
-    printf "  ${C_B}NOTE:${C_R} Zone ${C_B}DNS:Edit${C_R} (not just DNS:Read) is REQUIRED - this same token\n" >&2
-    printf "  lets NPM auto-issue SSL certs via Cloudflare DNS-01 (writes an ACME TXT\n" >&2
-    printf "  record). With only DNS:Read, cert issuance fails with a Cloudflare 403.\n" >&2
+    printf "  User(User Details:Read), Zone(DNS:Read, Workers Routes:Edit, Zone:Read)\n" >&2
+    printf "  ${C_B}NOTE:${C_R} SSL certs use HTTP-01 by default and need NO Cloudflare token. Add\n" >&2
+    printf "  Zone ${C_B}DNS:Edit${C_R} ONLY if you opt into a wildcard cert (SSL_WILDCARD=1, DNS-01).\n" >&2
     printf "${C_B}Minimize by SCOPE${C_R} (not by removing perms): under 'Account Resources'\n" >&2
     printf "  pick ${C_B}Include > <your account>${C_R} only, and under 'Zone Resources' pick\n" >&2
     printf "  ${C_B}Include > Specific zone > ${DOMAIN}${C_R} only - never 'All accounts/zones'.\n" >&2
@@ -2708,14 +2713,18 @@ COMPOSE_WEBUI
   # the UI's own login instead — gate it behind Authentik later like any other
   # app (provider + application + the two authentik include lines) if you want.
   if [[ -n "${NPM_TOKEN:-}" ]]; then
-    local ui_snippet=""
-    if [[ -f "${NPM_DATA_DIR}/nginx/custom/authelia-authrequest.conf" ]]; then
-      ui_snippet=$'include /data/nginx/custom/authelia-location.conf;\ninclude /data/nginx/custom/authelia-authrequest.conf;'
-    fi
+    # SECURITY: gate the CrowdSec dashboard behind Authentik forward-auth, exactly
+    # like Arcane. Its first visit creates the dashboard's OWN admin account, so an
+    # ungated crowdsec.<domain> lets a stranger grab that account while you're still
+    # setting up. bootstrap_authentik already created the 'crowdsec' proxy provider +
+    # attached it to the embedded outpost, so this host just needs the auth snippet.
+    # ORDER: cert via HTTP-01 FIRST (the gate would 302 the ACME challenge), then gate.
+    local ui_auth=$'proxy_read_timeout 86400s;\nproxy_send_timeout 86400s;\ninclude /data/nginx/custom/authentik-location.conf;\ninclude /data/nginx/custom/authentik-authrequest.conf;'
     local ui_id=""
-    ui_id=$(npm_create_proxy_host "crowdsec.${DOMAIN}" "crowdsec-web-ui" 3000 true "$ui_snippet") || true
+    ui_id=$(npm_create_proxy_host "crowdsec.${DOMAIN}" "crowdsec-web-ui" 3000 true "") || true
     [[ -n "$ui_id" && "${NPM_SKIP_SSL:-0}" != "1" ]] && npm_enable_ssl "$ui_id" "crowdsec.${DOMAIN}" || true
-    [[ -n "$ui_id" ]] && info "CrowdSec dashboard: crowdsec.${DOMAIN} — FIRST VISIT creates the UI admin account, do it now"
+    [[ -n "$ui_id" ]] && npm_apply_auth_gate "$ui_id" "$ui_auth" || true
+    [[ -n "$ui_id" ]] && info "CrowdSec dashboard: crowdsec.${DOMAIN} — PROTECTED by Authentik. Log in via Authentik first, THEN create the dashboard's own admin account."
   else
     info "NPM automation unavailable — add the proxy host manually: crowdsec.${DOMAIN} -> crowdsec-web-ui:3000 (scheme http)"
   fi
