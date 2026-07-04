@@ -1269,19 +1269,27 @@ bootstrap_authentik() {
   # 2. Resolve the authorization flow PK (FK target for the provider). Try the
   #    implicit- then explicit-consent defaults, then ANY authorization-designation
   #    flow, so a renamed/blueprint-customized default still resolves.
-  local flow_pk="" slug
-  for slug in default-provider-authorization-implicit-consent default-provider-authorization-explicit-consent; do
-    flow_pk=$(_ak_api "/flows/instances/${slug}/" 2>/dev/null | jq -r '.pk // empty' 2>/dev/null || true)
+  # RETRY: Authentik's default flows are created by its BLUEPRINT system, which
+  # finishes applying a little AFTER the /-/health/ready/ endpoint goes green (more
+  # noticeably on 2025.x/2026.x). A single query here raced ahead of the blueprints
+  # and came back empty -> the provider was never created -> the embedded outpost
+  # stayed empty -> forward-auth returned HTTP 500. Poll for up to ~2 min until the
+  # authorization flow exists (this doubles as the real "blueprints applied" signal).
+  local flow_pk="" slug _fa
+  for _fa in $(seq 1 24); do
+    for slug in default-provider-authorization-implicit-consent default-provider-authorization-explicit-consent; do
+      flow_pk=$(_ak_api "/flows/instances/${slug}/" 2>/dev/null | jq -r '.pk // empty' 2>/dev/null || true)
+      [[ -n "$flow_pk" ]] && break
+      flow_pk=$(_ak_api "/flows/instances/?slug=${slug}" 2>/dev/null | jq -r '.results[0].pk // empty' 2>/dev/null || true)
+      [[ -n "$flow_pk" ]] && break
+    done
+    [[ -z "$flow_pk" ]] && flow_pk=$(_ak_api "/flows/instances/?designation=authorization" 2>/dev/null \
+             | jq -r '.results[0].pk // empty' 2>/dev/null || true)
     [[ -n "$flow_pk" ]] && break
-    flow_pk=$(_ak_api "/flows/instances/?slug=${slug}" 2>/dev/null | jq -r '.results[0].pk // empty' 2>/dev/null || true)
-    [[ -n "$flow_pk" ]] && break
+    sleep 5
   done
   if [[ -z "$flow_pk" ]]; then
-    flow_pk=$(_ak_api "/flows/instances/?designation=authorization" 2>/dev/null \
-             | jq -r '.results[0].pk // empty' 2>/dev/null || true)
-  fi
-  if [[ -z "$flow_pk" ]]; then
-    warn "Could not resolve Authentik authorization flow via API. Create the Arcane provider manually."
+    warn "Could not resolve Authentik authorization flow via API (blueprints not applied after ~2 min). Create the Arcane provider manually."
     return 0
   fi
 
