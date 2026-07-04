@@ -59,6 +59,7 @@ LOCK_HTTP_TO_CLOUDFLARE="${LOCK_HTTP_TO_CLOUDFLARE:-false}"  # restrict 80/443 t
 NPM_SKIP_SSL="${NPM_SKIP_SSL:-0}"                            # 1 = create proxy hosts HTTP-only (no Let's Encrypt attempt; do SSL manually in the NPM UI later)
 EXPOSE_NPM_ADMIN="${EXPOSE_NPM_ADMIN:-1}"                    # 1 = publish the NPM admin UI at npm.<domain> (NPM's OWN login, NO Authentik). 0 = SSH-tunnel only.
 CF_IPS_CACHE=""                                             # filled by get_cloudflare_ips()
+WILDCARD_CERT_ID=""                                         # ONE *.DOMAIN cert (DNS-01), reused for every proxy host
 
 # Deployment status tracking for guaranteed completion summary
 DEPLOY_STATUS="in_progress"
@@ -527,6 +528,18 @@ get_user_domain() {
     fatal "Invalid domain: '$DOMAIN'"
   printf '%s' "$DOMAIN" > "${DOMAIN_PERSIST_FILE}" || warn "Could not persist domain to ${DOMAIN_PERSIST_FILE}"
   success "Domain set to: $DOMAIN"
+
+  # HSTS-preloaded TLDs (Google-owned: .dev/.app/.page/... ) are hardcoded HTTPS-only
+  # inside every browser - http:// is rewritten to https:// before the request is even
+  # sent, so there is NO http fallback. Tell the user SSL is mandatory here; the deploy
+  # auto-issues ONE wildcard cert (needs a Cloudflare token with Zone:DNS:Edit).
+  case ".${DOMAIN##*.}" in
+    .dev|.app|.page|.foo|.zip|.mov|.new|.day|.boo|.rsvp|.meme|.dad|.phd|.esq|.prof|.how|.nexus|.channel|.search|.ing|.gle|.prod)
+      warn "'.${DOMAIN##*.}' is an HSTS-preloaded TLD: browsers FORCE https:// (no http fallback)."
+      warn "  So HTTPS is REQUIRED. This deploy will auto-issue a wildcard cert *.${DOMAIN} via"
+      warn "  Cloudflare DNS-01 - have a Cloudflare API token with Zone:DNS:Edit ready when prompted."
+      ;;
+  esac
 }
 
 # Validate an email for Let's Encrypt: must look like a real address AND must NOT
@@ -1066,61 +1079,72 @@ npm_create_proxy_host() {
   fi
 }
 
+npm_ensure_wildcard_cert() {
+  # Issue (or REUSE) ONE wildcard certificate *.DOMAIN via Cloudflare DNS-01 and
+  # cache its id in WILDCARD_CERT_ID. Rationale:
+  #  - ONE request covers EVERY subdomain (dockhand, authentik, npm, crowdsec + any
+  #    added later) -> smallest possible Let's Encrypt rate-limit footprint.
+  #  - Wildcards can ONLY be validated by DNS-01 (LE rule) - which is also the only
+  #    method that works behind the Authentik auth gate AND on HSTS-preloaded TLDs
+  #    like .dev/.app/.page (where browsers FORCE https, so SSL is mandatory).
+  #  - On re-runs we REUSE an existing matching cert, so repeated deploys can never
+  #    trip the duplicate-certificate limit.
+  WILDCARD_CERT_ID=""
+  [[ "${NPM_SKIP_SSL:-0}" == "1" ]] && return 0
+  local certs existing
+  certs=$(_npm_api "/nginx/certificates" 2>/dev/null || true)
+  existing=$(echo "$certs" | jq -r --arg d "*.${DOMAIN}" \
+    '[.[]? | select(.provider=="letsencrypt") | select(((.domain_names // []) | index($d)) != null) | .id] | max // empty' 2>/dev/null || true)
+  if [[ -n "$existing" && "$existing" != "null" ]]; then
+    WILDCARD_CERT_ID="$existing"
+    success "Reusing existing wildcard certificate *.${DOMAIN} (cert id ${WILDCARD_CERT_ID}) - no new Let's Encrypt request"
+    return 0
+  fi
+  if [[ -z "${CF_API_TOKEN:-}" ]]; then
+    warn "No Cloudflare token -> cannot auto-issue the wildcard (*.${DOMAIN} REQUIRES DNS-01)."
+    warn "  Hosts stay HTTP-only. On HSTS-preloaded TLDs (.dev/.app/.page) browsers FORCE https,"
+    warn "  so either add a DNS-challenge cert in the NPM UI, or re-run with CF_API_TOKEN set."
+    return 1
+  fi
+  # NOTE: NPM takes the LE account email from the logged-in NPM USER (set to
+  # $LETSENCRYPT_EMAIL in npm_change_password), NOT the payload. The cert "meta"
+  # schema is STRICT (additionalProperties:false): only dns_challenge / dns_provider
+  # / dns_provider_credentials / propagation_seconds are allowed.
+  local json resp
+  json=$(jq -nc --arg d "$DOMAIN" --arg tok "$CF_API_TOKEN" '{
+    provider: "letsencrypt",
+    nice_name: ("*." + $d),
+    domain_names: [("*." + $d), $d],
+    meta: {
+      dns_challenge: true,
+      dns_provider: "cloudflare",
+      dns_provider_credentials: ("dns_cloudflare_api_token = " + $tok),
+      propagation_seconds: 30
+    }
+  }')
+  info "Requesting ONE wildcard certificate for *.${DOMAIN} (+ ${DOMAIN}) via Cloudflare DNS-01 (up to ~2 min)..."
+  resp=$(_npm_api "/nginx/certificates" --max-time 200 -X POST -d "$json") || true
+  WILDCARD_CERT_ID=$(echo "$resp" | jq -r '.id // empty')
+  if [[ -z "$WILDCARD_CERT_ID" ]]; then
+    _log "WARN" "wildcard cert response: $(printf '%s' "$resp" | tr -d '\n' | cut -c1-400)"
+    warn "Wildcard cert issuance FAILED. Check the CF token has Zone:DNS:Edit on ${DOMAIN}. Raw response in ${LOG_FILE}. Hosts stay HTTP-only."
+    return 1
+  fi
+  success "Wildcard certificate issued: *.${DOMAIN} (cert id ${WILDCARD_CERT_ID}) - covers every subdomain"
+  return 0
+}
+
 npm_enable_ssl() {
-  # NPM API flow: 1) create LE certificate, 2) GET full host config,
-  # 3) merge SSL fields, PUT full object. MUST send all fields because
-  # NPM's PUT replaces the resource — a partial set loses forward_host
-  # (NPM derives it from domain prefix; breaks on hostnames that differ
-  # from the prefix, e.g. "authentik-server" vs "authentik.example.com").
+  # Attach the SHARED wildcard certificate (from npm_ensure_wildcard_cert) to a
+  # proxy host - one *.DOMAIN cert serves every host, no per-host LE request. GET the
+  # full host config, merge SSL fields, PUT the whole object back (NPM's PUT replaces
+  # the resource, so all fields must be resent or forward_host is lost).
   local HOST_ID="$1"
   local DOMAIN_NAME="$2"
-  local JSON RESP CERT_ID HOST_JSON
-  # NOTE: NPM takes the Let's Encrypt account email from the logged-in NPM USER
-  # (set to $LETSENCRYPT_EMAIL in npm_change_password), NOT from the cert payload.
-  # NPM's certificate "meta" schema is STRICT (additionalProperties:false) and does
-  # NOT permit letsencrypt_email / letsencrypt_agree -- sending them returns
-  # "data/meta must NOT have additional properties" and the cert is never created.
-  # So meta carries ONLY the schema-valid challenge keys below.
-
-  # Challenge selection:
-  #  - CF_API_TOKEN set  -> DNS-01 via Cloudflare. This is the RELIABLE path here:
-  #    every proxy host is gated by Authentik forward-auth (server-level
-  #    auth_request), which 302-redirects the HTTP-01 /.well-known/acme-challenge/
-  #    path before the cert exists, so HTTP-01 validation fails. DNS-01 never
-  #    touches nginx, so it works behind the auth gate (and behind a Cloudflare
-  #    proxied/orange-cloud record).
-  #  - no token          -> HTTP-01 (webroot) fallback.
-  if [[ -n "${CF_API_TOKEN:-}" ]]; then
-    JSON=$(jq -nc --arg domain "$DOMAIN_NAME" --arg tok "$CF_API_TOKEN" '{
-      provider: "letsencrypt",
-      nice_name: $domain,
-      domain_names: [$domain],
-      meta: {
-        dns_challenge: true,
-        dns_provider: "cloudflare",
-        dns_provider_credentials: ("dns_cloudflare_api_token = " + $tok),
-        propagation_seconds: 30
-      }
-    }')
-    info "Requesting Let's Encrypt cert for ${DOMAIN_NAME} via Cloudflare DNS-01 (can take up to 2 minutes)..."
-  else
-    JSON=$(jq -nc --arg domain "$DOMAIN_NAME" '{
-      provider: "letsencrypt",
-      nice_name: $domain,
-      domain_names: [$domain],
-      meta: { dns_challenge: false }
-    }')
-    info "Requesting Let's Encrypt certificate for ${DOMAIN_NAME} via HTTP-01 (can take up to 2 minutes)..."
-  fi
-  RESP=$(_npm_api "/nginx/certificates" --max-time 180 -X POST -d "$JSON") || true
-  CERT_ID=$(echo "$RESP" | jq -r '.id // empty')
+  local CERT_ID="${3:-$WILDCARD_CERT_ID}"
+  local JSON RESP HOST_JSON
   if [[ -z "$CERT_ID" ]]; then
-    _log "WARN" "NPM cert response for ${DOMAIN_NAME}: $(printf '%s' "$RESP" | tr -d '\n' | cut -c1-400)"
-    if [[ -n "${CF_API_TOKEN:-}" ]]; then
-      warn "Cloudflare DNS-01 cert failed for ${DOMAIN_NAME}. Check: CF token has Zone:DNS:Edit on ${DOMAIN}, and the email is valid. Raw response in ${LOG_FILE}. Host stays HTTP-only for now."
-    else
-      warn "HTTP-01 cert failed for ${DOMAIN_NAME} (host is behind Authentik, which can block the ACME challenge). Provide CF_API_TOKEN for reliable DNS-01. Raw response in ${LOG_FILE}. Host stays HTTP-only."
-    fi
+    warn "No wildcard certificate available - ${DOMAIN_NAME} stays HTTP-only (supply a Cloudflare token with Zone:DNS:Edit to auto-issue *.${DOMAIN})."
     return 1
   fi
 
@@ -1536,6 +1560,9 @@ automate_npm() {
   fi
 
   npm_purge_proxy_hosts
+
+  # Issue/reuse ONE wildcard cert up front; every host below attaches this same cert.
+  npm_ensure_wildcard_cert || true
 
   # Dockhand: protected by Authentik forward-auth (nginx auth_request). Both
   # snippets are required: the location block (outpost proxy + auth subrequest)
