@@ -368,6 +368,19 @@ idempotent_cleanup() {
   rm -f /etc/crowdsec/crowdsec-firewall-bouncer.yaml 2>/dev/null || true
   rm -rf /etc/crowdsec 2>/dev/null || true
 
+  # vps-blocklist (third-party blocklist refresher) from a prior run. Rules
+  # must go before the sets - ipset refuses to destroy a set in use.
+  systemctl disable --now vps-blocklist.timer vps-blocklist.service 2>/dev/null || true
+  rm -f /etc/systemd/system/vps-blocklist.service /etc/systemd/system/vps-blocklist.timer \
+        /usr/local/bin/vps-blocklist-update.sh 2>/dev/null || true
+  rm -rf /var/lib/vps-blocklist 2>/dev/null || true
+  for _c in INPUT DOCKER-USER; do
+    iptables  -D "$_c" -m set --match-set vps_blocklist4 src -j DROP 2>/dev/null || true
+    ip6tables -D "$_c" -m set --match-set vps_blocklist6 src -j DROP 2>/dev/null || true
+  done
+  ipset destroy vps_blocklist4 2>/dev/null || true
+  ipset destroy vps_blocklist6 2>/dev/null || true
+
   # Native crowdsec packages. CRITICAL: a prior run can leave a HALF-CONFIGURED
   # package (CF worker-bouncer postinst failing) -> dpkg broken, apt-get remove
   # itself fails, broken state survives. Repair dpkg FIRST, then PURGE, repair
@@ -440,11 +453,11 @@ install_dependencies() {
     # Guard: repair dpkg if cleanup left a half-configured package behind.
     DEBIAN_FRONTEND=noninteractive dpkg --configure -a --force-confold </dev/null 2>/dev/null || true
     apt-get install -y -qq ca-certificates curl gnupg lsb-release \
-      software-properties-common apt-transport-https jq unzip cron logrotate rsyslog
+      software-properties-common apt-transport-https jq unzip cron logrotate rsyslog ipset
   else
     local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
     $pkg install -y -q ca-certificates curl gnupg2 yum-utils \
-      device-mapper-persistent-data lvm2 jq unzip cronie logrotate rsyslog
+      device-mapper-persistent-data lvm2 jq unzip cronie logrotate rsyslog ipset
   fi
   # rsyslog must run so SSH/auth + system events land in /var/log/auth.log and
   # /var/log/syslog. Ubuntu 24.04 (and other modern distros) ship journald-only by
@@ -2268,114 +2281,207 @@ setup_crowdsec_console() {
 }
 
 # -------------------------------------------------------------------------------
-# Third-party IP blocklists -> CrowdSec ban decisions
-# The community blocklist (CAPI) only covers IPs reported by other CrowdSec
-# users. This imports two curated public feeds as local ban decisions, so the
-# EXISTING enforcement path (host firewall bouncer incl. DOCKER-USER) blocks
-# well-known offenders proactively, before they ever trip a scenario:
+# Third-party IP blocklists -> ipset-backed firewall DROP (INPUT + DOCKER-USER)
+# The CrowdSec community blocklist (CAPI) only covers IPs reported by other
+# CrowdSec users. This adds two curated public feeds so well-known offenders
+# are dropped proactively, before they ever trip a scenario:
 #   - ipsum level-3 (github.com/stamparm/ipsum): IPv4s seen on >=3 independent
 #     blacklists (aggregates blocklist.de, greensnow, CINS, ET...). ~15k IPs,
 #     refreshed upstream daily, low false-positive at level 3.
 #   - Spamhaus DROP + DROPv6: hijacked / criminal-leased netblocks (CIDR).
 #     Near-zero false-positive; complements ipsum (ranges vs single IPs).
-# Decisions are imported with a 26h TTL and re-imported daily by a systemd
-# timer -> the set self-refreshes and de-listed IPs age out automatically.
-# NOTE: the CF worker bouncer's `only_include_decisions_from: [cscli, crowdsec]`
-# deliberately EXCLUDES origin `cscli-import`, so these lists never sync to
-# Cloudflare KV (free-plan write cap stays safe). Skip with INSTALL_BLOCKLISTS=0.
+# WHY ipset AND NOT `cscli decisions import`: bulk-importing ~15k decisions
+# succeeds, but afterwards ANY `cscli decisions list -i <ip>` point lookup
+# (the /v1/alerts?ip= path) makes crowdsec 1.7.x LAPI assemble every import
+# alert with ALL its events - measured 25+ min at 100% CPU holding the SQLite
+# write lock (heartbeats 500, machine logins failing) on exactly this dataset,
+# while 100 imported decisions answer in 0.3s. Chunked/batched imports do NOT
+# avoid it. One stray debug command must not wedge the security engine, so the
+# static blacklist bypasses the decision pipeline and is enforced with ipset
+# in the SAME chains the CrowdSec firewall bouncer uses (INPUT + DOCKER-USER;
+# same mechanism as harden.sh's GeoIP gate). CrowdSec stays the reactive layer.
+# Daily refresh via systemd timer; boot re-apply via the oneshot service.
+# Skip with INSTALL_BLOCKLISTS=0.
 # -------------------------------------------------------------------------------
 setup_custom_blocklists() {
-  step "CrowdSec third-party blocklists (ipsum level-3 + Spamhaus DROP)"
+  step "Third-party IP blocklists (ipsum level-3 + Spamhaus DROP, ipset)"
   if [[ "${INSTALL_BLOCKLISTS:-1}" != "1" ]]; then
     info "INSTALL_BLOCKLISTS=0 - skipping third-party blocklists"
     return 0
   fi
-  if [[ "$(docker inspect -f '{{.State.Running}}' crowdsec 2>/dev/null || true)" != "true" ]]; then
-    warn "CrowdSec container not running - blocklists skipped. Later: /usr/local/bin/crowdsec-blocklist-update.sh"
-    return 0
-  fi
-
-  # Lockout guard: allowlist the operator's client IP BEFORE importing, so a
-  # (rare) false-positive listing of your own IP can never ban you. Allowlisted
-  # values are skipped at import time. Best-effort: `cscli allowlists` needs
-  # crowdsec >= 1.6.8; SSH_CLIENT survives the sudo re-exec only sometimes, so
-  # fall back to the login session's host field. All failures are non-fatal.
-  local ssh_ip="${SSH_CLIENT:-}"; ssh_ip="${ssh_ip%% *}"
-  [[ -z "$ssh_ip" ]] && ssh_ip=$(who am i 2>/dev/null | grep -oE '\(([0-9]{1,3}\.){3}[0-9]{1,3}\)' | tr -d '()' || true)
-  if [[ -n "$ssh_ip" ]]; then
-    docker exec crowdsec cscli allowlists create deploy-operator -d "deploy-time operator IPs" &>/dev/null || true
-    if docker exec crowdsec cscli allowlists add deploy-operator "$ssh_ip" &>/dev/null; then
-      success "Operator IP ${ssh_ip} allowlisted (lockout guard)"
+  # install_dependencies already pulls ipset; this is a self-heal for reuse paths
+  if ! command -v ipset &>/dev/null; then
+    if [[ "$OS_FAMILY" == "debian" ]]; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o DPkg::Lock::Timeout=300 ipset </dev/null >>"$LOG_FILE" 2>&1 || true
+    else
+      local pkg="yum"; command -v dnf &>/dev/null && pkg="dnf"
+      $pkg install -y -q ipset >>"$LOG_FILE" 2>&1 || true
     fi
   fi
+  command -v ipset &>/dev/null || { warn "ipset unavailable - blocklists skipped"; return 0; }
 
-  cat > /usr/local/bin/crowdsec-blocklist-update.sh << 'BLOCKLIST_UPDATER'
+  # Operator lockout guard: the deploying client's IP goes into the exclude
+  # file, which the updater strips from the sets on every refresh. SSH_CLIENT
+  # survives the sudo re-exec only sometimes, so fall back to the login
+  # session's host field. Best-effort, non-fatal.
+  local ssh_ip="${SSH_CLIENT:-}"; ssh_ip="${ssh_ip%% *}"
+  [[ -z "$ssh_ip" ]] && ssh_ip=$(who am i 2>/dev/null | grep -oE '\(([0-9]{1,3}\.){3}[0-9]{1,3}\)' | tr -d '()' || true)
+  touch /etc/vps-blocklist.exclude
+  if [[ -n "$ssh_ip" ]] && ! grep -qxF "$ssh_ip" /etc/vps-blocklist.exclude 2>/dev/null; then
+    printf '%s\n' "$ssh_ip" >> /etc/vps-blocklist.exclude
+    success "Operator IP ${ssh_ip} excluded from blocklists (/etc/vps-blocklist.exclude)"
+  fi
+
+  cat > /usr/local/bin/vps-blocklist-update.sh << 'BLOCKLIST_UPDATER'
 #!/usr/bin/env bash
-# crowdsec-blocklist-update.sh - import third-party IP blocklists into CrowdSec.
-# Installed by the VPS deploy script; run daily by crowdsec-blocklist.timer.
-# Decisions get a 26h TTL, so each run refreshes the set and de-listed IPs
-# expire on their own. Re-importing an existing decision just extends it -
-# duplicates are not a problem. Safe to run by hand at any time.
+# vps-blocklist-update.sh - refresh third-party IP blocklists into ipset-backed
+# firewall DROP rules (INPUT + DOCKER-USER, IPv4 + IPv6). Installed by the VPS
+# deploy script; re-applied at boot by vps-blocklist.service and refreshed
+# daily by vps-blocklist.timer. Safe to run by hand at any time.
+#
+# Deliberately NOT `cscli decisions import`: 15k imported decisions make any
+# later `cscli decisions list -i <ip>` wedge crowdsec 1.7.x LAPI at 100% CPU
+# with the DB write-locked (measured). Static blacklists don't need the
+# decision pipeline - they are enforced in the same chains the CrowdSec
+# firewall bouncer uses.
+#
+# Feeds (all free, no keys):
+#   ipsum level-3   - IPv4s on >=3 independent blacklists (~15k, low FP)
+#   Spamhaus DROP   - hijacked/criminal netblocks, IPv4 CIDR (~1.7k, near-zero FP)
+#   Spamhaus DROPv6 - same, IPv6
+# The last good copy of each feed is cached in /var/lib/vps-blocklist and
+# reused when a download fails, so a flaky mirror never empties the sets.
+# Entries in /etc/vps-blocklist.exclude (one IP/CIDR per line, '#' comments)
+# are never blocked (operator lockout guard - the deploy seeds your SSH IP).
 set -euo pipefail
 
-DURATION="26h"
+CACHE_DIR="/var/lib/vps-blocklist"
+EXCLUDE_FILE="/etc/vps-blocklist.exclude"
 
-log() { logger -t crowdsec-blocklist "$*" 2>/dev/null || true; printf '%s\n' "$*"; }
+# log to stderr: stdout is reserved for _fetch's path handoff below
+log() { logger -t vps-blocklist "$*" 2>/dev/null || true; printf '%s\n' "$*" >&2; }
 
-[[ "$(docker inspect -f '{{.State.Running}}' crowdsec 2>/dev/null || true)" == "true" ]] \
-  || { log "crowdsec container not running - nothing imported"; exit 0; }
-
+command -v ipset >/dev/null 2>&1 || { log "ipset not installed - aborting"; exit 1; }
+mkdir -p "$CACHE_DIR"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 
-# _import <label> <url> <scope ip|range> <sanity-floor> <entry-regex>
-# The floor guards against a truncated download or an HTML error page being
-# imported as garbage: fewer valid entries than the floor -> skip this source.
-_import() {
-  local label="$1" url="$2" scope="$3" floor="$4" regex="$5" f="$tmp/$1.txt" n
-  if ! curl -sfL --max-time 90 "$url" -o "$tmp/$1.raw"; then
-    log "$label: download failed - skipped"
-    return 0
-  fi
-  # strip ';'/'#' comments and whitespace, keep only well-formed entries
-  sed -e 's/[;#].*//' -e 's/[[:space:]]//g' "$tmp/$1.raw" | grep -E "$regex" > "$f" || true
-  n=$(wc -l < "$f")
-  if (( n < floor )); then
-    log "$label: only $n valid entries (< $floor) - skipped as suspect download"
-    return 0
-  fi
-  if docker exec -i crowdsec cscli decisions import -i - --format values \
-       --scope "$scope" --type ban --duration "$DURATION" --reason "$label" \
-       --batch 2000 < "$f" >/dev/null 2>&1; then
-    log "$label: imported $n entries (scope $scope, ban $DURATION)"
+# _fetch <label> <url> <entry-regex> <sanity-floor>
+# Downloads + validates a feed into $CACHE_DIR/<label>.txt, keeping the
+# previous good copy when the download fails or looks truncated (floor guards
+# against an HTML error page or a cut-off transfer being applied as garbage).
+# Prints the cache path on stdout; prints nothing if no copy exists at all.
+_fetch() {
+  local label="$1" url="$2" regex="$3" floor="$4" n
+  if curl -sfL --max-time 90 "$url" -o "$tmp/$label.raw"; then
+    # strip ';'/'#' comments and whitespace, keep only well-formed entries
+    sed -e 's/[;#].*//' -e 's/[[:space:]]//g' "$tmp/$label.raw" \
+      | grep -E "$regex" | sort -u > "$tmp/$label.txt" || true
+    n=$(wc -l < "$tmp/$label.txt")
+    if (( n >= floor )); then
+      mv "$tmp/$label.txt" "$CACHE_DIR/$label.txt"
+      log "$label: fetched $n entries"
+    else
+      log "$label: only $n valid entries (< $floor) - suspect download, keeping cached copy"
+    fi
   else
-    log "$label: cscli import FAILED"
+    log "$label: download failed - keeping cached copy"
+  fi
+  [[ -f "$CACHE_DIR/$label.txt" ]] && printf '%s\n' "$CACHE_DIR/$label.txt"
+  return 0
+}
+
+# _apply <set-name> <family inet|inet6> <feed-files...>
+# Builds a temp set and atomically swaps it in: the live set is never empty
+# mid-refresh, and if everything failed upstream the old set stays untouched.
+_apply() {
+  local set="$1" family="$2"; shift 2
+  local n n_live
+  sort -u "$@" > "$tmp/$set.all"
+  # operator lockout guard (exact-entry match)
+  sed -e 's/[[:space:]]//g' "$EXCLUDE_FILE" 2>/dev/null | grep -vE '^(#|$)' > "$tmp/exclude" || true
+  if [[ -s "$tmp/exclude" ]]; then
+    grep -vxFf "$tmp/exclude" "$tmp/$set.all" > "$tmp/$set.fin" || true
+  else
+    cp "$tmp/$set.all" "$tmp/$set.fin"
+  fi
+  n=$(wc -l < "$tmp/$set.fin")
+  if (( n == 0 )); then
+    log "$set: no entries - leaving existing set untouched"
+    return 0
+  fi
+  {
+    printf 'create %s hash:net family %s maxelem 131072\n' "$set" "$family"
+    printf 'create %s_t hash:net family %s maxelem 131072\n' "$set" "$family"
+    printf 'flush %s_t\n' "$set"
+    sed "s/^/add ${set}_t /" "$tmp/$set.fin"
+    printf 'swap %s_t %s\ndestroy %s_t\n' "$set" "$set" "$set"
+  } > "$tmp/$set.restore"
+  # -! tolerates already-existing sets/entries; verify via live entry count
+  ipset restore -! < "$tmp/$set.restore" || true
+  ipset destroy "${set}_t" 2>/dev/null || true
+  n_live=$(ipset list "$set" -t 2>/dev/null | grep -oE 'Number of entries: [0-9]+' | grep -oE '[0-9]+' || true)
+  if [[ -n "$n_live" && "$n_live" -gt 0 ]]; then
+    log "$set: $n_live entries active (of $n candidates)"
+  else
+    log "$set: FAILED - set is empty after restore"
   fi
 }
 
-_import ipsum-level3   "https://raw.githubusercontent.com/stamparm/ipsum/master/levels/3.txt" \
-        ip    1000 '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
-_import spamhaus-drop  "https://www.spamhaus.org/drop/drop.txt" \
-        range 100  '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$'
-_import spamhaus-drop6 "https://www.spamhaus.org/drop/dropv6.txt" \
-        range 5    '^[0-9a-fA-F:]+/[0-9]{1,3}$'
-BLOCKLIST_UPDATER
-  chmod 755 /usr/local/bin/crowdsec-blocklist-update.sh
+# _rule <iptables|ip6tables> <chain> <set-name>
+# (Re)insert the DROP at position 1 so it precedes GeoIP/UFW accepts. The
+# chain may not exist yet (DOCKER-USER before docker starts) - skip quietly;
+# the boot service runs After=docker.service and the timer re-asserts daily.
+_rule() {
+  local ipt="$1" chain="$2" set="$3"
+  command -v "$ipt" >/dev/null 2>&1 || return 0
+  ipset list "$set" -t >/dev/null 2>&1 || return 0
+  "$ipt" -nL "$chain" >/dev/null 2>&1 || return 0
+  "$ipt" -D "$chain" -m set --match-set "$set" src -j DROP 2>/dev/null || true
+  "$ipt" -I "$chain" 1 -m set --match-set "$set" src -j DROP 2>/dev/null \
+    || log "$ipt: could not insert $set DROP rule in $chain"
+}
 
-  # systemd timer (not cron): present on every supported OS, Persistent=true
-  # catches runs missed while the box was down, and failures land in journald.
-  cat > /etc/systemd/system/crowdsec-blocklist.service << 'BLOCKLIST_SVC'
+v4_files=() v6_files=()
+f=$(_fetch ipsum-level3 "https://raw.githubusercontent.com/stamparm/ipsum/master/levels/3.txt" \
+      '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' 1000)
+[[ -n "$f" ]] && v4_files+=("$f") || true
+f=$(_fetch spamhaus-drop "https://www.spamhaus.org/drop/drop.txt" \
+      '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$' 100)
+[[ -n "$f" ]] && v4_files+=("$f") || true
+f=$(_fetch spamhaus-drop6 "https://www.spamhaus.org/drop/dropv6.txt" \
+      '^[0-9a-fA-F:]+/[0-9]{1,3}$' 5)
+[[ -n "$f" ]] && v6_files+=("$f") || true
+
+if (( ${#v4_files[@]} > 0 )); then _apply vps_blocklist4 inet  "${v4_files[@]}"; fi
+if (( ${#v6_files[@]} > 0 )); then _apply vps_blocklist6 inet6 "${v6_files[@]}"; fi
+
+_rule iptables  INPUT       vps_blocklist4
+_rule iptables  DOCKER-USER vps_blocklist4
+_rule ip6tables INPUT       vps_blocklist6
+_rule ip6tables DOCKER-USER vps_blocklist6
+BLOCKLIST_UPDATER
+  chmod 755 /usr/local/bin/vps-blocklist-update.sh
+
+  # Boot re-apply (ipsets don't survive reboot) + daily refresh. systemd, not
+  # cron: present on every supported OS, Persistent=true catches runs missed
+  # while the box was down, failures land in journald.
+  cat > /etc/systemd/system/vps-blocklist.service << 'BLOCKLIST_SVC'
 [Unit]
-Description=Import third-party IP blocklists into CrowdSec
-After=docker.service network-online.target
+Description=Apply third-party IP blocklists (ipset DROP sets)
+After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/crowdsec-blocklist-update.sh
+ExecStart=/usr/local/bin/vps-blocklist-update.sh
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
 BLOCKLIST_SVC
-  cat > /etc/systemd/system/crowdsec-blocklist.timer << 'BLOCKLIST_TIMER'
+  cat > /etc/systemd/system/vps-blocklist.timer << 'BLOCKLIST_TIMER'
 [Unit]
-Description=Daily third-party blocklist refresh for CrowdSec
+Description=Daily third-party IP blocklist refresh
 
 [Timer]
 OnCalendar=*-*-* 04:17:00
@@ -2386,16 +2492,23 @@ Persistent=true
 WantedBy=timers.target
 BLOCKLIST_TIMER
   systemctl daemon-reload 2>/dev/null || true
-  systemctl enable --now crowdsec-blocklist.timer >>"$LOG_FILE" 2>&1 \
-    || warn "Could not enable crowdsec-blocklist.timer - imports won't refresh daily"
+  systemctl enable vps-blocklist.service >>"$LOG_FILE" 2>&1 \
+    || warn "Could not enable vps-blocklist.service - sets won't re-apply on boot"
+  systemctl enable --now vps-blocklist.timer >>"$LOG_FILE" 2>&1 \
+    || warn "Could not enable vps-blocklist.timer - blocklists won't refresh daily"
 
-  info "Importing blocklists (first run, ~17k entries - takes a minute)..."
-  if /usr/local/bin/crowdsec-blocklist-update.sh >>"$LOG_FILE" 2>&1; then
-    local n
-    n=$(docker exec crowdsec cscli decisions list --origin cscli-import -l 0 -o raw 2>/dev/null | tail -n +2 | wc -l || true)
-    success "Blocklists active: ${n:-?} imported ban decisions (daily refresh: crowdsec-blocklist.timer)"
+  info "Applying blocklists (first run, ~17k entries)..."
+  if /usr/local/bin/vps-blocklist-update.sh >>"$LOG_FILE" 2>&1; then
+    local n4 n6
+    n4=$(ipset list vps_blocklist4 -t 2>/dev/null | grep -oE 'Number of entries: [0-9]+' | grep -oE '[0-9]+' || true)
+    n6=$(ipset list vps_blocklist6 -t 2>/dev/null | grep -oE 'Number of entries: [0-9]+' | grep -oE '[0-9]+' || true)
+    if [[ -n "$n4" && "$n4" -gt 0 ]]; then
+      success "Blocklists enforced: ${n4} IPv4 + ${n6:-0} IPv6 entries in INPUT + DOCKER-USER (daily refresh: vps-blocklist.timer)"
+    else
+      warn "Blocklist run finished but vps_blocklist4 is empty - check: journalctl -t vps-blocklist"
+    fi
   else
-    warn "Initial blocklist import failed - the timer retries daily. Manual: /usr/local/bin/crowdsec-blocklist-update.sh (log: ${LOG_FILE})"
+    warn "Blocklist apply failed - the timer retries daily. Manual: /usr/local/bin/vps-blocklist-update.sh (log: ${LOG_FILE})"
   fi
 }
 
@@ -2443,6 +2556,12 @@ verify_deployment() {
     "docker exec crowdsec cscli bouncers list 2>/dev/null | grep -q npm-bouncer"
   _check "http-cve collection installed" bash -c \
     "docker exec crowdsec cscli collections list 2>/dev/null | grep -q crowdsecurity/http-cve"
+  if [[ "${INSTALL_BLOCKLISTS:-1}" == "1" ]]; then
+    _check "blocklist ipset populated" bash -c \
+      "ipset list vps_blocklist4 -t 2>/dev/null | grep -qE 'Number of entries: [1-9]'"
+    _check "blocklist DROP rule in INPUT" \
+      iptables -C INPUT -m set --match-set vps_blocklist4 src -j DROP
+  fi
   # http.conf holds ONLY set_real_ip_from lines; the CF-Connecting-IP swap is
   # patched into the container's /etc/nginx/nginx.conf (NOT http.conf). Check both
   # where they actually live, else this is a guaranteed false negative.
@@ -2698,8 +2817,9 @@ ${C_B}${C_YEL}Done automatically:${C_R}
   - CrowdSec bans enforced incl. Docker-published ports (DOCKER-USER chain)
   - CrowdSec DETECTION wired for SSH + system logs (rsyslog + auth.log/syslog acquisition)
   - CrowdSec http-cve collection installed (CVE-exploit probing detection)
-  - Third-party blocklists imported: ipsum level-3 + Spamhaus DROP (~17k IPs/ranges,
-    daily refresh via crowdsec-blocklist.timer; skip with INSTALL_BLOCKLISTS=0)
+  - Third-party blocklists enforced via ipset DROP in INPUT + DOCKER-USER: ipsum
+    level-3 + Spamhaus DROP, ~17k entries (daily refresh: vps-blocklist.timer;
+    operator IP excluded via /etc/vps-blocklist.exclude; INSTALL_BLOCKLISTS=0 skips)
   - Cloudflare real visitor IPs restored in NPM (CF-Connecting-IP header)
   - Cloudflare Worker bouncer deployed for edge IP-ban enforcement (if token supplied)
   - Host filesystem mounted into Arcane READ-ONLY
