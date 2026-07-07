@@ -15,6 +15,8 @@ fi
 #     CROWDSEC_ENROLL_KEY=<key>    optional CrowdSec Console enroll key from
 #                                  app.crowdsec.net (Security Engines > Enroll). If set,
 #                                  the instance auto-enrolls; else enroll manually later.
+#     INSTALL_BLOCKLISTS=0         skip the third-party IP blocklist import
+#                                  (ipsum level-3 + Spamhaus DROP; default ON, daily refresh)
 #     LOCK_HTTP_TO_CLOUDFLARE=true restrict 80/443 to Cloudflare IP ranges in the
 #                                  firewall (default false; turn on once all DNS is proxied)
 set -euo pipefail
@@ -2247,6 +2249,138 @@ setup_crowdsec_console() {
 }
 
 # -------------------------------------------------------------------------------
+# Third-party IP blocklists -> CrowdSec ban decisions
+# The community blocklist (CAPI) only covers IPs reported by other CrowdSec
+# users. This imports two curated public feeds as local ban decisions, so the
+# EXISTING enforcement path (host firewall bouncer incl. DOCKER-USER) blocks
+# well-known offenders proactively, before they ever trip a scenario:
+#   - ipsum level-3 (github.com/stamparm/ipsum): IPv4s seen on >=3 independent
+#     blacklists (aggregates blocklist.de, greensnow, CINS, ET...). ~15k IPs,
+#     refreshed upstream daily, low false-positive at level 3.
+#   - Spamhaus DROP + DROPv6: hijacked / criminal-leased netblocks (CIDR).
+#     Near-zero false-positive; complements ipsum (ranges vs single IPs).
+# Decisions are imported with a 26h TTL and re-imported daily by a systemd
+# timer -> the set self-refreshes and de-listed IPs age out automatically.
+# NOTE: the CF worker bouncer's `only_include_decisions_from: [cscli, crowdsec]`
+# deliberately EXCLUDES origin `cscli-import`, so these lists never sync to
+# Cloudflare KV (free-plan write cap stays safe). Skip with INSTALL_BLOCKLISTS=0.
+# -------------------------------------------------------------------------------
+setup_custom_blocklists() {
+  step "CrowdSec third-party blocklists (ipsum level-3 + Spamhaus DROP)"
+  if [[ "${INSTALL_BLOCKLISTS:-1}" != "1" ]]; then
+    info "INSTALL_BLOCKLISTS=0 - skipping third-party blocklists"
+    return 0
+  fi
+  if [[ "$(docker inspect -f '{{.State.Running}}' crowdsec 2>/dev/null || true)" != "true" ]]; then
+    warn "CrowdSec container not running - blocklists skipped. Later: /usr/local/bin/crowdsec-blocklist-update.sh"
+    return 0
+  fi
+
+  # Lockout guard: allowlist the operator's client IP BEFORE importing, so a
+  # (rare) false-positive listing of your own IP can never ban you. Allowlisted
+  # values are skipped at import time. Best-effort: `cscli allowlists` needs
+  # crowdsec >= 1.6.8; SSH_CLIENT survives the sudo re-exec only sometimes, so
+  # fall back to the login session's host field. All failures are non-fatal.
+  local ssh_ip="${SSH_CLIENT:-}"; ssh_ip="${ssh_ip%% *}"
+  [[ -z "$ssh_ip" ]] && ssh_ip=$(who am i 2>/dev/null | grep -oE '\(([0-9]{1,3}\.){3}[0-9]{1,3}\)' | tr -d '()' || true)
+  if [[ -n "$ssh_ip" ]]; then
+    docker exec crowdsec cscli allowlists create deploy-operator -d "deploy-time operator IPs" &>/dev/null || true
+    if docker exec crowdsec cscli allowlists add deploy-operator "$ssh_ip" &>/dev/null; then
+      success "Operator IP ${ssh_ip} allowlisted (lockout guard)"
+    fi
+  fi
+
+  cat > /usr/local/bin/crowdsec-blocklist-update.sh << 'BLOCKLIST_UPDATER'
+#!/usr/bin/env bash
+# crowdsec-blocklist-update.sh - import third-party IP blocklists into CrowdSec.
+# Installed by the VPS deploy script; run daily by crowdsec-blocklist.timer.
+# Decisions get a 26h TTL, so each run refreshes the set and de-listed IPs
+# expire on their own. Re-importing an existing decision just extends it -
+# duplicates are not a problem. Safe to run by hand at any time.
+set -euo pipefail
+
+DURATION="26h"
+
+log() { logger -t crowdsec-blocklist "$*" 2>/dev/null || true; printf '%s\n' "$*"; }
+
+[[ "$(docker inspect -f '{{.State.Running}}' crowdsec 2>/dev/null || true)" == "true" ]] \
+  || { log "crowdsec container not running - nothing imported"; exit 0; }
+
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+
+# _import <label> <url> <scope ip|range> <sanity-floor> <entry-regex>
+# The floor guards against a truncated download or an HTML error page being
+# imported as garbage: fewer valid entries than the floor -> skip this source.
+_import() {
+  local label="$1" url="$2" scope="$3" floor="$4" regex="$5" f="$tmp/$1.txt" n
+  if ! curl -sfL --max-time 90 "$url" -o "$tmp/$1.raw"; then
+    log "$label: download failed - skipped"
+    return 0
+  fi
+  # strip ';'/'#' comments and whitespace, keep only well-formed entries
+  sed -e 's/[;#].*//' -e 's/[[:space:]]//g' "$tmp/$1.raw" | grep -E "$regex" > "$f" || true
+  n=$(wc -l < "$f")
+  if (( n < floor )); then
+    log "$label: only $n valid entries (< $floor) - skipped as suspect download"
+    return 0
+  fi
+  if docker exec -i crowdsec cscli decisions import -i - --format values \
+       --scope "$scope" --type ban --duration "$DURATION" --reason "$label" \
+       --batch 2000 < "$f" >/dev/null 2>&1; then
+    log "$label: imported $n entries (scope $scope, ban $DURATION)"
+  else
+    log "$label: cscli import FAILED"
+  fi
+}
+
+_import ipsum-level3   "https://raw.githubusercontent.com/stamparm/ipsum/master/levels/3.txt" \
+        ip    1000 '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+_import spamhaus-drop  "https://www.spamhaus.org/drop/drop.txt" \
+        range 100  '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$'
+_import spamhaus-drop6 "https://www.spamhaus.org/drop/dropv6.txt" \
+        range 5    '^[0-9a-fA-F:]+/[0-9]{1,3}$'
+BLOCKLIST_UPDATER
+  chmod 755 /usr/local/bin/crowdsec-blocklist-update.sh
+
+  # systemd timer (not cron): present on every supported OS, Persistent=true
+  # catches runs missed while the box was down, and failures land in journald.
+  cat > /etc/systemd/system/crowdsec-blocklist.service << 'BLOCKLIST_SVC'
+[Unit]
+Description=Import third-party IP blocklists into CrowdSec
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/crowdsec-blocklist-update.sh
+BLOCKLIST_SVC
+  cat > /etc/systemd/system/crowdsec-blocklist.timer << 'BLOCKLIST_TIMER'
+[Unit]
+Description=Daily third-party blocklist refresh for CrowdSec
+
+[Timer]
+OnCalendar=*-*-* 04:17:00
+RandomizedDelaySec=30m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+BLOCKLIST_TIMER
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable --now crowdsec-blocklist.timer >>"$LOG_FILE" 2>&1 \
+    || warn "Could not enable crowdsec-blocklist.timer - imports won't refresh daily"
+
+  info "Importing blocklists (first run, ~17k entries - takes a minute)..."
+  if /usr/local/bin/crowdsec-blocklist-update.sh >>"$LOG_FILE" 2>&1; then
+    local n
+    n=$(docker exec crowdsec cscli decisions list --origin cscli-import -l 0 -o raw 2>/dev/null | tail -n +2 | wc -l || true)
+    success "Blocklists active: ${n:-?} imported ban decisions (daily refresh: crowdsec-blocklist.timer)"
+  else
+    warn "Initial blocklist import failed - the timer retries daily. Manual: /usr/local/bin/crowdsec-blocklist-update.sh (log: ${LOG_FILE})"
+  fi
+}
+
+# -------------------------------------------------------------------------------
 # Post-deploy self-verification - the script proves its own work before
 # declaring success. Failures here are loud but non-fatal (warn level),
 # with exact debug commands printed.
@@ -2545,6 +2679,8 @@ ${C_B}${C_YEL}Done automatically:${C_R}
   - CrowdSec bans enforced incl. Docker-published ports (DOCKER-USER chain)
   - CrowdSec DETECTION wired for SSH + system logs (rsyslog + auth.log/syslog acquisition)
   - CrowdSec http-cve collection installed (CVE-exploit probing detection)
+  - Third-party blocklists imported: ipsum level-3 + Spamhaus DROP (~17k IPs/ranges,
+    daily refresh via crowdsec-blocklist.timer; skip with INSTALL_BLOCKLISTS=0)
   - Cloudflare real visitor IPs restored in NPM (CF-Connecting-IP header)
   - Cloudflare Worker bouncer deployed for edge IP-ban enforcement (if token supplied)
   - Host filesystem mounted into Dockhand READ-ONLY
@@ -2734,6 +2870,7 @@ main() {
   setup_cloudflare_realip
   setup_cloudflare_bouncer
   setup_crowdsec_console
+  setup_custom_blocklists
   setup_logrotate
   automate_npm
   setup_crowdsec_webui
