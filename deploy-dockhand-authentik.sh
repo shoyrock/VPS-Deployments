@@ -1422,11 +1422,20 @@ enforce_authentik_mfa() {
   # security key / platform biometric). device_classes lists what may VALIDATE.
   # Stage PKs resolve by their stable default names. Fully fail-safe: any failure
   # leaves MFA OPTIONAL and warns, never a half-broken login flow.
-  local vpk tpk wpk got rec cfg_stages
-  vpk=$(_ak_api "/stages/authenticator/validate/" 2>/dev/null | jq -r '.results[]? | select(.name=="default-authentication-mfa-validation") | .pk' 2>/dev/null | head -1)
-  tpk=$(_ak_api "/stages/authenticator/totp/" 2>/dev/null | jq -r '.results[]? | select(.name=="default-authenticator-totp-setup") | .pk' 2>/dev/null | head -1)
-  # WebAuthn setup stage (default blueprint name). Optional: if absent, TOTP-only.
-  wpk=$(_ak_api "/stages/authenticator/webauthn/" 2>/dev/null | jq -r '.results[]? | select(.name=="default-authenticator-webauthn-setup") | .pk' 2>/dev/null | head -1)
+  local vpk tpk wpk got rec cfg_stages tries
+  # The default-* stages are created by Authentik's DEFAULT BLUEPRINTS, which the
+  # worker applies ASYNCHRONOUSLY after first boot — the API can answer minutes
+  # before they exist. A one-shot lookup here races them (and loses on a fresh
+  # deploy, silently leaving MFA optional), so poll for up to 2 minutes.
+  for tries in $(seq 1 24); do
+    vpk=$(_ak_api "/stages/authenticator/validate/" 2>/dev/null | jq -r '.results[]? | select(.name=="default-authentication-mfa-validation") | .pk' 2>/dev/null | head -1)
+    tpk=$(_ak_api "/stages/authenticator/totp/" 2>/dev/null | jq -r '.results[]? | select(.name=="default-authenticator-totp-setup") | .pk' 2>/dev/null | head -1)
+    # WebAuthn setup stage (default blueprint name). Optional: if absent, TOTP-only.
+    wpk=$(_ak_api "/stages/authenticator/webauthn/" 2>/dev/null | jq -r '.results[]? | select(.name=="default-authenticator-webauthn-setup") | .pk' 2>/dev/null | head -1)
+    [[ -n "$vpk" && -n "$tpk" ]] && break
+    printf "\r  ${C_DIM}Waiting for Authentik default blueprints (MFA stages)... %d/24${C_R}" "$tries" >&2
+    sleep 5
+  done; printf "\r" >&2
   if [[ -z "$vpk" || -z "$tpk" ]]; then
     warn "Could not resolve Authentik MFA stages - MFA left OPTIONAL. Enforce later in the UI:"
     warn "  Flows & Stages > Stages > default-authentication-mfa-validation > 'Not configured action' = Configure + add the TOTP (and WebAuthn) setup stage(s)."
@@ -1994,7 +2003,26 @@ setup_cloudflare_bouncer() {
   # UPDATES SILENTLY STOP. This purges it to a clean dpkg state (the firewall
   # bouncer, the real enforcement, is a different package and is untouched). The
   # user can re-run the deploy after enabling AE to add edge enforcement.
+  # The crowdsec compose PRE-REGISTERS the worker bouncer's LAPI key via a
+  # BOUNCER_KEY_cloudflarebouncer env var, and the container re-creates that
+  # bouncer on EVERY start - so when the worker is skipped, a stale never-pulling
+  # 'cloudflarebouncer' entry lingers in `cscli bouncers list` (and a plain
+  # `cscli bouncers delete` is resurrected on the next container restart).
+  # Drop the env line, recreate crowdsec, then delete the registration from
+  # LAPI. A later re-run of this deploy re-adds both.
+  _worker_lapi_clean() {
+    local cyml="${STACK_DIR}/docker-compose.crowdsec.yml" i
+    if [[ -f "$cyml" ]] && grep -q 'BOUNCER_KEY_cloudflarebouncer' "$cyml"; then
+      sed -i '/# Pre-register the Cloudflare Worker bouncer/,+1d;/BOUNCER_KEY_cloudflarebouncer/d' "$cyml"
+      docker compose -p crowdsec -f "$cyml" up -d >>"$LOG_FILE" 2>&1 || true
+      for i in $(seq 1 12); do docker exec crowdsec cscli version >/dev/null 2>&1 && break; sleep 5; done
+    fi
+    docker exec crowdsec cscli bouncers delete cloudflarebouncer >>"$LOG_FILE" 2>&1 || true
+    info "Retired the pre-registered 'cloudflarebouncer' LAPI key (no worker deployed)."
+  }
+
   _worker_pkg_clean() {
+    _worker_lapi_clean
     command -v dpkg >/dev/null 2>&1 || return 0
     dpkg-query -W crowdsec-cloudflare-worker-bouncer >/dev/null 2>&1 || return 0
     DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all crowdsec-cloudflare-worker-bouncer </dev/null >>"$LOG_FILE" 2>&1 \

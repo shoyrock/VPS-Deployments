@@ -686,6 +686,11 @@ DIR="/usr/local/bin/geoip-block"
 ALLOW="geoip_allow" CFSET="geoip_cf" GATE="GEOIP_GATE" LOG="/var/log/harden.log"
 ALLOW6="geoip_allow6" CFSET6="geoip_cf6" GATE6="GEOIP_GATE6"
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') GeoIP: $*" >> "$LOG"; }
+# ipdeny.com intermittently aborts HTTP/2 transfers mid-stream (PROTOCOL_ERROR /
+# partial file), so force HTTP/1.1 and retry; a zone file must be a plain CIDR
+# list — reject empty, truncated-to-HTML, or garbage bodies before install.
+ZCURL="curl -fsSL --http1.1 --retry 3 --retry-delay 3 --retry-all-errors --max-time 120"
+zone_ok() { [[ -s "$1" ]] && ! grep -qim1 '<html' "$1" && grep -qEm1 '^[0-9a-fA-F]' "$1"; }
 
 command -v iptables &>/dev/null || { log "iptables missing — skipping"; exit 0; }
 command -v ipset    &>/dev/null || { log "ipset missing — skipping"; exit 0; }
@@ -740,7 +745,8 @@ mkdir -p "$DIR"
 for c in $COUNTRIES; do
     got=0
     for url in "aggregated/${c}-aggregated.zone" "countries/${c}.zone"; do
-        if curl -fsSL --max-time 30 "https://www.ipdeny.com/ipblocks/data/${url}" -o "${DIR}/${c}.zone.tmp"; then
+        if $ZCURL "https://www.ipdeny.com/ipblocks/data/${url}" -o "${DIR}/${c}.zone.tmp" \
+           && zone_ok "${DIR}/${c}.zone.tmp"; then
             mv "${DIR}/${c}.zone.tmp" "${DIR}/${c}.zone"; got=1; break
         fi
     done
@@ -822,8 +828,10 @@ fi
 if [[ "$HAVE6" == "1" ]]; then
     for c in $COUNTRIES; do
         got6=0
-        for url in "ipv6/ipaddresses/aggregated/${c}-aggregated.zone" "ipv6/ipaddresses/${c}.zone"; do
-            if curl -fsSL --max-time 30 "https://www.ipdeny.com/${url}" -o "${DIR}/${c}.v6.zone.tmp"; then
+        # v6 zones exist ONLY under aggregated/ (the per-country path 404s).
+        for url in "ipv6/ipaddresses/aggregated/${c}-aggregated.zone"; do
+            if $ZCURL "https://www.ipdeny.com/${url}" -o "${DIR}/${c}.v6.zone.tmp" \
+               && zone_ok "${DIR}/${c}.v6.zone.tmp"; then
                 mv "${DIR}/${c}.v6.zone.tmp" "${DIR}/${c}.v6.zone"; got6=1; break
             fi
         done
@@ -900,7 +908,10 @@ GEOEOF
     kill -0 "$geoip_pid" 2>/dev/null && warn "GeoIP apply still running in background (PID $geoip_pid)"
 
     # Daily refresh + re-apply on reboot (iptables/ipset rules are not persisted).
-    local cron_daily="0 4 * * * ${GEOIP_DIR}/apply-geoip.sh >> /var/log/harden.log 2>&1"
+    # Random minute: at 04:00 sharp ipdeny.com is hammered by everyone's cron and
+    # aborts transfers mid-stream — spread the fleet across the hour.
+    local cron_min=$(( RANDOM % 60 ))
+    local cron_daily="${cron_min} 4 * * * ${GEOIP_DIR}/apply-geoip.sh >> /var/log/harden.log 2>&1"
     local cron_boot="@reboot sleep 60 && ${GEOIP_DIR}/apply-geoip.sh >> /var/log/harden.log 2>&1"
     (crontab -l 2>/dev/null | grep -vF "apply-geoip" || true; echo "$cron_daily"; echo "$cron_boot") | crontab - 2>/dev/null || true
 
@@ -1249,7 +1260,16 @@ harden_ssh() {
         fi
     }
 
-    _set_sshd PermitRootLogin prohibit-password
+    # Fully disable root login ONLY when it cannot lock the operator out: harden.sh
+    # was invoked via sudo by a non-root user who holds an SSH key (so they
+    # demonstrably do not depend on root@ logins). Otherwise keep key-only root
+    # (prohibit-password), which already blocks password guessing.
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" && -s "/home/${SUDO_USER}/.ssh/authorized_keys" ]]; then
+        _set_sshd PermitRootLogin no
+        ok "SSH: root login fully disabled (operator '${SUDO_USER}' logs in with a key)"
+    else
+        _set_sshd PermitRootLogin prohibit-password
+    fi
     _set_sshd X11Forwarding no
     _set_sshd MaxAuthTries 3
     _set_sshd ClientAliveInterval 300

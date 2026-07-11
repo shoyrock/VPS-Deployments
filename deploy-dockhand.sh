@@ -1439,7 +1439,26 @@ setup_cloudflare_bouncer() {
   # FATALs. That makes apt-get + unattended-upgrades error out, so over a long
   # unattended run SECURITY UPDATES SILENTLY STOP. Purge it to a clean state (the
   # host firewall bouncer - the real enforcement - is a different package).
+  # The crowdsec compose PRE-REGISTERS the worker bouncer's LAPI key via a
+  # BOUNCER_KEY_cloudflarebouncer env var, and the container re-creates that
+  # bouncer on EVERY start - so when the worker is skipped, a stale never-pulling
+  # 'cloudflarebouncer' entry lingers in `cscli bouncers list` (and a plain
+  # `cscli bouncers delete` is resurrected on the next container restart).
+  # Drop the env line, recreate crowdsec, then delete the registration from
+  # LAPI. A later re-run of this deploy re-adds both.
+  _worker_lapi_clean() {
+    local cyml="${STACK_DIR}/docker-compose.crowdsec.yml" i
+    if [[ -f "$cyml" ]] && grep -q 'BOUNCER_KEY_cloudflarebouncer' "$cyml"; then
+      sed -i '/# Pre-register the Cloudflare Worker bouncer/,+1d;/BOUNCER_KEY_cloudflarebouncer/d' "$cyml"
+      docker compose -p crowdsec -f "$cyml" up -d >>"$LOG_FILE" 2>&1 || true
+      for i in $(seq 1 12); do docker exec crowdsec cscli version >/dev/null 2>&1 && break; sleep 5; done
+    fi
+    docker exec crowdsec cscli bouncers delete cloudflarebouncer >>"$LOG_FILE" 2>&1 || true
+    info "Retired the pre-registered 'cloudflarebouncer' LAPI key (no worker deployed)."
+  }
+
   _worker_pkg_clean() {
+    _worker_lapi_clean
     command -v dpkg >/dev/null 2>&1 || return 0
     dpkg-query -W crowdsec-cloudflare-worker-bouncer >/dev/null 2>&1 || return 0
     DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all crowdsec-cloudflare-worker-bouncer </dev/null >>"$LOG_FILE" 2>&1 \
