@@ -1575,6 +1575,11 @@ CFWB
       sleep 2
     done
     if $ok; then
+      # The package postinst starts the service with RAW systemctl (policy-rc.d is
+      # not consulted), fails on the stub config and leaves the package
+      # half-configured - which silently breaks every later apt install. Now that
+      # the service is healthy, the pending configure succeeds - re-run it.
+      DEBIAN_FRONTEND=noninteractive dpkg --configure --pending </dev/null >>"$LOG_FILE" 2>&1 || true
       success "Cloudflare Worker bouncer ACTIVE - edge enforcement is live"
       warn "ACTION REQUIRED (no Cloudflare API for this): set the Worker Route to FAIL OPEN -> CF dashboard > ${DOMAIN} > Workers Routes > edit the crowdsec route > Request limit failure mode > Fail open. Without it a worker error shows visitors a CF 1027 page."
     else

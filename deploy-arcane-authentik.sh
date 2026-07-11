@@ -2224,11 +2224,30 @@ CFWB
     systemctl stop crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
     local wbbin probe
     wbbin=$(command -v crowdsec-cloudflare-worker-bouncer 2>/dev/null || echo /usr/bin/crowdsec-cloudflare-worker-bouncer)
-    # AE off -> exits fast; AE on -> deploys the Worker then keeps running until the
-    # timeout stops it (exit 124, no fatal in output).
+    # AE off -> exits fast with an "Analytics Engine" fatal; AE on -> deploys the
+    # Worker, keeps running until the timeout kills it, and on shutdown TEARS DOWN
+    # its own infra and logs `level=fatal msg="context canceled"` - so a fatal in
+    # the output does NOT mean failure. Match explicit success FIRST; the
+    # persistent service enabled below re-deploys the infra the probe removed.
     probe=$(timeout 30 "$wbbin" -c "$cfg" 2>&1 || true)
     printf '%s\n' "$probe" >>"$LOG_FILE" 2>/dev/null || true
-    if printf '%s' "$probe" | grep -qi 'Analytics Engine'; then
+    if printf '%s' "$probe" | grep -qi 'Successfully deployed infra'; then
+      # Deploy check passed (Worker created) -> enable the persistent service.
+      systemctl enable crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 || true
+      systemctl restart crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 || true
+      sleep 5
+      if systemctl is-active --quiet crowdsec-cloudflare-worker-bouncer; then
+        # The package postinst starts the service with RAW systemctl (policy-rc.d
+        # is not consulted), fails on the stub config and leaves the package
+        # half-configured - which silently breaks every later apt install. Now
+        # that the service is healthy, the pending configure succeeds - re-run it.
+        DEBIAN_FRONTEND=noninteractive dpkg --configure --pending </dev/null >>"$LOG_FILE" 2>&1 || true
+        success "Cloudflare Worker bouncer ACTIVE - edge enforcement is live"
+        warn "ACTION (no Cloudflare API for this): set the Worker Route to FAIL OPEN -> CF dashboard > ${DOMAIN} > Workers Routes > edit the crowdsec route > Request limit failure mode > Fail open. Without it a worker error shows visitors a CF 1027 page."
+      else
+        info "Cloudflare Worker bouncer installed but not active yet (see ${LOG_FILE}). Host-level CrowdSec banning is ACTIVE."
+      fi
+    elif printf '%s' "$probe" | grep -qi 'Analytics Engine'; then
       info "Cloudflare Worker (edge) bouncer skipped - this Cloudflare account has Workers"
       info "  Analytics Engine disabled (a hard requirement of the worker bouncer; Cloudflare"
       info "  has no API to enable it). Host-level CrowdSec banning is ACTIVE and enforcing."
@@ -2236,22 +2255,11 @@ CFWB
       info "  Analytics Engine, then re-run this deploy with CF_API_TOKEN set."
       systemctl disable crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
       _worker_pkg_clean
-    elif printf '%s' "$probe" | grep -qiE 'level=fatal|panic:|unable to deploy'; then
+    else
       info "Cloudflare Worker (edge) bouncer skipped - deploy check did not succeed (details"
       info "  in ${LOG_FILE}). Host-level CrowdSec banning is ACTIVE and enforcing all bans."
       systemctl disable crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
       _worker_pkg_clean
-    else
-      # Deploy check passed (Worker created) -> enable the persistent service.
-      systemctl enable crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 || true
-      systemctl restart crowdsec-cloudflare-worker-bouncer >>"$LOG_FILE" 2>&1 || true
-      sleep 5
-      if systemctl is-active --quiet crowdsec-cloudflare-worker-bouncer; then
-        success "Cloudflare Worker bouncer ACTIVE - edge enforcement is live"
-        warn "ACTION (no Cloudflare API for this): set the Worker Route to FAIL OPEN -> CF dashboard > ${DOMAIN} > Workers Routes > edit the crowdsec route > Request limit failure mode > Fail open. Without it a worker error shows visitors a CF 1027 page."
-      else
-        info "Cloudflare Worker bouncer installed but not active yet (see ${LOG_FILE}). Host-level CrowdSec banning is ACTIVE."
-      fi
     fi
   else
     systemctl disable crowdsec-cloudflare-worker-bouncer 2>/dev/null || true
