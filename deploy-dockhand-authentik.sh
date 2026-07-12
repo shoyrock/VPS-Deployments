@@ -22,7 +22,7 @@ fi
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.8.0-hardened-cloudflare-authentik"
+readonly SCRIPT_VERSION="4.11.0-hardened-cloudflare-authentik"
 readonly SCRIPT_NAME="deploy-dockhand-authentik.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/apps/dockhand-stack"   # infra lives UNDER /opt/apps (unified layout)

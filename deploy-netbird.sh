@@ -41,7 +41,7 @@ fi
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.7.1-netbird-proxy"
+readonly SCRIPT_VERSION="4.11.0-netbird-proxy"
 readonly SCRIPT_NAME="deploy-netbird.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/netbird-stack"

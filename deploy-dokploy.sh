@@ -17,7 +17,7 @@ fi
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.7.0-hardened-cloudflare"
+readonly SCRIPT_VERSION="4.11.0-hardened-cloudflare"
 readonly SCRIPT_NAME="deploy-dokploy.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/dokploy-stack"

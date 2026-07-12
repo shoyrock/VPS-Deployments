@@ -1,4 +1,4 @@
-# VPS Deployment Scripts — v4.10.0-hardened-cloudflare
+# VPS Deployment Scripts — v4.11.0-hardened-cloudflare
 
 > ⚠️ **SECURITY DISCLAIMER — READ BEFORE USING**
 >
@@ -15,6 +15,17 @@
 One-shot, hardened deployment scripts for fresh VPS instances. Every script deploys **Nginx Proxy Manager** (reverse proxy + SSL), an **identity provider** (Authelia SSO + 2FA, or Authentik on the authentik variants), **CrowdSec** (IPS with NPM-aware collections + firewall bouncer), and **firewall rules**.
 
 ---
+
+## What's New in v4.11.0
+
+*Validated end-to-end on a real VPS: fresh-deploy audit → live fixes → Cloudflare edge enforcement verified.*
+
+- **Cloudflare Worker bouncer fixes** (all scripts): a *successful* worker deploy is no longer misread as a failure (its probe run ends in a harmless `fatal: context canceled` when the timeout stops it); dpkg is repaired (`--configure --pending`) after the package postinst inevitably wedges it — previously that silently broke all later apt installs **including unattended security updates**; and a skipped worker no longer leaves a stale never-pulling `cloudflarebouncer` key in `cscli bouncers list`.
+- **Enabling Workers Analytics Engine** (the worker bouncer's hard requirement — free plan included, dashboard-only, no API): Cloudflare dashboard → **Workers & Pages → Analytics Engine → create any blank dataset** (name/binding are arbitrary, e.g. `crowdsec_metrics` / `CROWDSEC_METRICS`). Creating a dataset is what activates the account flag; the bouncer's worker ships its own binding and never touches that dataset. Then (re-)run the deploy with `CF_API_TOKEN` set.
+- **Authentik MFA race fixed** (authentik variants): default blueprints apply asynchronously after first boot; the MFA stage lookup now polls up to 2 minutes instead of racing them — MFA is no longer silently left optional on fresh deploys.
+- **`harden.sh` GeoIP refresh made reliable**: HTTP/1.1 + retries + zone-content validation (ipdeny.com aborts HTTP/2 transfers under load), daily cron at a random minute past 04:00, dead IPv6 fallback URL dropped.
+- **`harden.sh` sets `PermitRootLogin no`** when invoked via sudo by a keyed non-root user (lockout-safe; falls back to `prohibit-password` otherwise).
+- All scripts stamped `SCRIPT_VERSION` **4.11.0**.
 
 ## What's New in v4.10.0
 
@@ -67,7 +78,7 @@ Prefer `wget`? `wget -qO- <url> | bash` works the same way.
 | Script | Deploys | Stack Dir | Notes |
 |--------|---------|-----------|-------|
 | `deploy-dockhand.sh` | NPM + Dockhand + Authelia + CrowdSec | `/opt/dockhand-stack/` | Docker manager with host file access |
-| `deploy-dockhand-authentik.sh` | NPM + Dockhand + Authentik + CrowdSec | `/opt/dockhand-stack/` | ✅ **Flagship / most-tested (v4.8.0).** Full Authentik IdP (postgres + redis + server + worker); Dockhand gated by Authentik nginx forward-auth. **Live-audited on a real VPS** — CrowdSec detection **and** enforcement verified, SSH + web attacks actively banned. The recommended stack. **Fresh VPS only** (wipes Docker + firewall). Prereqs for the edge bouncer: enable Cloudflare **Workers Analytics Engine**, and use **DNS-01** certs when DNS is proxied through Cloudflare. |
+| `deploy-dockhand-authentik.sh` | NPM + Dockhand + Authentik + CrowdSec | `/opt/dockhand-stack/` | ✅ **Flagship / most-tested (v4.11.0).** Full Authentik IdP (postgres + redis + server + worker); Dockhand gated by Authentik nginx forward-auth. **Live-audited on a real VPS** — CrowdSec detection **and** enforcement verified, SSH + web attacks actively banned. The recommended stack. **Fresh VPS only** (wipes Docker + firewall). Prereqs for the edge bouncer: enable Cloudflare **Workers Analytics Engine**, and use **DNS-01** certs when DNS is proxied through Cloudflare. |
 | `deploy-netbird.sh` | Traefik + Authentik + NetBird (+ built-in reverse proxy) + Dockhand + CrowdSec | `/opt/netbird-stack/` | ⚠️ Zero-trust variant. **NetBird's reverse proxy is the app ingress** (apps exposed via its dashboard, not Traefik labels). **Staging — test in a VM first** |
 | `deploy-portainer.sh` | NPM + Portainer + Authelia + CrowdSec | `/opt/portainer-stack/` | Visual container management |
 | `deploy-dockge.sh` | NPM + Dockge + Authelia + CrowdSec | `/opt/dockge-stack/` | Compose stack manager |
