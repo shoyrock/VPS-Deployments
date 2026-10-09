@@ -36,12 +36,15 @@ fi
 #                                  Cloudflare Worker bouncer (edge IP-ban enforcement).
 #                                  If unset, the script prompts; blank = configure later.
 #     CF_BOUNCER_ACTION=ban        edge action for banned IPs: ban | captcha (default ban)
+#     CROWDSEC_ENROLL_KEY=<key>    optional CrowdSec Console enroll key from
+#                                  app.crowdsec.net (Security Engines > Enroll). If set,
+#                                  the instance auto-enrolls; else enroll manually later.
 #     LOCK_HTTP_TO_CLOUDFLARE=true restrict 80/443 to Cloudflare IP ranges in the
 #                                  firewall (default false; turn on once all DNS is proxied)
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.11.0-netbird-proxy"
+readonly SCRIPT_VERSION="4.11.1-netbird-proxy"
 readonly SCRIPT_NAME="deploy-netbird.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/netbird-stack"
@@ -936,16 +939,6 @@ COMPOSE_AK
   success "Authentik compose written (exposed via NetBird reverse proxy)"
 }
 
-# Authentik admin API via the bootstrap token (server published on 127.0.0.1:9000).
-AK_API_BASE="http://127.0.0.1:9000/api/v3"
-_ak_api() {
-  local path="$1"; shift
-  curl -s --max-time 30 \
-    -H "Authorization: Bearer ${AUTHENTIK_BOOTSTRAP_TOKEN}" \
-    -H "Content-Type: application/json" \
-    "${AK_API_BASE}${path}" "$@"
-}
-
 bootstrap_authentik() {
   step "Bootstrapping Authentik (health check)"
   # Authentik is exposed via the NetBird reverse proxy, not via Traefik forward-auth.
@@ -1481,302 +1474,6 @@ create_netbird_proxy_services() {
   info "  DNS: point *.${DOMAIN} -> $(get_external_ip) for TLS to issue."
 }
 
-# ==============================================================================
-# DEPRECATED / UNUSED -- vestigial NPM + Authelia helpers carried over from
-# deploy-dockhand.sh. Nothing calls them in this script (the stack uses Traefik +
-# Authentik instead). They are inert (only referenced inside their own bodies) and
-# safe to delete wholesale down to the "Firewall, logrotate, CrowdSec" banner.
-# Kept only to keep this rewrite's diff reviewable; prune in a follow-up commit.
-# ==============================================================================
-npm_change_password() {
-  step "Securing NPM admin password"
-  local NEW_PASS JSON LOGIN
-  NEW_PASS=$(rand_password 24)
-  # NPM 2.15+ ships with NO default user: GET /api/ reports "setup":false and the
-  # first admin is created via an UNAUTHENTICATED POST /api/users (admin@example.com/
-  # changeme can NEVER log in there -> "Invalid email or password" + no proxy hosts).
-  # Read .setup RAW (jq '.setup // empty' wrongly returns empty when it IS false), poll
-  # until the API is ready, then create the admin with our random password.
-  local _setup="" _st _cu _t
-  for _st in 1 2 3 4 5 6 7 8; do
-    _setup=$(_npm_api "/" 2>/dev/null | jq -r '.setup' 2>/dev/null || echo "")
-    [[ "$_setup" == "true" || "$_setup" == "false" ]] && break
-    sleep 3
-  done
-  if [[ "$_setup" == "false" ]]; then
-    printf '%s' "$NEW_PASS" > "${STACK_DIR}/.npm_admin_password"; chmod 600 "${STACK_DIR}/.npm_admin_password"
-    NPM_TOKEN=""
-    _cu=$(jq -nc --arg pw "$NEW_PASS" '{name:"Administrator",nickname:"Admin",email:"admin@example.com",roles:["admin"],is_disabled:false,auth:{type:"password",secret:$pw}}')
-    for _t in 1 2 3 4 5; do
-      _npm_api "/users" -d "$_cu" >/dev/null 2>&1 || true
-      LOGIN=$(_npm_api "/tokens" -d "$(jq -nc --arg s "$NEW_PASS" '{identity:"admin@example.com",secret:$s}')" 2>/dev/null) || true
-      NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty' 2>/dev/null)
-      [[ -n "$NPM_TOKEN" ]] && break
-      sleep 3
-    done
-    if [[ -n "$NPM_TOKEN" ]]; then
-      success "NPM first admin created (admin@example.com) - saved to ${STACK_DIR}/.npm_admin_password (mode 600)"
-      return 0
-    fi
-    warn "NPM setup-mode first-user creation failed; trying the legacy default-login path."
-  fi
-  JSON='{"identity":"admin@example.com","secret":"changeme"}'
-  LOGIN=$(_npm_api "/tokens" -d "$JSON" 2>/dev/null) || true
-  NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty')
-  if [[ -z "$NPM_TOKEN" ]]; then
-    warn "Could not get NPM token - skipping automated NPM setup"
-    return 1
-  fi
-
-  # Persist the new password BEFORE applying it, so a flaky re-auth can never
-  # leave the account on a random password we did not record (= hard lockout of
-  # the NPM admin UI). If the change PUT fails, 'changeme' still works - recoverable.
-  printf '%s' "$NEW_PASS" > "${STACK_DIR}/.npm_admin_password"
-  chmod 600 "${STACK_DIR}/.npm_admin_password"
-  JSON=$(jq -nc --arg s "$NEW_PASS" '{type:"password",current:"changeme",secret:$s}')
-  _npm_api "/users/1/auth" -X PUT -d "$JSON" >/dev/null 2>&1 || true
-  # Re-authenticate with new password (retry: NPM can briefly 401 right after the change)
-  NPM_TOKEN=""
-  for _ in 1 2 3; do
-    JSON=$(jq -nc --arg s "$NEW_PASS" '{identity:"admin@example.com",secret:$s}')
-    LOGIN=$(_npm_api "/tokens" -d "$JSON" 2>/dev/null) || true
-    NPM_TOKEN=$(echo "$LOGIN" | jq -r '.token // empty')
-    [[ -n "$NPM_TOKEN" ]] && break
-    sleep 2
-  done
-  if [[ -n "$NPM_TOKEN" ]]; then
-    success "NPM admin password changed - saved to ${STACK_DIR}/.npm_admin_password (mode 600)"
-    return 0
-  else
-    warn "NPM password change sent but re-auth failed. Saved candidate to ${STACK_DIR}/.npm_admin_password; if it fails, 'changeme' may still be active."
-    return 1
-  fi
-}
-
-npm_create_proxy_host() {
-  # Creates host WITHOUT SSL first (NPM rejects ssl_forced with no cert).
-  # SSL is attached afterwards by npm_enable_ssl. Prints host ID on stdout.
-  local DOMAIN_NAME="$1"
-  local FWD_HOST="$2"
-  local FWD_PORT="$3"
-  local WS="${4:-true}"
-  local ADVANCED_CONFIG="${5:-}"
-
-  local JSON
-  JSON=$(jq -nc --arg domain "$DOMAIN_NAME" --arg fwd_host "$FWD_HOST" --argjson fwd_port "$FWD_PORT" \
-    --argjson ws "$WS" --arg adv "$ADVANCED_CONFIG" \
-    '{
-      domain_names: [$domain],
-      forward_scheme: "http",
-      forward_host: $fwd_host,
-      forward_port: $fwd_port,
-      access_list_id: 0,
-      certificate_id: 0,
-      ssl_forced: false,
-      caching_enabled: false,
-      block_exploits: true,
-      allow_websocket_upgrade: $ws,
-      http2_support: false,
-      hsts_enabled: false,
-      hsts_subdomains: false,
-      advanced_config: $adv
-    }')
-
-  local RESP ID
-  RESP=$(_npm_api "/nginx/proxy-hosts" -X POST -d "$JSON") || true
-  ID=$(echo "$RESP" | jq -r '.id // empty')
-  if [[ -n "$ID" ]]; then
-    success "Created proxy host: ${DOMAIN_NAME} -> ${FWD_HOST}:${FWD_PORT}"
-    echo "$ID"
-  else
-    warn "Failed to create proxy host for ${DOMAIN_NAME}: $(echo "$RESP" | jq -r '.error.message // .message // "unknown error"' 2>/dev/null)"
-    return 1
-  fi
-}
-
-npm_enable_ssl() {
-  local HOST_ID="$1"
-  local DOMAIN_NAME="$2"
-  local EMAIL="${3:-admin@${DOMAIN}}"
-  local JSON RESP CERT_ID HOST_JSON
-
-  JSON=$(jq -nc --arg email "$EMAIL" --arg domain "$DOMAIN_NAME" '{
-    provider: "letsencrypt",
-    nice_name: $domain,
-    domain_names: [$domain],
-    meta: { letsencrypt_email: $email, letsencrypt_agree: true, dns_challenge: false }
-  }')
-  info "Requesting Let's Encrypt certificate for ${DOMAIN_NAME} (can take up to 2 minutes)..."
-  RESP=$(_npm_api "/nginx/certificates" --max-time 180 -X POST -d "$JSON") || true
-  CERT_ID=$(echo "$RESP" | jq -r '.id // empty')
-  if [[ -z "$CERT_ID" ]]; then
-    warn "Certificate issuance failed for ${DOMAIN_NAME} (is DNS pointed at this server yet?). Host stays HTTP-only; add SSL in the NPM UI once DNS resolves."
-    return 1
-  fi
-
-  HOST_JSON=$(_npm_api "/nginx/proxy-hosts/${HOST_ID}") || true
-  if [[ -z "$HOST_JSON" ]]; then
-    warn "Could not fetch host ${HOST_ID} config to attach SSL — attach manually in NPM UI"
-    return 1
-  fi
-  JSON=$(echo "$HOST_JSON" | jq -c --argjson cert "$CERT_ID" '{
-    domain_names: .domain_names,
-    forward_scheme: .forward_scheme,
-    forward_host: .forward_host,
-    forward_port: .forward_port,
-    access_list_id: (.access_list_id // 0),
-    certificate_id: $cert,
-    ssl_forced: true,
-    caching_enabled: (.caching_enabled // false),
-    block_exploits: (.block_exploits // true),
-    allow_websocket_upgrade: (.allow_websocket_upgrade // true),
-    http2_support: true,
-    hsts_enabled: true,
-    hsts_subdomains: false,
-    advanced_config: (.advanced_config // "")
-  }')
-  RESP=$(_npm_api "/nginx/proxy-hosts/${HOST_ID}" -X PUT -d "$JSON") || true
-  if [[ -n "$(echo "$RESP" | jq -r '.id // empty')" ]]; then
-    success "SSL enabled + forced for ${DOMAIN_NAME} (cert id ${CERT_ID})"
-  else
-    warn "Could not attach certificate ${CERT_ID} to host ${HOST_ID} - attach it manually in NPM UI"
-  fi
-}
-
-# -------------------------------------------------------------------------------
-# Authelia SSO/MFA setup
-# -------------------------------------------------------------------------------
-setup_authelia_secrets() {
-  step "Authelia Secrets"
-  mkdir -p "$AUTHELIA_SECRETS_DIR"
-  # Separate secrets for each purpose (the old script reused the session JWT
-  # secret for password-reset JWTs).
-  rand_secret > "${AUTHELIA_SECRETS_DIR}/jwt_reset"
-  rand_secret > "${AUTHELIA_SECRETS_DIR}/storage_encryption"
-  rand_secret > "${AUTHELIA_SECRETS_DIR}/session"
-  chmod 600 "${AUTHELIA_SECRETS_DIR}/"*
-  success "Authelia secrets generated: $AUTHELIA_SECRETS_DIR"
-}
-
-setup_authelia_config() {
-  step "Authelia Configuration"
-  mkdir -p "$AUTHELIA_CONFIG_DIR"
-  cat > "${AUTHELIA_CONFIG_DIR}/configuration.yml" << AUTHELIA_CONF
-###############################################################
-#                       Authelia configuration                #
-#       https://www.authelia.com/configuration/               #
-###############################################################
-server:
-  address: 'tcp://:9091/'
-log:
-  level: info
-totp:
-  issuer: authelia.${DOMAIN}
-authentication_backend:
-  file:
-    path: /config/users.yml
-access_control:
-  default_policy: deny
-  rules:
-    - domain: "authelia.${DOMAIN}"
-      policy: bypass
-    # Wildcard catch-all LAST: any other subdomain (incl. dockhand and
-    # anything you add later) requires 2FA by default.
-    - domain: "*.${DOMAIN}"
-      policy: two_factor
-session:
-  name: authelia_session
-  expiration: 1h
-  inactivity: 5m
-  remember_me: 1M
-  cookies:
-    - domain: "${DOMAIN}"
-      authelia_url: "https://authelia.${DOMAIN}"
-      default_redirection_url: "https://dockhand.${DOMAIN}"
-regulation:
-  max_retries: 5
-  find_time: 2m
-  ban_time: 10m
-storage:
-  local:
-    path: /config/db.sqlite3
-notifier:
-  filesystem:
-    filename: /config/notifications.txt
-AUTHELIA_CONF
-  success "Authelia configuration created"
-}
-
-setup_authelia_snippets() {
-  step "Authelia NPM Snippets"
-  mkdir -p "$AUTHELIA_SNIPPETS_DIR"
-
-  # FIXED: the old snippet proxied auth_request to authelia:9091/authelia,
-  # which is a 404 -> every request to Dockhand would 500. The correct
-  # endpoint (Authelia 4.38+) is /api/authz/auth-request, marked internal,
-  # with body stripped and the original method/URL forwarded.
-  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" << 'SNIPPET'
-location /internal/authelia/authz {
-    internal;
-    proxy_pass http://authelia:9091/api/authz/auth-request;
-    proxy_set_header X-Original-Method $request_method;
-    proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
-    proxy_set_header X-Forwarded-For $remote_addr;
-    proxy_set_header Content-Length "";
-    proxy_pass_request_body off;
-}
-SNIPPET
-
-  cat > "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" << 'SNIPPET'
-auth_request /internal/authelia/authz;
-auth_request_set $user $upstream_http_remote_user;
-auth_request_set $groups $upstream_http_remote_groups;
-auth_request_set $name $upstream_http_remote_name;
-auth_request_set $email $upstream_http_remote_email;
-proxy_set_header Remote-User $user;
-proxy_set_header Remote-Groups $groups;
-proxy_set_header Remote-Name $name;
-proxy_set_header Remote-Email $email;
-auth_request_set $redirection_url $upstream_http_location;
-error_page 401 =302 $redirection_url;
-SNIPPET
-
-  # Also write to NPM's custom config directory so they're accessible inside the container
-  local npm_custom_dir="${NPM_DATA_DIR}/nginx/custom"
-  mkdir -p "$npm_custom_dir"
-  cp "${AUTHELIA_SNIPPETS_DIR}/authelia-location.conf" "$npm_custom_dir/"
-  cp "${AUTHELIA_SNIPPETS_DIR}/authelia-authrequest.conf" "$npm_custom_dir/"
-  success "Authelia NPM snippets created"
-}
-
-setup_authelia_users() {
-  step "Authelia Users"
-  # FIXED: users.yml is now created BEFORE the container starts (Authelia
-  # crash-loops without it), the password is RANDOM (was the literal string
-  # "authelia"), and the bogus hard-coded fallback hash that could never
-  # authenticate has been removed - hash generation failure is now fatal.
-  local default_pass hash
-  default_pass=$(rand_password 16)
-  info "Generating argon2 hash for default admin user..."
-  hash=$(docker run --rm authelia/authelia:latest \
-           authelia crypto hash generate argon2 --password "$default_pass" 2>/dev/null \
-         | awk -F': ' '/Digest/ {print $2}')
-  [[ -n "$hash" ]] || fatal "Failed to generate Authelia password hash"
-  cat > "${AUTHELIA_CONFIG_DIR}/users.yml" << USERS
-users:
-  admin:
-    displayname: "Admin User"
-    password: "${hash}"
-    email: admin@${DOMAIN}
-    groups:
-      - admins
-USERS
-  chmod 600 "${AUTHELIA_CONFIG_DIR}/users.yml"
-  printf '%s' "$default_pass" > "${AUTHELIA_DIR}/.default_password"
-  chmod 600 "${AUTHELIA_DIR}/.default_password"
-  success "Default user created. Login: admin / (see ${AUTHELIA_DIR}/.default_password) - change after first login"
-}
-
 register_dockhand_stacks() {
   step "Registering editable stacks in Dockhand"
   info "Copying compose files into the Dockhand data directory for browsing..."
@@ -2285,15 +1982,30 @@ setup_crowdsec_console() {
   printf "\r" >&2
 
   if ! $console_ready; then
-    warn "CrowdSec LAPI not ready - Console enrollment skipped. Enroll manually later with: docker exec crowdsec cscli console enroll --auto"
+    warn "CrowdSec LAPI not ready - Console enrollment skipped. Enroll later: docker exec crowdsec cscli console enroll <YOUR_ENROLL_KEY>"
     return 0
   fi
 
-  if docker exec crowdsec cscli console enroll --auto &>/dev/null; then
-    success "CrowdSec enrolled in Console"
-    info "View alerts, decisions and metrics at: https://app.crowdsec.net/"
+  # Console enrollment REQUIRES a per-account enroll key from https://app.crowdsec.net
+  # (Security Engines > Enroll your instance). There is NO key-less auto-enroll -
+  # the old `cscli console enroll --auto` (no key) ALWAYS failed, which is why
+  # auto-enroll never worked; only the manual key flow does. Provide the key via
+  # CROWDSEC_ENROLL_KEY to enroll automatically; otherwise print the manual steps.
+  local enroll_key="${CROWDSEC_ENROLL_KEY:-}"
+  if [[ -z "$enroll_key" ]]; then
+    info "Console enrollment skipped (optional). To enroll your instance:"
+    info "  1) https://app.crowdsec.net  >  Security Engines  >  Enroll your instance  (copy the key, starts 'cs...')"
+    info "  2) docker exec crowdsec cscli console enroll <KEY>"
+    info "  3) Back in the Console, click Accept to approve this engine."
+    info "  (or re-run this deploy with CROWDSEC_ENROLL_KEY=<KEY> to do it automatically.)"
+    return 0
+  fi
+
+  if docker exec crowdsec cscli console enroll "$enroll_key" &>/dev/null; then
+    success "CrowdSec enrolled in Console - click Accept at https://app.crowdsec.net to approve it"
   else
-    warn "CrowdSec Console enrollment failed or already enrolled. Check: docker logs crowdsec"
+    warn "Console enrollment failed (already enrolled, or bad/expired key). Check: docker logs crowdsec"
+    warn "  Retry: docker exec crowdsec cscli console enroll <KEY>"
   fi
 }
 
@@ -2427,7 +2139,8 @@ ${C_B}Dockhand${C_R}
 
 ${C_B}CrowdSec Console${C_R}
   URL:      https://app.crowdsec.net/
-  Note:     Enrolled in the Console; if it failed: docker exec crowdsec cscli console enroll --auto
+  Enroll:   app.crowdsec.net > Security Engines > Enroll (copy key), then:
+            docker exec crowdsec cscli console enroll <KEY>  (or CROWDSEC_ENROLL_KEY=<KEY> at deploy)
   Source:   parses Traefik JSON access logs (${TRAEFIK_LOG_DIR})
 
 ${C_B}Cloudflare Worker bouncer${C_R}

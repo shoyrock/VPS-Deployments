@@ -1,5 +1,28 @@
 # Changelog
 
+## v4.11.1 — CrowdSec Console enroll fix ported everywhere + repo self-test
+
+### All 9 Authelia platform scripts + deploy-netbird.sh
+- **CrowdSec Console enrollment never worked** on these scripts: they still ran `cscli console enroll --auto` with no key (the v4.8.0 fix below was only applied to `deploy-dockhand-authentik.sh` / `deploy-arcane-authentik.sh`). Console enroll requires a per-account key, so this failed every time while the summary still read "enrolled in the Console". Ported the fixed flow: `CROWDSEC_ENROLL_KEY=<key>` enrolls automatically, otherwise the correct 3-step manual flow is printed (and the summary / "Done automatically" lines no longer claim enrollment).
+- Header env-var docs + README updated accordingly.
+
+### deploy-yunohost.sh / deploy-freedombox.sh
+- `setup_crowdsec_console` was defined but **never called** from `main()` — wired in after the Cloudflare bouncer step, matching the other scripts.
+
+### deploy-dokploy.sh
+- Removed a dead `setup_portainer()` copy-paste leftover (never called; referenced an undefined `PORTAINER_DIR`, which would have aborted under `set -u` had it ever run).
+
+### deploy-casaos.sh
+- `cat file | grep` → `grep file` (cosmetic).
+
+### deploy-netbird.sh
+- Pruned the block the script itself labelled "DEPRECATED / UNUSED -- vestigial NPM + Authelia helpers ... safe to delete wholesale" (`npm_change_password`, `npm_create_proxy_host`, `npm_enable_ssl`, `_npm_api`, `setup_authelia_*`) plus the unused `_ak_api` helper. Nothing called any of them; `register_dockhand_stacks` (which is used) was kept.
+
+### Repo
+- `deploy-npm-portainer.sh.sh` (legacy v2.0.0, not wired into the menu) renamed to `deploy-npm-portainer.sh`.
+- **`tests/`** — Docker-based self-test: `bash -n` + shellcheck (warning level) on every script, offline smoke tests of `deploy.sh` (unknown tool, aliases, GitHub-unreachable local fallback + cancel, interactive quit / invalid choice) and `install.sh` (dies cleanly offline), menu→script wiring, CRLF guard. Run: `docker build -t vps-deploy-tests -f tests/Dockerfile . && docker run --rm --network none vps-deploy-tests`.
+- All scripts stamped `SCRIPT_VERSION` 4.11.1.
+
 ## v4.9.0 — live-redeploy fixes + GeoIP allowlist + NPM-admin-via-domain
 
 Validated by repeated full redeploys + a security audit on a real VPS.

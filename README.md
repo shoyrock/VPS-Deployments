@@ -1,4 +1,4 @@
-# VPS Deployment Scripts — v4.11.0-hardened-cloudflare
+# VPS Deployment Scripts — v4.11.1-hardened-cloudflare
 
 > ⚠️ **SECURITY DISCLAIMER — READ BEFORE USING**
 >
@@ -15,6 +15,16 @@
 One-shot, hardened deployment scripts for fresh VPS instances. Every script deploys **Nginx Proxy Manager** (reverse proxy + SSL), an **identity provider** (Authelia SSO + 2FA, or Authentik on the authentik variants), **CrowdSec** (IPS with NPM-aware collections + firewall bouncer), and **firewall rules**.
 
 ---
+
+## What's New in v4.11.1
+
+- **CrowdSec Console enrollment fixed on all non-Authentik scripts** (the 9 Authelia stacks + NetBird): they still ran the key-less `cscli console enroll --auto`, which the v4.8.0 notes already established *always* fails — so enrollment silently never happened while the summary claimed the instance was enrolled. They now use the same flow as the Authentik variants: pass `CROWDSEC_ENROLL_KEY=<key>` to enroll automatically, otherwise the correct 3-step manual flow is printed.
+- **`deploy-yunohost.sh` / `deploy-freedombox.sh`** defined `setup_crowdsec_console` but never called it from `main()` — now wired in like the other scripts.
+- **`deploy-dokploy.sh`**: removed a dead `setup_portainer` leftover that referenced an undefined `PORTAINER_DIR`.
+- **`deploy-netbird.sh`**: pruned the self-labelled "DEPRECATED / UNUSED" NPM + Authelia helper block (never called).
+- **`deploy-npm-portainer.sh.sh`** (legacy, not in the menu) renamed to `deploy-npm-portainer.sh`.
+- **`tests/`**: a Docker-based self-test (`docker build -t vps-deploy-tests -f tests/Dockerfile . && docker run --rm --network none vps-deploy-tests`) — `bash -n` + shellcheck on every script, plus offline smoke tests of `deploy.sh` (menu, aliases, GitHub-unreachable fallback, cancel) and `install.sh`.
+- All scripts stamped `SCRIPT_VERSION` **4.11.1**.
 
 ## What's New in v4.11.0
 
@@ -134,6 +144,7 @@ sudo ./deploy-freedombox.sh            # Deploy FreedomBox (Debian 12 only)
 - `INSTALL_CROWDSEC_WEBUI=0` — skip the CrowdSec Web UI dashboard (installed by default; see the CrowdSec section)
 - `CF_API_TOKEN=<token>` — Cloudflare **User** API token; enables the CrowdSec Cloudflare Worker bouncer non-interactively. If unset, the script prompts (blank = configure now, deploy later).
 - `CF_BOUNCER_ACTION=ban|captcha` — edge action for banned IPs (default `ban`; `captcha` challenges instead of blocking).
+- `CROWDSEC_ENROLL_KEY=<key>` — CrowdSec Console enroll key (app.crowdsec.net → Security Engines → Enroll your instance). If set, the instance auto-enrolls; otherwise the summary prints the manual steps.
 - `LOCK_HTTP_TO_CLOUDFLARE=true` — restrict ports 80/443 to Cloudflare's published IP ranges in the firewall (default `false`; turn on once all DNS is proxied through Cloudflare).
 
 ```bash
@@ -429,11 +440,13 @@ Then **Continue to summary → Create Token**, copy the generated token, and pas
 
 ### Console (cloud)
 
-Each deploy enrolls the CrowdSec instance in the **CrowdSec Console** via `cscli console enroll --auto`. View alerts, decisions, and metrics at [app.crowdsec.net](https://app.crowdsec.net) — accept the pending enrollment there. If enrollment was skipped (LAPI not ready at deploy time), run:
+Console enrollment is optional and **requires a per-account enroll key** — there is no key-less auto-enroll (the old `cscli console enroll --auto` always failed). Pass the key at deploy time with `CROWDSEC_ENROLL_KEY=<key>` to enroll automatically, or do it afterwards:
 
-```bash
-docker exec crowdsec cscli console enroll --auto
-```
+1. [app.crowdsec.net](https://app.crowdsec.net) → **Security Engines → Enroll your instance** — copy the key (starts `cs...`).
+2. `docker exec crowdsec cscli console enroll <KEY>`
+3. Back in the Console, click **Accept** to approve this engine.
+
+View alerts, decisions, and metrics at [app.crowdsec.net](https://app.crowdsec.net) once accepted.
 
 Local CLI inspection is also available any time:
 

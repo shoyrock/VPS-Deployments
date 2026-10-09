@@ -12,12 +12,15 @@ fi
 #                                  Cloudflare Worker bouncer (edge IP-ban enforcement).
 #                                  If unset, the script prompts; blank = configure later.
 #     CF_BOUNCER_ACTION=ban        edge action for banned IPs: ban | captcha (default ban)
+#     CROWDSEC_ENROLL_KEY=<key>    optional CrowdSec Console enroll key from
+#                                  app.crowdsec.net (Security Engines > Enroll). If set,
+#                                  the instance auto-enrolls; else enroll manually later.
 #     LOCK_HTTP_TO_CLOUDFLARE=true restrict 80/443 to Cloudflare IP ranges in the
 #                                  firewall (default false; turn on once all DNS is proxied)
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.11.0-hardened-cloudflare"
+readonly SCRIPT_VERSION="4.11.1-hardened-cloudflare"
 readonly SCRIPT_NAME="deploy-dokploy.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/dokploy-stack"
@@ -502,41 +505,6 @@ setup_dokploy() {
   docker service update --network-add proxy dokploy 2>/dev/null || docker network connect proxy dokploy 2>/dev/null || true
 
   success "Dokploy deployed (UI :3000, Traefik stopped ? NPM handles 80/443)"
-}
-
-setup_portainer() {
-  step "Portainer CE"
-  mkdir -p "$PORTAINER_DIR" "$CROWDSEC_DIR"
-
-  cat > "${STACK_DIR}/docker-compose.portainer.yml" << 'COMPOSE_PORTAINER'
-services:
-  portainer:
-    image: portainer/portainer-ce:latest
-    container_name: portainer
-    restart: always
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - portainer_data:/data
-    networks:
-      - proxy
-volumes:
-  portainer_data:
-networks:
-  proxy:
-    external: true
-COMPOSE_PORTAINER
-
-  docker compose -p portainer -f "${STACK_DIR}/docker-compose.portainer.yml" pull
-  docker compose -p portainer -f "${STACK_DIR}/docker-compose.portainer.yml" up -d
-
-  info "Waiting for Portainer (please wait)..."
-  for i in $(seq 1 40); do
-    printf "${C_DIM}  Waiting for Portainer... (%d/40)${C_R}\r" "$i"
-    docker exec portainer wget -qO- --timeout=5 http://127.0.0.1:9000/api/status &>/dev/null && { success "Portainer responding"; break; }
-    [[ $i -eq 40 ]] && warn "Portainer timed out. Check: docker logs portainer"
-    sleep 3
-  done
-  success "Portainer deployed"
 }
 
 setup_firewall() {
@@ -1653,15 +1621,30 @@ setup_crowdsec_console() {
   printf "\r" >&2
 
   if ! $console_ready; then
-    warn "CrowdSec LAPI not ready - Console enrollment skipped. Enroll manually later with: docker exec crowdsec cscli console enroll --auto"
+    warn "CrowdSec LAPI not ready - Console enrollment skipped. Enroll later: docker exec crowdsec cscli console enroll <YOUR_ENROLL_KEY>"
     return 0
   fi
 
-  if docker exec crowdsec cscli console enroll --auto &>/dev/null; then
-    success "CrowdSec enrolled in Console"
-    info "View alerts, decisions and metrics at: https://app.crowdsec.net/"
+  # Console enrollment REQUIRES a per-account enroll key from https://app.crowdsec.net
+  # (Security Engines > Enroll your instance). There is NO key-less auto-enroll -
+  # the old `cscli console enroll --auto` (no key) ALWAYS failed, which is why
+  # auto-enroll never worked; only the manual key flow does. Provide the key via
+  # CROWDSEC_ENROLL_KEY to enroll automatically; otherwise print the manual steps.
+  local enroll_key="${CROWDSEC_ENROLL_KEY:-}"
+  if [[ -z "$enroll_key" ]]; then
+    info "Console enrollment skipped (optional). To enroll your instance:"
+    info "  1) https://app.crowdsec.net  >  Security Engines  >  Enroll your instance  (copy the key, starts 'cs...')"
+    info "  2) docker exec crowdsec cscli console enroll <KEY>"
+    info "  3) Back in the Console, click Accept to approve this engine."
+    info "  (or re-run this deploy with CROWDSEC_ENROLL_KEY=<KEY> to do it automatically.)"
+    return 0
+  fi
+
+  if docker exec crowdsec cscli console enroll "$enroll_key" &>/dev/null; then
+    success "CrowdSec enrolled in Console - click Accept at https://app.crowdsec.net to approve it"
   else
-    warn "CrowdSec Console enrollment failed or already enrolled. Check: docker logs crowdsec"
+    warn "Console enrollment failed (already enrolled, or bad/expired key). Check: docker logs crowdsec"
+    warn "  Retry: docker exec crowdsec cscli console enroll <KEY>"
   fi
 }
 # -------------------------------------------------------------------------------
@@ -1795,10 +1778,12 @@ ${C_B}Authelia${C_R}
   Login:     admin / ${authelia_pass}  (change after first login)
   Info:      Verification codes: sudo docker exec authelia cat /config/notifications.txt
 
-${C_B}CrowdSec Console${C_R}
+${C_B}CrowdSec Console${C_R} (optional cloud dashboard)
   URL:      https://app.crowdsec.net/
-  Note:     This CrowdSec instance is enrolled in the Console (cloud dashboard).
-            If enrollment failed, run: docker exec crowdsec cscli console enroll --auto
+  Enroll:   1) app.crowdsec.net > Security Engines > Enroll your instance (copy key)
+            2) docker exec crowdsec cscli console enroll <KEY>
+            3) click Accept in the Console to approve this engine
+            (or re-run with CROWDSEC_ENROLL_KEY=<KEY> to enroll automatically)
 
 
 ${C_B}Cloudflare Worker bouncer${C_R}
@@ -1818,7 +1803,7 @@ ${C_B}${C_YEL}Done automatically:${C_R}
   - Let's Encrypt SSL certificates requested and forced (where DNS resolved)
   - NPM admin password changed to a random value (saved mode 600)
   - Authelia admin password randomized (saved mode 600)
-  - CrowdSec Console enrollment attempted
+  - CrowdSec Console enrolled (only if CROWDSEC_ENROLL_KEY was provided; else manual)
   - Authelia 2FA protecting Dokploy
   - CrowdSec bans enforced incl. Docker-published ports (DOCKER-USER chain)
   - CrowdSec http-cve collection installed (CVE-exploit probing detection)
