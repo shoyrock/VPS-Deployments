@@ -65,25 +65,32 @@ for f in deploy-*.sh; do
 done
 [[ -z "$dead" ]] && pass "no dead functions" || fail "defined but never called:$dead"
 
-echo "== 4d. Docker-manager UIs can read/edit the stacks (PUID=0 + identical-path mount + per-project layout)"
+echo "== 4d. Docker-manager UIs can read/edit the stacks WITHOUT running as root"
 bad=""
-# Arcane: runs as uid 65532 unless PUID/PGID set; needs PROJECTS_DIRECTORY at the
-# identical path; one folder per project with a standard compose.yaml.
+# Arcane: unprivileged uid 65532 + a host group (setup_manager_access) that owns
+# exactly the compose/env files; PROJECTS_DIRECTORY at the identical path; one
+# folder per project with a standard compose.yaml. Never PUID=0, never cgroup: host.
 f=deploy-arcane-authentik.sh
-for want in "PUID=0" "PGID=0" "PROJECTS_DIRECTORY=/opt/apps" "/opt/apps:/opt/apps"; do grep -q -- "$want" "$f" || bad="$bad $f(missing:$want)"; done
+for want in 'PUID=${MGR_UID}' 'PGID=${MGR_GID}' "PROJECTS_DIRECTORY=/opt/apps" "/opt/apps:/opt/apps" "setup_manager_access() {" 'chmod 3770 "${STACK_DIR}/${d}"' 'chown "${MGR_UID}:${MGR_GROUP}" "${STACK_DIR}/${d}/compose.yaml"'; do grep -qF -- "$want" "$f" || bad="$bad $f(missing:$want)"; done
+for m in deploy-arcane-authentik.sh deploy-dockhand-authentik.sh deploy-dockhand.sh deploy-netbird.sh; do
+  grep -qE '^\s+- PUID=0\s*$' "$m" && bad="$bad $m(RUNS-AS-ROOT:PUID=0)"
+  grep -qE '^\s+cgroup: host' "$m" && bad="$bad $m(cgroup-host)"
+  grep -q 'setup_manager_access() {' "$m" || bad="$bad $m(no-setup_manager_access)"
+  grep -qF 'readonly MGR_UID=65532' "$m" || bad="$bad $m(no-MGR_UID)"
+done
 grep -q 'docker-compose\.[a-z-]*\.yml' "$f" && bad="$bad $f(flat-compose-layout-leftover)"
 # crowdsec/ and authentik/ are addressed through their DIR variables in the script
 for pat in 'npm/compose\.yaml' '(crowdsec|CROWDSEC_DIR\})/compose\.yaml' '(authentik|AUTHENTIK_DIR\})/compose\.yaml' 'arcane/compose\.yaml' 'crowdsec-webui/compose\.yaml'; do
   grep -qE "$pat" "$f" || bad="$bad $f(no-project:$pat)"
 done
-# Dockhand: entrypoint drops to uid 1001 unless PUID=0; stack dir must be mounted RW at the same path.
+# Dockhand: unprivileged PUID/PGID from the same group model; stack dir mounted RW at the same path.
 for f in deploy-dockhand-authentik.sh deploy-dockhand.sh deploy-netbird.sh; do
-  for want in "PUID=0" "PGID=0"; do grep -q -- "- $want" "$f" || bad="$bad $f(missing:$want)"; done
+  for want in 'PUID=${MGR_UID}' 'PGID=${MGR_GID}'; do grep -qF -- "- $want" "$f" || bad="$bad $f(missing:$want)"; done
 done
 grep -q -- "- /opt/apps:/opt/apps" deploy-dockhand-authentik.sh || bad="$bad dockhand-authentik(no-identical-mount)"
 grep -q -- "- /opt/dockhand-stack:/opt/dockhand-stack" deploy-dockhand.sh || bad="$bad dockhand(no-identical-mount)"
 grep -q -- "- /opt/netbird-stack:/opt/netbird-stack" deploy-netbird.sh || bad="$bad netbird(no-identical-mount)"
-[[ -z "$bad" ]] && pass "manager UIs: PUID/PGID, identical-path mounts, Arcane per-project layout" || fail "manager UI config:$bad"
+[[ -z "$bad" ]] && pass "manager UIs: unprivileged uid + group model, identical-path mounts, Arcane per-project layout" || fail "manager UI config:$bad"
 
 echo "== 4e. generated Arcane compose files parse and keep relative paths inside the stack"
 # Extract each heredoc exactly as the script writes it and validate with docker compose

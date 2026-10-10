@@ -605,9 +605,64 @@ get_letsencrypt_email() {
   success "Let's Encrypt email: $LETSENCRYPT_EMAIL"
 }
 
+# -------------------------------------------------------------------------------
+# Least-privilege file access for the Arcane UI. Arcane runs as uid 65532 inside
+# its container (upstream default; NOT root). A dedicated host group is granted
+# only what "edit / redeploy / update stacks from the UI" needs:
+#   /opt/apps            root:vpsmgr 3770  create new projects there (PROJECTS_DIRECTORY)
+#   STACK_DIR            root:vpsmgr 2750  traverse only
+#   <project>/           root:vpsmgr 3770  Arcane writes .env/workspace files next to
+#                                          compose.yaml on every UI save (verified: a
+#                                          2750 dir makes "Save" fail with
+#                                          'open ".env": permission denied' while
+#                                          pull/up/redeploy still work). The STICKY
+#                                          bit keeps root-owned files (password files,
+#                                          data dirs) undeletable/unrenamable by the UI.
+#   <project>/compose.yaml   65532:vpsmgr 660  Arcane must OWN it: it chmods the file
+#                                          after every save (a root-owned 660 file
+#                                          fails with 'failed to write compose file:
+#                                          chmod ...'). Non-secret config; root still
+#                                          edits it freely.
+#   authentik.env, .arcane.env, webui.env  root:vpsmgr 640  compose reads them at deploy
+#   arcane-data/         65532:vpsmgr 770  Arcane's own DB/state
+# Everything else is untouched: .npm_admin_password, .akadmin_password, bouncer
+# configs (600 root), NPM data, CrowdSec config/data, Postgres (their own uids).
+# Verified against Arcane v2.15 running as 65532: all five projects discovered,
+# UI save + up + redeploy + update-check succeed, password files unreadable and
+# unrenamable. Idempotent - called before Arcane starts and again once every
+# stack has been written.
+# -------------------------------------------------------------------------------
+readonly MGR_UID=65532
+readonly MGR_GROUP="vpsmgr"
+MGR_GID=""   # resolved in setup_manager_access (65532 unless that gid is taken)
+setup_manager_access() {
+  if ! getent group "$MGR_GROUP" >/dev/null 2>&1; then
+    groupadd -g "$MGR_UID" "$MGR_GROUP" 2>/dev/null || groupadd "$MGR_GROUP"
+  fi
+  MGR_GID=$(getent group "$MGR_GROUP" | cut -d: -f3)
+  local d f
+  mkdir -p /opt/apps "$STACK_DIR" "$ARCANE_DATA_DIR"
+  chgrp "$MGR_GROUP" /opt/apps "$STACK_DIR"
+  chmod 3770 /opt/apps          # was 755 - group may create projects, others lose read; sticky
+  chmod 2750 "$STACK_DIR"       # was 750 root-only - group may traverse
+  for d in npm crowdsec authentik arcane crowdsec-webui; do
+    [[ -d "${STACK_DIR}/${d}" ]] || continue
+    chgrp "$MGR_GROUP" "${STACK_DIR}/${d}"; chmod 3770 "${STACK_DIR}/${d}"   # setgid + sticky
+    if [[ -f "${STACK_DIR}/${d}/compose.yaml" ]]; then
+      chown "${MGR_UID}:${MGR_GROUP}" "${STACK_DIR}/${d}/compose.yaml"; chmod 660 "${STACK_DIR}/${d}/compose.yaml"
+    fi
+  done
+  for f in "${AUTHENTIK_DIR}/authentik.env" "${STACK_DIR}/arcane/.arcane.env" "${STACK_DIR}/crowdsec-webui/webui.env"; do
+    [[ -f "$f" ]] || continue
+    chgrp "$MGR_GROUP" "$f"; chmod 640 "$f"
+  done
+  chown -R "${MGR_UID}:${MGR_GROUP}" "$ARCANE_DATA_DIR"; chmod 770 "$ARCANE_DATA_DIR"
+}
+
 setup_arcane() {
   step "Arcane (standalone)"
   mkdir -p "${ARCANE_DATA_DIR}"
+  setup_manager_access          # group + /opt/apps + STACK_DIR + arcane-data ownership
 
   # SECURITY: the host filesystem is mounted READ-ONLY (/:/host:ro).
   # The previous read-write mount meant any Arcane compromise = instant,
@@ -630,12 +685,14 @@ setup_arcane() {
   #      custom-named *.yml in ONE folder are reported "ambiguous" and skipped.
   #      Folder name == compose project name (-p) so Arcane adopts the running
   #      containers instead of creating duplicates.
-  #   3. PUID=0 / PGID=0. Arcane runs as uid 65532 by default; ${STACK_DIR} is a
-  #      root-owned 750 dir and the env files are 600, so Arcane logged
-  #      "Skipping unreadable project directory during discovery" and the UI
-  #      showed nothing editable (updates of authentik/arcane/crowdsec-webui -
-  #      the ones with env_file - failed outright). Running Arcane as root in
-  #      its container is no new privilege: docker.sock already is root.
+  #   3. File access for Arcane's UNPRIVILEGED runtime user (uid 65532 - it is
+  #      never run as root here). ${STACK_DIR} was a root-owned 750 dir with 600
+  #      env files, so Arcane logged "Skipping unreadable project directory
+  #      during discovery" and the UI showed nothing editable. The fix is a
+  #      dedicated host group (setup_manager_access) granted exactly: traverse
+  #      the stack dir, read+write the five compose.yaml files, read the three
+  #      env files compose needs at redeploy, own its own arcane-data. Admin
+  #      password files, Authentik secrets, NPM/CrowdSec data stay root-only.
 
   # Arcane secrets: 32-byte ENCRYPTION_KEY + JWT_SECRET (both REQUIRED by Arcane).
   # Written to a locked-down env file so they never sit in the world-readable
@@ -654,23 +711,22 @@ EOF
   )
   chmod 600 "${STACK_DIR}/arcane/.arcane.env" 2>/dev/null || true
 
-  cat > "${STACK_DIR}/arcane/compose.yaml" << 'COMPOSE_ARCANE'
+  cat > "${STACK_DIR}/arcane/compose.yaml" << COMPOSE_ARCANE
 services:
   arcane:
     image: ghcr.io/getarcaneapp/manager:latest
     container_name: arcane
     hostname: arcane
     restart: unless-stopped
-    cgroup: host
     security_opt:
       - no-new-privileges:true
     env_file:
       - .arcane.env
     environment:
-      # See the comment above: without these three, Arcane cannot read/edit the
-      # stacks under /opt/apps (it drops to uid 65532 and the dirs are root 750).
-      - PUID=0
-      - PGID=0
+      # Unprivileged runtime user (never PUID=0). PGID is the host group that
+      # setup_manager_access granted access to the stack files under /opt/apps.
+      - PUID=${MGR_UID}
+      - PGID=${MGR_GID}
       - PROJECTS_DIRECTORY=/opt/apps
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -684,6 +740,7 @@ networks:
     external: true
 COMPOSE_ARCANE
 
+  setup_manager_access          # arcane/compose.yaml + .arcane.env now exist
   info "Pulling Arcane image..."
   docker compose -p arcane -f "${STACK_DIR}/arcane/compose.yaml" pull
   docker compose -p arcane -f "${STACK_DIR}/arcane/compose.yaml" up -d --force-recreate
@@ -1578,6 +1635,7 @@ SNIPPET
 
 register_arcane_stacks() {
   step "Registering infra stacks as Arcane projects"
+  setup_manager_access          # final pass: every project folder + env file now exists
   # Nothing to copy: each infra stack already lives in its own project folder
   # under ${STACK_DIR} (= PROJECTS_DIRECTORY/arcane-stack), which Arcane scans.
   # Edit / redeploy / update them from Arcane -> Projects, or from the CLI:
@@ -2762,6 +2820,11 @@ mnt="$(docker inspect -f '{{range .Mounts}}{{.Destination}}={{.RW}}{{"\n"}}{{end
 if [ -n "$mnt" ]; then echo "$mnt" | grep -q '=false$' && pass "Arcane host fs READ-ONLY (/host:ro)" || fail "Arcane host fs READ-WRITE -- compromise = root on host"
 else warn "Arcane /host mount not found"; fi
 docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' arcane 2>/dev/null | grep -q '/var/run/docker.sock' && warn "Arcane has docker.sock (root-equivalent, by design) -- the auth gate is your ONLY protection" || true
+akenv="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' arcane 2>/dev/null)"
+echo "$akenv" | grep -qx 'PUID=0' && fail "Arcane runs as ROOT in its container (PUID=0) -- should be the unprivileged uid 65532" || pass "Arcane runs unprivileged (PUID=$(echo "$akenv" | sed -n 's/^PUID=//p' | head -1))"
+[ "$(docker inspect -f '{{.HostConfig.CgroupnsMode}}' arcane 2>/dev/null)" = "host" ] && warn "Arcane shares the HOST cgroup namespace (cgroup: host) -- not needed, remove it" || pass "Arcane in a private cgroup namespace"
+for f in "${STACK_DIR}/.npm_admin_password" "${AUTHENTIK_DIR}/.akadmin_password"; do
+  [ -f "$f" ] || continue; g="$(stat -c '%G' "$f" 2>/dev/null)"; [ "$g" = root ] && pass "$(basename "$f") owned by root (not readable by the UI user)" || fail "$(basename "$f") group is $g -- UI user could read it"; done
 gate="$(docker exec npm sh -c "grep -lsi 'authentik' /data/nginx/proxy_host/*.conf 2>/dev/null | xargs -r grep -lsi 'arcane' 2>/dev/null" 2>/dev/null || true)"
 [ -n "$gate" ] && pass "Authentik forward-auth gate present on arcane host" || fail "arcane host has NO Authentik gate -- root UI unprotected at edge"
 for f in "${STACK_DIR}/.npm_admin_password" "${AUTHENTIK_DIR}/.akadmin_password" /etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml; do
@@ -2889,6 +2952,7 @@ ${C_B}Troubleshooting:${C_R}
   Verify:  sudo bash ${STACK_DIR}/verify-stack.sh   (re-runnable health + security audit)
   Logs:    docker logs -f npm    docker logs -f arcane    docker logs -f authentik-server
   Restart: docker compose -p npm -f ${STACK_DIR}/npm/compose.yaml restart   (one folder per project: npm|crowdsec|authentik|arcane|crowdsec-webui)
+  UI user: Arcane runs unprivileged (uid 65532, host group '${MGR_GROUP}'); it can edit the compose files + read their env files only
   Update:  Arcane -> Projects (all infra stacks are editable/updatable there), or: docker compose -p npm -f ${STACK_DIR}/npm/compose.yaml pull && ... up -d
   FW:      ${fw_cmd}
   CrowdSec: docker exec crowdsec cscli metrics   docker exec crowdsec cscli alerts list

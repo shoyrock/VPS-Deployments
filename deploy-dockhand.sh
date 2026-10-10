@@ -487,6 +487,37 @@ get_user_domain() {
   success "Domain set to: $DOMAIN"
 }
 
+# -------------------------------------------------------------------------------
+# Least-privilege file access for the Dockhand UI. Dockhand's entrypoint drops to
+# an unprivileged user (PUID/PGID below - never root) and adds it to the docker
+# socket group itself. A dedicated host group is granted only what "edit /
+# redeploy stacks from the UI" needs: traverse the stack dir, read+write the
+# compose files, read the env files compose needs at redeploy. Password files,
+# secrets, bouncer configs stay root-only 600; container data keeps its own uids.
+# Idempotent - called before Dockhand starts and again after every stack exists.
+# -------------------------------------------------------------------------------
+readonly MGR_UID=65532
+readonly MGR_GROUP="vpsmgr"
+MGR_GID=""   # resolved in setup_manager_access (65532 unless that gid is taken)
+setup_manager_access() {
+  if ! getent group "$MGR_GROUP" >/dev/null 2>&1; then
+    groupadd -g "$MGR_UID" "$MGR_GROUP" 2>/dev/null || groupadd "$MGR_GROUP"
+  fi
+  MGR_GID=$(getent group "$MGR_GROUP" | cut -d: -f3)
+  local f d
+  mkdir -p "$STACK_DIR"
+  chgrp "$MGR_GROUP" "$STACK_DIR"; chmod 2750 "$STACK_DIR"
+  for f in "${STACK_DIR}"/docker-compose.*.yml; do
+    # owned by the UI user (non-secret config): managers chmod/replace the file on save
+    [[ -f "$f" ]] || continue; chown "${MGR_UID}:${MGR_GROUP}" "$f"; chmod 660 "$f"
+  done
+  local envs=("${STACK_DIR}/crowdsec-webui/webui.env")   # env_file targets compose reads at (re)deploy
+  for f in "${envs[@]}"; do
+    [[ -f "$f" ]] || continue
+    d="$(dirname "$f")"; chgrp "$MGR_GROUP" "$d" "$f"; chmod 2750 "$d"; chmod 640 "$f"
+  done
+}
+
 setup_dockhand() {
   step "Dockhand (standalone)"
   mkdir -p "${DOCKHAND_DATA_DIR}"
@@ -499,7 +530,7 @@ setup_dockhand() {
   # If you genuinely need write access to host files from the Dockhand UI,
   # change "/:/host:ro" to "/:/host" below and re-run:
   #   docker compose -f /opt/dockhand-stack/docker-compose.dockhand.yml up -d --force-recreate
-  cat > "${STACK_DIR}/docker-compose.dockhand.yml" << 'COMPOSE_DOCKHAND'
+  cat > "${STACK_DIR}/docker-compose.dockhand.yml" << COMPOSE_DOCKHAND
 services:
   dockhand:
     image: fnsys/dockhand:latest
@@ -509,12 +540,10 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      # Dockhand's entrypoint drops to uid 1001 unless PUID=0. The stack dir is a
-      # root-owned 750 directory (env/secret files 600), so as 1001 Dockhand can
-      # see the containers but cannot read/edit/redeploy their compose files.
-      # docker.sock already makes it root-equivalent; this adds no new privilege.
-      - PUID=0
-      - PGID=0
+      # Unprivileged runtime user (never PUID=0). PGID is the host group that
+      # setup_manager_access granted access to the stack's compose + env files.
+      - PUID=${MGR_UID}
+      - PGID=${MGR_GID}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # Stack dir mounted RW at the IDENTICAL host path: the compose-project labels
@@ -531,6 +560,7 @@ networks:
 COMPOSE_DOCKHAND
 
   info "Pulling Dockhand image..."
+  setup_manager_access          # group + stack dir + dockhand compose perms
   docker compose -p dockhand -f "${STACK_DIR}/docker-compose.dockhand.yml" pull
   docker compose -p dockhand -f "${STACK_DIR}/docker-compose.dockhand.yml" up -d --force-recreate
 
@@ -1030,6 +1060,7 @@ USERS
 }
 
 register_dockhand_stacks() {
+  setup_manager_access          # final pass: every compose/env file now exists
   step "Registering editable stacks in Dockhand"
   info "Creating combined compose files in Dockhand data directory..."
 

@@ -605,6 +605,37 @@ get_letsencrypt_email() {
   success "Let's Encrypt email: $LETSENCRYPT_EMAIL"
 }
 
+# -------------------------------------------------------------------------------
+# Least-privilege file access for the Dockhand UI. Dockhand's entrypoint drops to
+# an unprivileged user (PUID/PGID below - never root) and adds it to the docker
+# socket group itself. A dedicated host group is granted only what "edit /
+# redeploy stacks from the UI" needs: traverse the stack dir, read+write the
+# compose files, read the env files compose needs at redeploy. Password files,
+# secrets, bouncer configs stay root-only 600; container data keeps its own uids.
+# Idempotent - called before Dockhand starts and again after every stack exists.
+# -------------------------------------------------------------------------------
+readonly MGR_UID=65532
+readonly MGR_GROUP="vpsmgr"
+MGR_GID=""   # resolved in setup_manager_access (65532 unless that gid is taken)
+setup_manager_access() {
+  if ! getent group "$MGR_GROUP" >/dev/null 2>&1; then
+    groupadd -g "$MGR_UID" "$MGR_GROUP" 2>/dev/null || groupadd "$MGR_GROUP"
+  fi
+  MGR_GID=$(getent group "$MGR_GROUP" | cut -d: -f3)
+  local f d
+  mkdir -p "$STACK_DIR"
+  chgrp "$MGR_GROUP" "$STACK_DIR"; chmod 2750 "$STACK_DIR"
+  for f in "${STACK_DIR}"/docker-compose.*.yml; do
+    # owned by the UI user (non-secret config): managers chmod/replace the file on save
+    [[ -f "$f" ]] || continue; chown "${MGR_UID}:${MGR_GROUP}" "$f"; chmod 660 "$f"
+  done
+  local envs=("${AUTHENTIK_DIR}/authentik.env" "${STACK_DIR}/crowdsec-webui/webui.env")   # env_file targets compose reads at (re)deploy
+  for f in "${envs[@]}"; do
+    [[ -f "$f" ]] || continue
+    d="$(dirname "$f")"; chgrp "$MGR_GROUP" "$d" "$f"; chmod 2750 "$d"; chmod 640 "$f"
+  done
+}
+
 setup_dockhand() {
   step "Dockhand (standalone)"
   mkdir -p "${DOCKHAND_DATA_DIR}"
@@ -626,7 +657,7 @@ setup_dockhand() {
   # UNTAGGED (see-but-not-edit via the read-only /host mount) and can't be adopted.
   # With it, every stack under /opt/apps is editable + adoptable. docker.sock
   # already makes Dockhand root-equivalent, so this opens no new attack path.
-  cat > "${STACK_DIR}/docker-compose.dockhand.yml" << 'COMPOSE_DOCKHAND'
+  cat > "${STACK_DIR}/docker-compose.dockhand.yml" << COMPOSE_DOCKHAND
 services:
   dockhand:
     image: fnsys/dockhand:latest
@@ -636,12 +667,10 @@ services:
     security_opt:
       - no-new-privileges:true
     environment:
-      # Dockhand's entrypoint drops to uid 1001 unless PUID=0. The stack dir is a
-      # root-owned 750 directory (env/secret files 600), so as 1001 Dockhand can
-      # see the containers but cannot read/edit/redeploy their compose files.
-      # docker.sock already makes it root-equivalent; this adds no new privilege.
-      - PUID=0
-      - PGID=0
+      # Unprivileged runtime user (never PUID=0). PGID is the host group that
+      # setup_manager_access granted access to the stack's compose + env files.
+      - PUID=${MGR_UID}
+      - PGID=${MGR_GID}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /opt/apps:/opt/apps
@@ -655,6 +684,7 @@ networks:
 COMPOSE_DOCKHAND
 
   info "Pulling Dockhand image..."
+  setup_manager_access          # group + stack dir + dockhand compose perms
   docker compose -p dockhand -f "${STACK_DIR}/docker-compose.dockhand.yml" pull
   docker compose -p dockhand -f "${STACK_DIR}/docker-compose.dockhand.yml" up -d --force-recreate
 
@@ -1545,6 +1575,7 @@ SNIPPET
 }
 
 register_dockhand_stacks() {
+  setup_manager_access          # final pass: every compose/env file now exists
   step "Registering editable stacks in Dockhand"
   info "Creating combined compose files in Dockhand data directory..."
 
@@ -2741,6 +2772,10 @@ mnt="$(docker inspect -f '{{range .Mounts}}{{.Destination}}={{.RW}}{{"\n"}}{{end
 if [ -n "$mnt" ]; then echo "$mnt" | grep -q '=false$' && pass "Dockhand host fs READ-ONLY (/host:ro)" || fail "Dockhand host fs READ-WRITE -- compromise = root on host"
 else warn "Dockhand /host mount not found"; fi
 docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' dockhand 2>/dev/null | grep -q '/var/run/docker.sock' && warn "Dockhand has docker.sock (root-equivalent, by design) -- the auth gate is your ONLY protection" || true
+dhenv="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' dockhand 2>/dev/null)"
+echo "$dhenv" | grep -qx 'PUID=0' && fail "Dockhand runs as ROOT in its container (PUID=0) -- should be the unprivileged uid 65532" || pass "Dockhand runs unprivileged (PUID=$(echo "$dhenv" | sed -n 's/^PUID=//p' | head -1))"
+for f in "${STACK_DIR}/.npm_admin_password" "${AUTHENTIK_DIR}/.akadmin_password"; do
+  [ -f "$f" ] || continue; g="$(stat -c '%G' "$f" 2>/dev/null)"; [ "$g" = root ] && pass "$(basename "$f") owned by root (not readable by the UI user)" || fail "$(basename "$f") group is $g -- UI user could read it"; done
 gate="$(docker exec npm sh -c "grep -lsi 'authentik' /data/nginx/proxy_host/*.conf 2>/dev/null | xargs -r grep -lsi 'dockhand' 2>/dev/null" 2>/dev/null || true)"
 [ -n "$gate" ] && pass "Authentik forward-auth gate present on dockhand host" || fail "dockhand host has NO Authentik gate -- root UI unprotected at edge"
 for f in "${STACK_DIR}/.npm_admin_password" "${AUTHENTIK_DIR}/.akadmin_password" /etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml; do
