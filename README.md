@@ -1,4 +1,4 @@
-# VPS Deployment Scripts — v4.11.0-hardened-cloudflare
+# VPS Deployment Scripts — v4.11.1-hardened-cloudflare
 
 > ⚠️ **SECURITY DISCLAIMER — READ BEFORE USING**
 >
@@ -15,6 +15,25 @@
 One-shot, hardened deployment scripts for fresh VPS instances. Every script deploys **Nginx Proxy Manager** (reverse proxy + SSL), an **identity provider** (Authelia SSO + 2FA, or Authentik on the authentik variants), **CrowdSec** (IPS with NPM-aware collections + firewall bouncer), and **firewall rules**.
 
 ---
+
+## What's New in v4.11.1
+
+- **`.dev` / `.app` / any HSTS-preloaded domain now works, and certs issue themselves.** On those TLDs a browser only ever speaks https and will not let you bypass a certificate error, so a proxy host left HTTP-only at deploy (DNS not pointed yet) was unreachable — and the SSO gate on the app host 302s the ACME challenge, so a later manual cert request in the NPM UI failed too. All 11 NPM-based scripts now install **`vps-npm-ssl-retry.timer`**: every 10 min it finds proxy hosts without a certificate, skips the ones whose DNS still does not resolve, lifts the auth gate for the issuance, attaches the Let's Encrypt cert with SSL forced, restores the gate, and disables itself once every host is covered (`/var/log/vps-npm-ssl-retry.log`, or `vps-npm-ssl-retry.sh -v`). The domain prompt and the final summary are TLD-aware (https URLs + SSH-tunnel fallback for NPM on HSTS TLDs). `add-domain.sh` re-arms the timer when a new host's cert cannot be issued yet.
+- **Certificates were broken on the 9 Authelia scripts with current NPM (2.15+).** Two independent causes, both verified against NPM 2.16: the API rejected their certificate payload (`meta.letsencrypt_email`/`letsencrypt_agree` → "must NOT have additional properties", HTTP 400), and the NPM admin was created as `admin@example.com`, which NPM passes to certbot as the Let's Encrypt account email and Let's Encrypt refuses. Fixed: minimal payload, and the admin is now `admin@<your-domain>` (persisted to `/etc/vps-deploy-email`; login identity = that email, also tried by `add-domain.sh`). Same payload fix in `add-domain.sh`.
+- **Arcane / Dockhand could not edit, redeploy or update the infra stacks** (npm, authentik, crowdsec, …) from their UI. Root cause (reproduced against the real Arcane v2.15 image): both managers drop to a non-root uid (Arcane 65532, Dockhand 1001) while the stack dir is root-owned `750` with `600` env files, so they could see the containers but not read their compose files (Arcane logged `Skipping unreadable project directory during discovery … permission denied`). Fixes:
+  - **No root for the UI, no new privilege.** Both managers keep running **unprivileged** (uid 65532). A dedicated host group `vpsmgr` is granted exactly what the UI needs and nothing else: traverse the stack dir, own/write the compose files (non-secret config), read the env files compose needs at redeploy, and (Arcane) write `.env`/workspace files in its project folders. Admin password files, Authentik/Authelia secrets, bouncer configs stay root-only `600`; NPM/CrowdSec/Postgres data keep their own owners. Project folders are `setgid+sticky`, so the UI user cannot delete or rename root-owned files even where it may create its own. `/opt/apps` goes from world-readable `755` to `3770` (tighter for everyone else). The bundled `verify-stack.sh` now **fails** if the manager runs as root (`PUID=0`), shares the host cgroup namespace, or if a password file is group-readable.
+  - `deploy-arcane-authentik.sh`: `PROJECTS_DIRECTORY=/opt/apps` (mounted at the identical path), and each infra stack lives in **its own project folder with a standard `compose.yaml`** — `/opt/apps/arcane-stack/{npm,crowdsec,authentik,arcane,crowdsec-webui}/compose.yaml` (folder name = compose project name, so Arcane adopts the running containers). Arcane's scanner treats several custom-named `*.yml` in one folder as *ambiguous* and skips them, which is why the old layout never showed up as projects. Your own stacks under `/opt/apps/<app>/compose.yaml` are picked up automatically. Verified against Arcane v2.15 as uid 65532: all five projects discovered; UI save, up, redeploy and update-check succeed; password files unreadable.
+  - `deploy-dockhand-authentik.sh`, `deploy-dockhand.sh`, `deploy-netbird.sh`: same group model for Dockhand (its entrypoint drops to the given `PUID`/`PGID` and adds itself to the docker-socket group); the two scripts that lacked it also get the stack dir bind-mounted RW at the identical host path (the v4.9 "adoptable, not untagged" fix was only in the authentik variant). Dockhand gets traverse + compose/env file access only (no directory write); if a Dockhand UI edit ever reports a permission error, that is the one place to loosen.
+  - The old "Registering editable stacks" step, which copied compose files into the manager's data dir with a header pointing at a file that never existed (and whose copies could not be run: relative paths + fixed `container_name`), is gone from the Arcane script.
+  - `add-domain.sh`, `verify-stack.sh`, `harden.sh` recognise the new `npm/compose.yaml` layout (and still the old flat one).
+  - Existing Arcane deployments: re-run the deploy on a fresh box, or migrate by hand — move each `docker-compose.<x>.yml` into `<x>/compose.yaml`, fix the relative volume paths (`./data` → `../data` for npm; `./crowdsec/…` → `./…`), add `PUID=65532`/`PGID=<gid of vpsmgr>`/`PROJECTS_DIRECTORY=/opt/apps` to Arcane's compose, run the `setup_manager_access` permissions (see the function in the script), then `docker compose -p <x> -f <x>/compose.yaml up -d` for each.
+- **CrowdSec Console enrollment fixed on all non-Authentik scripts** (the 9 Authelia stacks + NetBird): they still ran the key-less `cscli console enroll --auto`, which the v4.8.0 notes already established *always* fails — so enrollment silently never happened while the summary claimed the instance was enrolled. They now use the same flow as the Authentik variants: pass `CROWDSEC_ENROLL_KEY=<key>` to enroll automatically, otherwise the correct 3-step manual flow is printed.
+- **`deploy-yunohost.sh` / `deploy-freedombox.sh`** defined `setup_crowdsec_console` but never called it from `main()` — now wired in like the other scripts.
+- **`deploy-dokploy.sh`**: removed a dead `setup_portainer` leftover that referenced an undefined `PORTAINER_DIR`.
+- **`deploy-netbird.sh`**: pruned the self-labelled "DEPRECATED / UNUSED" NPM + Authelia helper block (never called).
+- **`deploy-npm-portainer.sh.sh`** (legacy, not in the menu) renamed to `deploy-npm-portainer.sh`.
+- **`tests/`**: a Docker-based self-test (`docker build -t vps-deploy-tests -f tests/Dockerfile . && docker run --rm --network none vps-deploy-tests`) — `bash -n` + shellcheck on every script, plus offline smoke tests of `deploy.sh` (menu, aliases, GitHub-unreachable fallback, cancel) and `install.sh`.
+- All scripts stamped `SCRIPT_VERSION` **4.11.1**.
 
 ## What's New in v4.11.0
 
@@ -49,7 +68,9 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script depl
 
 > **Deploy order (fresh VPS):** `deploy-*.sh` → your app stacks under `/opt/apps/<app>` → **`harden.sh`** (run it directly for the country picker). Then enable NPM 2FA, enroll Authentik TOTP, and point DNS so SSL issues.
 
-> ⚠️ **First access uses `http://`, not `https://`.** Proxy hosts are created **HTTP-only** (no SSL cert yet). Browsers default to `https`, which fails when there's no certificate — so explicitly use **`http://npm.<domain>`**, `http://dockhand.<domain>`, etc. until you enable SSL. **To add HTTPS:** NPM admin → the host → **SSL** tab → *Request a new SSL Certificate* (Let's Encrypt; DNS must point at the box + port 80 reachable). The host then auto-redirects `http → https`.
+> ⚠️ **HTTPS comes up by itself; until then a host is `http://` only.** Each proxy host gets its Let's Encrypt cert at deploy if its DNS already points at the box (HTTP-01, port 80). Hosts whose DNS arrives later are picked up by **`vps-npm-ssl-retry.timer`** (every 10 min; `/var/log/vps-npm-ssl-retry.log`) — no UI steps. Until the cert lands, open that host with **`http://`** (browsers default to https, which fails with no cert); it auto-redirects to https afterwards.
+>
+> **`.dev`, `.app`, `.page` and other HSTS-preloaded TLDs:** browsers *only* speak https there and will not let you bypass a certificate error, so a host is simply unreachable until its cert exists. Point DNS (a wildcard `A` record is easiest) before or during the deploy and let the timer finish. NPM itself stays reachable regardless via the SSH tunnel: `ssh -L 8181:127.0.0.1:81 <user>@<vps>` → `http://localhost:8181` (localhost is not HSTS).
 
 ---
 
@@ -134,6 +155,7 @@ sudo ./deploy-freedombox.sh            # Deploy FreedomBox (Debian 12 only)
 - `INSTALL_CROWDSEC_WEBUI=0` — skip the CrowdSec Web UI dashboard (installed by default; see the CrowdSec section)
 - `CF_API_TOKEN=<token>` — Cloudflare **User** API token; enables the CrowdSec Cloudflare Worker bouncer non-interactively. If unset, the script prompts (blank = configure now, deploy later).
 - `CF_BOUNCER_ACTION=ban|captcha` — edge action for banned IPs (default `ban`; `captcha` challenges instead of blocking).
+- `CROWDSEC_ENROLL_KEY=<key>` — CrowdSec Console enroll key (app.crowdsec.net → Security Engines → Enroll your instance). If set, the instance auto-enrolls; otherwise the summary prints the manual steps.
 - `LOCK_HTTP_TO_CLOUDFLARE=true` — restrict ports 80/443 to Cloudflare's published IP ranges in the firewall (default `false`; turn on once all DNS is proxied through Cloudflare).
 
 ```bash
@@ -374,7 +396,7 @@ Every NPM-based deploy also installs **[CrowdSec Web UI](https://github.com/TheD
 
 ```bash
 cd /opt/apps/dockhand-stack    # or your platform's STACK_DIR
-docker compose -p crowdsec-webui -f docker-compose.crowdsec-webui.yml down
+docker compose -p crowdsec-webui -f docker-compose.crowdsec-webui.yml down   # arcane-authentik: -f crowdsec-webui/compose.yaml
 docker exec crowdsec cscli machines delete crowdsec-web-ui
 rm -rf crowdsec-webui docker-compose.crowdsec-webui.yml
 # finally: delete the crowdsec.<domain> proxy host in the NPM UI
@@ -429,11 +451,13 @@ Then **Continue to summary → Create Token**, copy the generated token, and pas
 
 ### Console (cloud)
 
-Each deploy enrolls the CrowdSec instance in the **CrowdSec Console** via `cscli console enroll --auto`. View alerts, decisions, and metrics at [app.crowdsec.net](https://app.crowdsec.net) — accept the pending enrollment there. If enrollment was skipped (LAPI not ready at deploy time), run:
+Console enrollment is optional and **requires a per-account enroll key** — there is no key-less auto-enroll (the old `cscli console enroll --auto` always failed). Pass the key at deploy time with `CROWDSEC_ENROLL_KEY=<key>` to enroll automatically, or do it afterwards:
 
-```bash
-docker exec crowdsec cscli console enroll --auto
-```
+1. [app.crowdsec.net](https://app.crowdsec.net) → **Security Engines → Enroll your instance** — copy the key (starts `cs...`).
+2. `docker exec crowdsec cscli console enroll <KEY>`
+3. Back in the Console, click **Accept** to approve this engine.
+
+View alerts, decisions, and metrics at [app.crowdsec.net](https://app.crowdsec.net) once accepted.
 
 Local CLI inspection is also available any time:
 
@@ -487,7 +511,7 @@ Failures are non-fatal (warn level) with exact debug commands printed.
 Each stack directory contains:
 ```
 STACK_DIR/
-├── docker-compose.npm.yml
+├── docker-compose.npm.yml               (arcane-authentik: one folder per project instead — npm/, crowdsec/, authentik/, arcane/, crowdsec-webui/ each with compose.yaml — so Arcane manages them as Projects)
 ├── docker-compose.authelia.yml          (or docker-compose.authentik.yml)
 ├── docker-compose.crowdsec.yml
 ├── docker-compose.crowdsec-webui.yml    (CrowdSec dashboard — remove cleanly anytime)
@@ -554,7 +578,7 @@ STACK_DIR/
 
 ```bash
 cd /opt/<platform>-stack
-docker compose -f docker-compose.npm.yml restart
+docker compose -f docker-compose.npm.yml restart              # arcane-authentik: -p npm -f npm/compose.yaml
 docker compose -f docker-compose.authelia.yml restart       # or docker-compose.authentik.yml
 docker compose -f docker-compose.crowdsec.yml restart
 ```

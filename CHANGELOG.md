@@ -1,5 +1,51 @@
 # Changelog
 
+## v4.11.1 — CrowdSec Console enroll fix ported everywhere + repo self-test
+
+### All 11 NPM scripts — HSTS-preloaded TLDs (.dev/.app/…) + automatic certificate retry
+- **Bug:** certs are issued at deploy only for hosts whose DNS already resolves; the rest were left HTTP-only "until you add SSL in the UI". On `.dev`/`.app`/… (HSTS-preloaded) that is a dead end: browsers force https *and* refuse to bypass the resulting certificate error, so `npm.`/`arcane.`/`authentik.<domain>` were unreachable; and the SSO forward-auth gate on the app host 302s `/.well-known/acme-challenge/`, so a later manual request from the NPM UI failed as well. (The two Authentik variants already *warned* about HSTS TLDs — on the new-domain path only — but offered no way out.)
+- **Fix:** new `setup_ssl_retry` installs `/usr/local/bin/vps-npm-ssl-retry.sh` + `vps-npm-ssl-retry.{service,timer}` (root, every 10 min, `OnBootSec=3min`). The script logs into NPM with the saved admin credentials, lists proxy hosts with `certificate_id` 0, skips hosts whose DNS does not resolve yet, reuses an existing exact/wildcard LE cert when present, otherwise clears `advanced_config` (the gate) for the issuance, requests the HTTP-01 cert, re-PUTs the host with the cert + `ssl_forced` + `hsts_enabled` + the original `advanced_config`, and disables the timer once no host is pending. Skipped with `NPM_SKIP_SSL=1`; removed on redeploy by `idempotent_cleanup`. Verified against a live NPM 2.16: login, listing, DNS skip, gate lift + restore on a failed issuance (the sandbox cannot reach Let's Encrypt), timer logic.
+- `_is_hsts_tld` / `_warn_hsts_tld` helpers in every script (list extended with `.chrome/.google/.youtube/.android/.gmail/.play`); the warning now also fires on the domain-reuse path, and the deploy summary is TLD-aware (https URLs + SSH-tunnel fallback for NPM instead of the wrong "use http://" advice).
+- `add-domain.sh`: re-arms the timer when a new host's cert cannot be issued yet.
+
+### All 9 Authelia scripts + add-domain.sh — certificates could never be issued on NPM 2.15+
+- **Bug 1 (verified against NPM 2.16):** `npm_enable_ssl` sent `meta.letsencrypt_email` + `letsencrypt_agree`; NPM 2.15+ rejects them (`data/meta must NOT have additional properties`, HTTP 400) → every cert request failed before certbot even ran. Same payload in `add-domain.sh`. Fixed: `meta: {dns_challenge:false}` only (what the Authentik variants already send).
+- **Bug 2:** the first NPM admin was created as `admin@example.com`. NPM passes the admin's email to certbot as the Let's Encrypt account contact (`-m`), and Let's Encrypt refuses `example.com`. Fixed: the admin is `admin@<domain>` (`NPM_ADMIN_EMAIL`), persisted to `/etc/vps-deploy-email`; the legacy `changeme` path also updates the email; login identity = that email, with `admin@example.com` as fallback for pre-existing stacks (`add-domain.sh` and the retry script try both).
+
+### deploy-arcane-authentik.sh — infra stacks are now real Arcane Projects
+- **Bug:** Arcane could list the containers but not edit/redeploy/update the npm/authentik/crowdsec/arcane/crowdsec-webui stacks. Reproduced against `ghcr.io/getarcaneapp/manager` v2.15.1: Arcane runs as uid 65532 (no `PUID`/`PGID` was set), `STACK_DIR` is root-owned `chmod 750`, env files are `600` → `WRN Skipping unreadable project directory during discovery path=/opt/apps/arcane-stack error="permission denied"`. On top of that, five custom-named `docker-compose.<x>.yml` in one folder are what Arcane's scanner calls *ambiguous* ("reported rather than guessed").
+- **Fix (least privilege, no root):** Arcane keeps its unprivileged uid 65532; a new `setup_manager_access` creates host group `vpsmgr` and grants it only: `/opt/apps` 3770 (create projects), `STACK_DIR` 2750 (traverse), each project folder 3770 (setgid+sticky: Arcane writes `.env`/workspace files on UI save, but cannot delete/rename root-owned files), `compose.yaml` 660 **owned by 65532** (Arcane chmods it after every save, which needs ownership; it is non-secret config), the three env files 640, `arcane-data` owned by 65532. Password files / bouncer configs stay 600 root; data dirs untouched. Arcane compose gets `PUID=65532`, `PGID=<vpsmgr>`, `PROJECTS_DIRECTORY=/opt/apps` (no `cgroup: host` - not needed). Every infra stack moves to its own folder with a standard file: `${STACK_DIR}/npm/compose.yaml` (`../data`, `../letsencrypt`), `crowdsec/compose.yaml` (`./config`, `./data`, `../data/logs`), `authentik/compose.yaml` (`./authentik.env`, `./postgres`, …), `arcane/compose.yaml` (`./.arcane.env`, `../arcane-data`), `crowdsec-webui/compose.yaml` (`./webui.env`, `./data`). Folder name == `-p` project name, so Arcane adopts the running containers. Verified against Arcane v2.15.1 running as 65532: `docker compose config` resolves every bind source to the same host paths as before; all five projects discovered; API-driven project save (PUT), up, redeploy and update-check succeed; `.npm_admin_password` / `.akadmin_password` unreadable and unrenamable by the UI user. (A 2750 project dir was tried first: pull/up/redeploy worked but UI save failed with `open ".env": permission denied` - hence 3770 with sticky.)
+- Embedded `verify-stack.sh` gains checks: FAIL if Arcane runs as root (`PUID=0`), WARN on `cgroup: host`, FAIL if a password file is not root-group.
+- `register_arcane_stacks` no longer copies compose files into `arcane-data/` (those copies pointed at a non-existent `docker-compose.yml`, used relative paths that would have created empty data dirs, and clashed on `container_name`); it now just lists the project folders.
+- Summary/restart hints, worker-bouncer cleanup (`crowdsec/compose.yaml`), the embedded `verify-stack.sh` and the Web-UI removal notes all updated.
+
+### deploy-dockhand-authentik.sh / deploy-dockhand.sh / deploy-netbird.sh — Dockhand can edit the stacks
+- Dockhand's entrypoint drops to uid 1001 unless `PUID` is set; same root-owned-750 problem as above. All three now run Dockhand as `PUID=65532`/`PGID=<vpsmgr>` (verified: entrypoint creates the user, adds it to the docker-socket group, starts fine) with the same `setup_manager_access` model: stack dir 2750 traverse, `docker-compose.*.yml` 660, the env files compose needs 640 (dockhand-authentik: `authentik.env`, `webui.env`; dockhand: `webui.env`; netbird: `authentik.env`, `dashboard.env`, `proxy.env`). `deploy-dockhand.sh` and `deploy-netbird.sh` additionally bind-mount the stack dir RW at the identical host path (`/opt/dockhand-stack`, `/opt/netbird-stack`) — the v4.9 "adoptable, not untagged" fix had only been applied to the authentik variant.
+
+### add-domain.sh / verify-stack.sh / harden.sh
+- Detect the per-project layout too (`<stack>/npm/compose.yaml`, `<stack>/crowdsec-webui/compose.yaml`); `harden.sh` also knows `/opt/apps/arcane-stack`.
+
+### All 9 Authelia platform scripts + deploy-netbird.sh
+- **CrowdSec Console enrollment never worked** on these scripts: they still ran `cscli console enroll --auto` with no key (the v4.8.0 fix below was only applied to `deploy-dockhand-authentik.sh` / `deploy-arcane-authentik.sh`). Console enroll requires a per-account key, so this failed every time while the summary still read "enrolled in the Console". Ported the fixed flow: `CROWDSEC_ENROLL_KEY=<key>` enrolls automatically, otherwise the correct 3-step manual flow is printed (and the summary / "Done automatically" lines no longer claim enrollment).
+- Header env-var docs + README updated accordingly.
+
+### deploy-yunohost.sh / deploy-freedombox.sh
+- `setup_crowdsec_console` was defined but **never called** from `main()` — wired in after the Cloudflare bouncer step, matching the other scripts.
+
+### deploy-dokploy.sh
+- Removed a dead `setup_portainer()` copy-paste leftover (never called; referenced an undefined `PORTAINER_DIR`, which would have aborted under `set -u` had it ever run).
+
+### deploy-casaos.sh
+- `cat file | grep` → `grep file` (cosmetic).
+
+### deploy-netbird.sh
+- Pruned the block the script itself labelled "DEPRECATED / UNUSED -- vestigial NPM + Authelia helpers ... safe to delete wholesale" (`npm_change_password`, `npm_create_proxy_host`, `npm_enable_ssl`, `_npm_api`, `setup_authelia_*`) plus the unused `_ak_api` helper. Nothing called any of them; `register_dockhand_stacks` (which is used) was kept.
+
+### Repo
+- `deploy-npm-portainer.sh.sh` (legacy v2.0.0, not wired into the menu) renamed to `deploy-npm-portainer.sh`.
+- **`tests/`** — Docker-based self-test: `bash -n` + shellcheck (warning level) on every script, offline smoke tests of `deploy.sh` (unknown tool, aliases, GitHub-unreachable local fallback + cancel, interactive quit / invalid choice) and `install.sh` (dies cleanly offline), menu→script wiring, CRLF guard. Run: `docker build -t vps-deploy-tests -f tests/Dockerfile . && docker run --rm --network none vps-deploy-tests`.
+- All scripts stamped `SCRIPT_VERSION` 4.11.1.
+
 ## v4.9.0 — live-redeploy fixes + GeoIP allowlist + NPM-admin-via-domain
 
 Validated by repeated full redeploys + a security audit on a real VPS.

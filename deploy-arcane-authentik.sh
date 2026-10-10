@@ -22,7 +22,7 @@ fi
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="4.11.0-hardened-cloudflare-authentik"
+readonly SCRIPT_VERSION="4.11.1-hardened-cloudflare-authentik"
 readonly SCRIPT_NAME="deploy-arcane-authentik.sh"
 START_TIME=$(date +%s); readonly START_TIME
 readonly STACK_DIR="/opt/apps/arcane-stack"   # infra lives UNDER /opt/apps (unified layout)
@@ -173,16 +173,28 @@ _on_exit() {
   printf "${C_B}  External: %s${C_R}\n" "$ext_ip"
   printf "${C_B}  Domain:   %s${C_R}\n" "${DOMAIN:-<not set>}"
   printf '%s\n' "${C_B}------------------------------------------------------------------------------${C_R}"
-  printf "${C_B}  ${C_RED}>> Use http:// (NOT https://) — SSL is not configured yet. See the SSL note below.${C_R}\n"
+  local _scheme="http"
+  if _is_hsts_tld "${DOMAIN:-}"; then
+    _scheme="https"
+    printf "${C_B}  ${C_RED}>> '.%s' is HSTS-preloaded: browsers only ever open https:// here. Hosts whose DNS already${C_R}\n" "${DOMAIN##*.}"
+    printf "${C_B}  ${C_RED}   pointed at this box got their cert now; the rest are issued automatically by${C_R}\n"
+    printf "${C_B}  ${C_RED}   vps-npm-ssl-retry.timer (every 10 min) once DNS resolves. See the SSL note below.${C_R}\n"
+  else
+    printf "${C_B}  ${C_RED}>> Hosts without a cert yet are reachable over http:// only; https:// comes up by itself${C_R}\n"
+    printf "${C_B}  ${C_RED}   once DNS points here (vps-npm-ssl-retry.timer, every 10 min). See the SSL note below.${C_R}\n"
+  fi
   if [[ "${EXPOSE_NPM_ADMIN:-1}" == "1" && -n "${DOMAIN:-}" ]]; then
-    printf "${C_B}  NPM Admin:     http://npm.%s   (turn ON NPM's 2FA — it's internet-facing)${C_R}\n" "$DOMAIN"
+    printf "${C_B}  NPM Admin:     %s://npm.%s   (turn ON NPM's 2FA — it's internet-facing)${C_R}\n" "$_scheme" "$DOMAIN"
   else
     printf "${C_B}  NPM Admin:     SSH tunnel: ssh -L 8181:127.0.0.1:81 ubuntu@%s -> http://localhost:8181${C_R}\n" "$ip"
   fi
+  if _is_hsts_tld "${DOMAIN:-}"; then
+    printf "${C_B}  NPM (fallback): ssh -L 8181:127.0.0.1:81 <user>@%s -> http://localhost:8181  (works before certs exist)${C_R}\n" "$ip"
+  fi
   printf "${C_B}  NPM Login:     %s / %s${C_R}\n" "${LETSENCRYPT_EMAIL:-admin@example.com}" "$npm_pass"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
-    printf "${C_B}  Arcane:      http://arcane.%s${C_R}\n" "$DOMAIN"
-    printf "${C_B}  Authentik:     http://authentik.%s${C_R}\n" "$DOMAIN"
+    printf "${C_B}  Arcane:      %s://arcane.%s${C_R}\n" "$_scheme" "$DOMAIN"
+    printf "${C_B}  Authentik:     %s://authentik.%s${C_R}\n" "$_scheme" "$DOMAIN"
     printf '%s\n' "${C_B}------------------------------------------------------------------------------${C_R}"
     printf "${C_B}${C_YEL}  Containers (hostname = container name, via NPM proxy network):${C_R}\n"
     printf "${C_B}    npm                  ->  ports 80, 443, 81 (admin)${C_R}\n"
@@ -197,7 +209,7 @@ _on_exit() {
     printf "${C_B}  ${C_RED}Change this password after first login!${C_R}\n"
     printf "\n"
     printf "${C_B}  ${C_YEL}-- First login / MFA (ENFORCED) --${C_R}\n"
-    printf "${C_B}  Browse to http://authentik.%s and log in as akadmin.${C_R}\n" "$DOMAIN"
+    printf "${C_B}  Browse to %s://authentik.%s and log in as akadmin.${C_R}\n" "$_scheme" "$DOMAIN"
     printf "${C_B}  MFA is ENFORCED: you are REQUIRED to enroll a TOTP authenticator on first\n"
     printf "  login (have your authenticator app ready). Applies to every user.${C_R}\n"
     if [[ -s "${AUTHENTIK_DIR}/.akadmin_recovery_url" ]]; then
@@ -206,11 +218,17 @@ _on_exit() {
     fi
     printf "\n"
     printf "${C_B}  ${C_YEL}-- HTTPS / SSL (read this) --${C_R}\n"
-    printf "${C_B}  Proxy hosts are ${C_RED}HTTP-only right now${C_R}${C_B} (no certificate). Your browser defaults\n"
-    printf "  to https, which will FAIL with no cert — so use ${C_RED}http://${C_R}${C_B} for every URL above\n"
-    printf "  until you add SSL. To enable HTTPS: open NPM admin -> the host -> SSL tab ->\n"
-    printf "  'Request a new SSL Certificate' (Let's Encrypt; DNS must point at this server,\n"
-    printf "  port 80 reachable). After that the host auto-redirects http -> https.${C_R}\n"
+    printf "${C_B}  Certs are issued via Let's Encrypt HTTP-01 for every host whose DNS already points\n"
+    printf "  at this server (port 80 reachable). Hosts whose DNS was not ready stay HTTP-only\n"
+    printf "  for now: ${C_YEL}vps-npm-ssl-retry.timer${C_R}${C_B} re-tries them every 10 min and attaches the cert\n"
+    printf "  (SSL forced) by itself - no UI steps. Status: journalctl -u vps-npm-ssl-retry,\n"
+    printf "  log /var/log/vps-npm-ssl-retry.log, or run: vps-npm-ssl-retry.sh -v\n"
+    if _is_hsts_tld "${DOMAIN:-}"; then
+      printf "  ${C_RED}'.%s' is HSTS-preloaded: a host without its cert cannot be opened in a browser at\n" "${DOMAIN##*.}"
+      printf "  all (no http://, no 'proceed anyway'). Point DNS, wait for the timer, then use https://.${C_R}\n"
+    else
+      printf "  Until then use http:// for that host; it auto-redirects to https once the cert lands.${C_R}\n"
+    fi
     printf "\n"
     printf "${C_B}  All credentials are stored (mode 600) under: %s${C_R}\n" "$STACK_DIR"
   fi
@@ -367,6 +385,10 @@ idempotent_cleanup() {
   rm -f /usr/local/bin/crowdsec-firewall-bouncer 2>/dev/null || true
   rm -f /etc/crowdsec/crowdsec-firewall-bouncer.yaml 2>/dev/null || true
   rm -rf /etc/crowdsec 2>/dev/null || true
+  # vps-npm-ssl-retry (cert auto-retry) from a prior run
+  systemctl disable --now vps-npm-ssl-retry.timer vps-npm-ssl-retry.service 2>/dev/null || true
+  rm -f /etc/systemd/system/vps-npm-ssl-retry.service /etc/systemd/system/vps-npm-ssl-retry.timer \
+        /usr/local/bin/vps-npm-ssl-retry.sh /etc/vps-npm-ssl-retry.conf 2>/dev/null || true
 
   # vps-blocklist (third-party blocklist refresher) from a prior run. Rules
   # must go before the sets - ipset refuses to destroy a set in use.
@@ -521,6 +543,28 @@ setup_docker_network() {
   success "Network 'proxy' ready"
 }
 
+# HSTS-preloaded TLDs (Google-owned: .dev/.app/.page/...) are hardcoded HTTPS-only in
+# every browser: http:// is rewritten to https:// before the request is sent AND a
+# certificate error cannot be bypassed. A host left HTTP-only (DNS not pointed yet)
+# is therefore unreachable in a browser until its cert is issued - which the
+# vps-npm-ssl-retry.timer does automatically (every 10 min) once DNS resolves.
+_is_hsts_tld() {
+  case ".${1##*.}" in
+    .dev|.app|.page|.foo|.zip|.mov|.new|.day|.boo|.rsvp|.meme|.dad|.phd|.esq|.prof|.how|.nexus|.channel|.search|.ing|.gle|.prod|.chrome|.google|.youtube|.android|.gmail|.play) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+_warn_hsts_tld() {
+  _is_hsts_tld "$DOMAIN" || return 0
+  warn "'.${DOMAIN##*.}' is an HSTS-preloaded TLD: browsers FORCE https:// and will NOT let you"
+  warn "  bypass a certificate error - so nothing is reachable in a browser until its"
+  warn "  Let's Encrypt cert exists. Point each subdomain (or a wildcard A record) at THIS"
+  warn "  server BEFORE/while this runs; certs issue via HTTP-01 (port 80) at deploy, and"
+  warn "  vps-npm-ssl-retry.timer keeps retrying every 10 min for any host whose DNS"
+  warn "  arrives later (log: /var/log/vps-npm-ssl-retry.log). Meanwhile reach NPM via"
+  warn "  SSH tunnel: ssh -L 8181:127.0.0.1:81 <user>@<vps>  ->  http://localhost:8181"
+}
+
 get_user_domain() {
   step "Domain Configuration"
   if [[ -f "${DOMAIN_PERSIST_FILE}" ]]; then
@@ -531,7 +575,7 @@ get_user_domain() {
       printf "${C_YEL}   Press ${C_B}Y${C_R}${C_YEL} + Enter to REUSE this domain${C_R}\n" >&2
       printf "${C_YEL}   Press ${C_B}N${C_R}${C_YEL} + Enter to enter a NEW domain${C_R}\n\n" >&2
       read -rp "Reuse '${existing_domain}'? [Y/n]: " use_existing
-      [[ "$use_existing" =~ ^[Nn]$ ]] || { DOMAIN="$existing_domain"; success "Domain set to: $DOMAIN"; return 0; }
+      [[ "$use_existing" =~ ^[Nn]$ ]] || { DOMAIN="$existing_domain"; success "Domain set to: $DOMAIN"; _warn_hsts_tld; return 0; }
       printf "\n${C_CYN}Switching to new domain entry...${C_R}\n" >&2
     fi
   fi
@@ -545,19 +589,7 @@ get_user_domain() {
   printf '%s' "$DOMAIN" > "${DOMAIN_PERSIST_FILE}" || warn "Could not persist domain to ${DOMAIN_PERSIST_FILE}"
   success "Domain set to: $DOMAIN"
 
-  # HSTS-preloaded TLDs (Google-owned: .dev/.app/.page/... ) are hardcoded HTTPS-only
-  # inside every browser - http:// is rewritten to https:// before the request is even
-  # sent, so there is NO http fallback. Tell the user SSL is mandatory here; the deploy
-  # auto-issues ONE wildcard cert (needs a Cloudflare token with Zone:DNS:Edit).
-  case ".${DOMAIN##*.}" in
-    .dev|.app|.page|.foo|.zip|.mov|.new|.day|.boo|.rsvp|.meme|.dad|.phd|.esq|.prof|.how|.nexus|.channel|.search|.ing|.gle|.prod)
-      warn "'.${DOMAIN##*.}' is an HSTS-preloaded TLD: browsers FORCE https:// (no http fallback)."
-      warn "  So HTTPS is REQUIRED here. This deploy auto-issues Let's Encrypt certs via HTTP-01"
-      warn "  (no DNS API needed) - just make sure each subdomain (or a wildcard A record) points"
-      warn "  at THIS server and port 80 is reachable. (Prefer one wildcard cert? re-run with"
-      warn "  SSL_WILDCARD=1 + a Cloudflare token that has Zone:DNS:Edit.)"
-      ;;
-  esac
+  _warn_hsts_tld
 }
 
 # Validate an email for Let's Encrypt: must look like a real address AND must NOT
@@ -605,9 +637,64 @@ get_letsencrypt_email() {
   success "Let's Encrypt email: $LETSENCRYPT_EMAIL"
 }
 
+# -------------------------------------------------------------------------------
+# Least-privilege file access for the Arcane UI. Arcane runs as uid 65532 inside
+# its container (upstream default; NOT root). A dedicated host group is granted
+# only what "edit / redeploy / update stacks from the UI" needs:
+#   /opt/apps            root:vpsmgr 3770  create new projects there (PROJECTS_DIRECTORY)
+#   STACK_DIR            root:vpsmgr 2750  traverse only
+#   <project>/           root:vpsmgr 3770  Arcane writes .env/workspace files next to
+#                                          compose.yaml on every UI save (verified: a
+#                                          2750 dir makes "Save" fail with
+#                                          'open ".env": permission denied' while
+#                                          pull/up/redeploy still work). The STICKY
+#                                          bit keeps root-owned files (password files,
+#                                          data dirs) undeletable/unrenamable by the UI.
+#   <project>/compose.yaml   65532:vpsmgr 660  Arcane must OWN it: it chmods the file
+#                                          after every save (a root-owned 660 file
+#                                          fails with 'failed to write compose file:
+#                                          chmod ...'). Non-secret config; root still
+#                                          edits it freely.
+#   authentik.env, .arcane.env, webui.env  root:vpsmgr 640  compose reads them at deploy
+#   arcane-data/         65532:vpsmgr 770  Arcane's own DB/state
+# Everything else is untouched: .npm_admin_password, .akadmin_password, bouncer
+# configs (600 root), NPM data, CrowdSec config/data, Postgres (their own uids).
+# Verified against Arcane v2.15 running as 65532: all five projects discovered,
+# UI save + up + redeploy + update-check succeed, password files unreadable and
+# unrenamable. Idempotent - called before Arcane starts and again once every
+# stack has been written.
+# -------------------------------------------------------------------------------
+readonly MGR_UID=65532
+readonly MGR_GROUP="vpsmgr"
+MGR_GID=""   # resolved in setup_manager_access (65532 unless that gid is taken)
+setup_manager_access() {
+  if ! getent group "$MGR_GROUP" >/dev/null 2>&1; then
+    groupadd -g "$MGR_UID" "$MGR_GROUP" 2>/dev/null || groupadd "$MGR_GROUP"
+  fi
+  MGR_GID=$(getent group "$MGR_GROUP" | cut -d: -f3)
+  local d f
+  mkdir -p /opt/apps "$STACK_DIR" "$ARCANE_DATA_DIR"
+  chgrp "$MGR_GROUP" /opt/apps "$STACK_DIR"
+  chmod 3770 /opt/apps          # was 755 - group may create projects, others lose read; sticky
+  chmod 2750 "$STACK_DIR"       # was 750 root-only - group may traverse
+  for d in npm crowdsec authentik arcane crowdsec-webui; do
+    [[ -d "${STACK_DIR}/${d}" ]] || continue
+    chgrp "$MGR_GROUP" "${STACK_DIR}/${d}"; chmod 3770 "${STACK_DIR}/${d}"   # setgid + sticky
+    if [[ -f "${STACK_DIR}/${d}/compose.yaml" ]]; then
+      chown "${MGR_UID}:${MGR_GROUP}" "${STACK_DIR}/${d}/compose.yaml"; chmod 660 "${STACK_DIR}/${d}/compose.yaml"
+    fi
+  done
+  for f in "${AUTHENTIK_DIR}/authentik.env" "${STACK_DIR}/arcane/.arcane.env" "${STACK_DIR}/crowdsec-webui/webui.env"; do
+    [[ -f "$f" ]] || continue
+    chgrp "$MGR_GROUP" "$f"; chmod 640 "$f"
+  done
+  chown -R "${MGR_UID}:${MGR_GROUP}" "$ARCANE_DATA_DIR"; chmod 770 "$ARCANE_DATA_DIR"
+}
+
 setup_arcane() {
   step "Arcane (standalone)"
   mkdir -p "${ARCANE_DATA_DIR}"
+  setup_manager_access          # group + /opt/apps + STACK_DIR + arcane-data ownership
 
   # SECURITY: the host filesystem is mounted READ-ONLY (/:/host:ro).
   # The previous read-write mount meant any Arcane compromise = instant,
@@ -616,23 +703,36 @@ setup_arcane() {
   # 2FA gates all access and the :ro mount removes the easiest abuse path.
   # If you genuinely need write access to host files from the Arcane UI,
   # change "/:/host:ro" to "/:/host" below and re-run:
-  #   docker compose -p arcane -f /opt/apps/arcane-stack/docker-compose.arcane.yml up -d --force-recreate
+  #   docker compose -p arcane -f /opt/apps/arcane-stack/arcane/compose.yaml up -d --force-recreate
   #
-  # /opt/apps mount (identical path, RW): EVERYTHING lives under /opt/apps now -
-  # the infra stacks at ${STACK_DIR} (= /opt/apps/arcane-stack) and host-deployed
-  # APP stacks at /opt/apps/<app>/. Their compose-project labels point at those
-  # HOST paths; Arcane's HostPath resolver can only reach them WRITABLY if
-  # /opt/apps is bind-mounted at the IDENTICAL path. Without it the stacks show
-  # UNTAGGED (see-but-not-edit via the read-only /host mount) and can't be adopted.
-  # With it, every stack under /opt/apps is editable + adoptable. docker.sock
-  # already makes Arcane root-equivalent, so this opens no new attack path.
+  # UI-MANAGEABLE STACKS (Arcane "Projects"). Three things must all hold or Arcane
+  # can see the containers but can NOT edit / redeploy / update them:
+  #   1. PROJECTS_DIRECTORY=/opt/apps, bind-mounted at the IDENTICAL host path (so
+  #      relative volume paths in the compose files resolve the same for Arcane
+  #      and for Docker). Every stack under /opt/apps - the infra projects below
+  #      AND your own /opt/apps/<app>/compose.yaml - is then a first-class project.
+  #   2. One folder per project holding a standard-named compose file
+  #      (${STACK_DIR}/npm/compose.yaml, crowdsec/, authentik/, arcane/,
+  #      crowdsec-webui/). Arcane discovers projects by scanning folders; several
+  #      custom-named *.yml in ONE folder are reported "ambiguous" and skipped.
+  #      Folder name == compose project name (-p) so Arcane adopts the running
+  #      containers instead of creating duplicates.
+  #   3. File access for Arcane's UNPRIVILEGED runtime user (uid 65532 - it is
+  #      never run as root here). ${STACK_DIR} was a root-owned 750 dir with 600
+  #      env files, so Arcane logged "Skipping unreadable project directory
+  #      during discovery" and the UI showed nothing editable. The fix is a
+  #      dedicated host group (setup_manager_access) granted exactly: traverse
+  #      the stack dir, read+write the five compose.yaml files, read the three
+  #      env files compose needs at redeploy, own its own arcane-data. Admin
+  #      password files, Authentik secrets, NPM/CrowdSec data stay root-only.
 
   # Arcane secrets: 32-byte ENCRYPTION_KEY + JWT_SECRET (both REQUIRED by Arcane).
   # Written to a locked-down env file so they never sit in the world-readable
   # compose YAML. Regenerated only if not already provided via the environment.
   ARCANE_ENCRYPTION_KEY="${ARCANE_ENCRYPTION_KEY:-$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
   ARCANE_JWT_SECRET="${ARCANE_JWT_SECRET:-$(rand_secret)}"
-  ( umask 077; cat > "${STACK_DIR}/.arcane.env" << EOF
+  mkdir -p "${STACK_DIR}/arcane"
+  ( umask 077; cat > "${STACK_DIR}/arcane/.arcane.env" << EOF
 ENVIRONMENT=production
 GIN_MODE=release
 PORT=3552
@@ -641,9 +741,9 @@ ENCRYPTION_KEY=${ARCANE_ENCRYPTION_KEY}
 JWT_SECRET=${ARCANE_JWT_SECRET}
 EOF
   )
-  chmod 600 "${STACK_DIR}/.arcane.env" 2>/dev/null || true
+  chmod 600 "${STACK_DIR}/arcane/.arcane.env" 2>/dev/null || true
 
-  cat > "${STACK_DIR}/docker-compose.arcane.yml" << 'COMPOSE_ARCANE'
+  cat > "${STACK_DIR}/arcane/compose.yaml" << COMPOSE_ARCANE
 services:
   arcane:
     image: ghcr.io/getarcaneapp/manager:latest
@@ -654,10 +754,16 @@ services:
       - no-new-privileges:true
     env_file:
       - .arcane.env
+    environment:
+      # Unprivileged runtime user (never PUID=0). PGID is the host group that
+      # setup_manager_access granted access to the stack files under /opt/apps.
+      - PUID=${MGR_UID}
+      - PGID=${MGR_GID}
+      - PROJECTS_DIRECTORY=/opt/apps
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /opt/apps:/opt/apps
-      - ./arcane-data:/app/data
+      - ../arcane-data:/app/data
       - /:/host:ro
     networks:
       - proxy
@@ -666,9 +772,10 @@ networks:
     external: true
 COMPOSE_ARCANE
 
+  setup_manager_access          # arcane/compose.yaml + .arcane.env now exist
   info "Pulling Arcane image..."
-  docker compose -p arcane -f "${STACK_DIR}/docker-compose.arcane.yml" pull
-  docker compose -p arcane -f "${STACK_DIR}/docker-compose.arcane.yml" up -d --force-recreate
+  docker compose -p arcane -f "${STACK_DIR}/arcane/compose.yaml" pull
+  docker compose -p arcane -f "${STACK_DIR}/arcane/compose.yaml" up -d --force-recreate
 
   info "Waiting for Arcane to be ready..."
   for i in $(seq 1 30); do
@@ -697,7 +804,8 @@ setup_stack() {
            "$AUTHENTIK_DIR" "$AUTHENTIK_MEDIA_DIR" "$AUTHENTIK_TEMPLATES_DIR" \
            "$AUTHENTIK_BLUEPRINTS_DIR" "$AUTHENTIK_CERTS_DIR" "$AUTHENTIK_SNIPPETS_DIR"
 
-  cat > "${STACK_DIR}/docker-compose.authentik.yml" << 'COMPOSE_AUTHENTIK'
+  mkdir -p "$AUTHENTIK_DIR"
+  cat > "${AUTHENTIK_DIR}/compose.yaml" << 'COMPOSE_AUTHENTIK'
 services:
   authentik-postgres:
     image: postgres:16-alpine
@@ -709,9 +817,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    env_file: ./authentik/authentik.env
+    env_file: ./authentik.env
     volumes:
-      - ./authentik/postgres:/var/lib/postgresql/data
+      - ./postgres:/var/lib/postgresql/data
     networks:
       - proxy
   # NOTE: authentik 2025.x+ removed the external Redis dependency (task queue moved
@@ -723,14 +831,14 @@ services:
     hostname: authentik-server
     restart: unless-stopped
     command: server
-    env_file: ./authentik/authentik.env
+    env_file: ./authentik.env
     ports:
       - "127.0.0.1:9000:9000"
     volumes:
-      - ./authentik/media:/media
-      - ./authentik/templates:/templates
-      - ./authentik/blueprints:/blueprints/custom
-      - ./authentik/certs:/certs
+      - ./media:/media
+      - ./templates:/templates
+      - ./blueprints:/blueprints/custom
+      - ./certs:/certs
     depends_on:
       authentik-postgres:
         condition: service_healthy
@@ -742,17 +850,17 @@ services:
     hostname: authentik-worker
     restart: unless-stopped
     command: worker
-    env_file: ./authentik/authentik.env
+    env_file: ./authentik.env
     user: root
     volumes:
       # docker.sock intentionally NOT mounted. The worker only needs it for the Docker
       # OUTPOST controller, which this stack does not use (embedded outpost runs inside
       # authentik-server). Dropping it removes root-equivalent host access from the
       # worker -- one less thing an attacker can pivot through.
-      - ./authentik/media:/media
-      - ./authentik/templates:/templates
-      - ./authentik/blueprints:/blueprints/custom
-      - ./authentik/certs:/certs
+      - ./media:/media
+      - ./templates:/templates
+      - ./blueprints:/blueprints/custom
+      - ./certs:/certs
     depends_on:
       authentik-postgres:
         condition: service_healthy
@@ -763,7 +871,8 @@ networks:
     external: true
 COMPOSE_AUTHENTIK
 
-  cat > "${STACK_DIR}/docker-compose.npm.yml" << 'COMPOSE_NPM'
+  mkdir -p "${STACK_DIR}/npm"
+  cat > "${STACK_DIR}/npm/compose.yaml" << 'COMPOSE_NPM'
 services:
   npm:
     image: jc21/nginx-proxy-manager:latest
@@ -778,8 +887,8 @@ services:
       # to be opened in the cloud firewall. The deploy's own API calls use 127.0.0.1:81.
       - 127.0.0.1:81:81
     volumes:
-      - ./data:/data
-      - ./letsencrypt:/etc/letsencrypt
+      - ../data:/data
+      - ../letsencrypt:/etc/letsencrypt
     networks:
       - proxy
 networks:
@@ -788,7 +897,7 @@ networks:
 COMPOSE_NPM
 
 
-  cat > "${STACK_DIR}/docker-compose.crowdsec.yml" << COMPOSE_CROWDSEC
+  cat > "${CROWDSEC_DIR}/compose.yaml" << COMPOSE_CROWDSEC
 services:
   crowdsec:
     image: crowdsecurity/crowdsec:latest
@@ -798,9 +907,9 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
-      - ./crowdsec/data:/var/lib/crowdsec/data
-      - ./crowdsec/config:/etc/crowdsec
-      - ./data/logs:/npm-logs:ro
+      - ./data:/var/lib/crowdsec/data
+      - ./config:/etc/crowdsec
+      - ../data/logs:/npm-logs:ro
       - /var/log:/var/log:ro
     environment:
       # http-cve adds known-CVE exploit-probing detection (Log4j etc). The base
@@ -837,11 +946,11 @@ COMPOSE_CROWDSEC
 
 
   info "Pulling images..."
-  docker compose -p npm -f "${STACK_DIR}/docker-compose.npm.yml" pull
-  docker compose -p crowdsec -f "${STACK_DIR}/docker-compose.crowdsec.yml" pull
+  docker compose -p npm -f "${STACK_DIR}/npm/compose.yaml" pull
+  docker compose -p crowdsec -f "${CROWDSEC_DIR}/compose.yaml" pull
 
   info "Starting NPM..."
-  docker compose -p npm -f "${STACK_DIR}/docker-compose.npm.yml" up -d
+  docker compose -p npm -f "${STACK_DIR}/npm/compose.yaml" up -d
   for i in $(seq 1 30); do
     local has_80=false has_443=false has_81=false
     ss -tlnp 2>/dev/null | grep -q ':80[[:space:]]' && has_80=true
@@ -864,8 +973,8 @@ COMPOSE_CROWDSEC
   info "Deploying Authentik (postgres + server + worker)..."
   gen_authentik_files
   setup_authentik_snippets      # write nginx forward-auth snippets into NPM custom dir
-  docker compose -p authentik -f "${STACK_DIR}/docker-compose.authentik.yml" pull
-  docker compose -p authentik -f "${STACK_DIR}/docker-compose.authentik.yml" up -d
+  docker compose -p authentik -f "${AUTHENTIK_DIR}/compose.yaml" pull
+  docker compose -p authentik -f "${AUTHENTIK_DIR}/compose.yaml" up -d
   info "Waiting for Authentik server (first boot runs migrations - up to ~3 min)..."
   # Probe from the HOST against the published API port (127.0.0.1:9000). The
   # goauthentik image ships NO curl, so 'docker exec ... curl' always failed in
@@ -921,7 +1030,7 @@ COMPOSE_CROWDSEC
   printf "\r" >&2
 
   info "Starting CrowdSec..."
-  docker compose -p crowdsec -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec
+  docker compose -p crowdsec -f "${CROWDSEC_DIR}/compose.yaml" up -d crowdsec
   for i in $(seq 1 30); do
     docker ps --format '{{.Names}}' | grep -qx "crowdsec" && { success "CrowdSec container running"; break; }
     printf "${C_DIM}  Waiting for CrowdSec container... (%d/30)${C_R}\r" "$i" >&2
@@ -1557,28 +1666,18 @@ SNIPPET
 }
 
 register_arcane_stacks() {
-  step "Registering editable stacks in Arcane"
-  info "Creating combined compose files in Arcane data directory..."
-
-  # Combine all compose files into one for easy editing
-  {
-    echo "# Combined stack - NPM + Authentik + CrowdSec"
-    echo "# Edit this file and run: docker compose -f ${STACK_DIR}/docker-compose.yml up -d"
-    echo ""
-    cat "${STACK_DIR}/docker-compose.npm.yml" 2>/dev/null || true
-    echo ""
-    # Extract the services from authentik compose (remove networks: section to avoid duplicates)
-    sed '1,/^services:/b;/^networks:/,$d' "${STACK_DIR}/docker-compose.authentik.yml" 2>/dev/null || true
-    echo ""
-    sed '1,/^services:/b;/^networks:/,$d' "${STACK_DIR}/docker-compose.crowdsec.yml" 2>/dev/null || true
-  } > "${ARCANE_DATA_DIR}/infrastructure.yml" 2>/dev/null || true
-
-  # Also copy individual compose files for reference
-  cp "${STACK_DIR}/docker-compose.npm.yml" "${ARCANE_DATA_DIR}/npm.yml" 2>/dev/null || true
-  cp "${STACK_DIR}/docker-compose.authentik.yml" "${ARCANE_DATA_DIR}/authentik.yml" 2>/dev/null || true
-  cp "${STACK_DIR}/docker-compose.crowdsec.yml" "${ARCANE_DATA_DIR}/crowdsec.yml" 2>/dev/null || true
-
-  success "Compose files available in Arcane file browser: ${ARCANE_DATA_DIR}"
+  step "Registering infra stacks as Arcane projects"
+  setup_manager_access          # final pass: every project folder + env file now exists
+  # Nothing to copy: each infra stack already lives in its own project folder
+  # under ${STACK_DIR} (= PROJECTS_DIRECTORY/arcane-stack), which Arcane scans.
+  # Edit / redeploy / update them from Arcane -> Projects, or from the CLI:
+  #   docker compose -p npm -f ${STACK_DIR}/npm/compose.yaml pull && ... up -d
+  local d
+  for d in npm crowdsec authentik arcane crowdsec-webui; do
+    [[ -f "${STACK_DIR}/${d}/compose.yaml" ]] && info "  project ${d}: ${STACK_DIR}/${d}/compose.yaml" || true
+  done
+  info "Your own stacks go in /opt/apps/<app>/compose.yaml - Arcane picks them up automatically."
+  success "Infra stacks are Arcane projects (Projects page: npm, crowdsec, authentik, arcane, crowdsec-webui)"
 }
 
 npm_purge_proxy_hosts() {
@@ -2030,7 +2129,7 @@ setup_cloudflare_bouncer() {
   # Drop the env line, recreate crowdsec, then delete the registration from
   # LAPI. A later re-run of this deploy re-adds both.
   _worker_lapi_clean() {
-    local cyml="${STACK_DIR}/docker-compose.crowdsec.yml" i
+    local cyml="${CROWDSEC_DIR}/compose.yaml" i
     if [[ -f "$cyml" ]] && grep -q 'BOUNCER_KEY_cloudflarebouncer' "$cyml"; then
       sed -i '/# Pre-register the Cloudflare Worker bouncer/,+1d;/BOUNCER_KEY_cloudflarebouncer/d' "$cyml"
       docker compose -p crowdsec -f "$cyml" up -d >>"$LOG_FILE" 2>&1 || true
@@ -2698,7 +2797,7 @@ for c in npm arcane authentik-server authentik-worker authentik-postgres crowdse
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$c"; then pass "container $c running"; else fail "container $c NOT running"; fi
 done
 # CrowdSec Web UI is optional/removable: only check when its compose file exists.
-if [[ -f "${STACK_DIR}/docker-compose.crowdsec-webui.yml" ]]; then
+if [[ -f "${STACK_DIR}/crowdsec-webui/compose.yaml" ]]; then
   docker ps --format '{{.Names}}' 2>/dev/null | grep -qx crowdsec-web-ui && pass "container crowdsec-web-ui running" || warn "container crowdsec-web-ui NOT running (removed? see README to reinstall)"
 fi
 hdr "Service health"
@@ -2753,6 +2852,11 @@ mnt="$(docker inspect -f '{{range .Mounts}}{{.Destination}}={{.RW}}{{"\n"}}{{end
 if [ -n "$mnt" ]; then echo "$mnt" | grep -q '=false$' && pass "Arcane host fs READ-ONLY (/host:ro)" || fail "Arcane host fs READ-WRITE -- compromise = root on host"
 else warn "Arcane /host mount not found"; fi
 docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' arcane 2>/dev/null | grep -q '/var/run/docker.sock' && warn "Arcane has docker.sock (root-equivalent, by design) -- the auth gate is your ONLY protection" || true
+akenv="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' arcane 2>/dev/null)"
+echo "$akenv" | grep -qx 'PUID=0' && fail "Arcane runs as ROOT in its container (PUID=0) -- should be the unprivileged uid 65532" || pass "Arcane runs unprivileged (PUID=$(echo "$akenv" | sed -n 's/^PUID=//p' | head -1))"
+[ "$(docker inspect -f '{{.HostConfig.CgroupnsMode}}' arcane 2>/dev/null)" = "host" ] && warn "Arcane shares the HOST cgroup namespace (cgroup: host) -- not needed, remove it" || pass "Arcane in a private cgroup namespace"
+for f in "${STACK_DIR}/.npm_admin_password" "${AUTHENTIK_DIR}/.akadmin_password"; do
+  [ -f "$f" ] || continue; g="$(stat -c '%G' "$f" 2>/dev/null)"; [ "$g" = root ] && pass "$(basename "$f") owned by root (not readable by the UI user)" || fail "$(basename "$f") group is $g -- UI user could read it"; done
 gate="$(docker exec npm sh -c "grep -lsi 'authentik' /data/nginx/proxy_host/*.conf 2>/dev/null | xargs -r grep -lsi 'arcane' 2>/dev/null" 2>/dev/null || true)"
 [ -n "$gate" ] && pass "Authentik forward-auth gate present on arcane host" || fail "arcane host has NO Authentik gate -- root UI unprotected at edge"
 for f in "${STACK_DIR}/.npm_admin_password" "${AUTHENTIK_DIR}/.akadmin_password" /etc/crowdsec/bouncers/crowdsec-cloudflare-worker-bouncer.yaml; do
@@ -2879,7 +2983,9 @@ ${C_B}${C_YEL}Credential files (root-only, mode 600):${C_R}
 ${C_B}Troubleshooting:${C_R}
   Verify:  sudo bash ${STACK_DIR}/verify-stack.sh   (re-runnable health + security audit)
   Logs:    docker logs -f npm    docker logs -f arcane    docker logs -f authentik-server
-  Restart: docker compose -p npm -f ${STACK_DIR}/docker-compose.npm.yml restart   (per-stack project: -p npm|crowdsec|authentik|arcane)
+  Restart: docker compose -p npm -f ${STACK_DIR}/npm/compose.yaml restart   (one folder per project: npm|crowdsec|authentik|arcane|crowdsec-webui)
+  UI user: Arcane runs unprivileged (uid 65532, host group '${MGR_GROUP}'); it can edit the compose files + read their env files only
+  Update:  Arcane -> Projects (all infra stacks are editable/updatable there), or: docker compose -p npm -f ${STACK_DIR}/npm/compose.yaml pull && ... up -d
   FW:      ${fw_cmd}
   CrowdSec: docker exec crowdsec cscli metrics   docker exec crowdsec cscli alerts list
   Log:     ${LOG_FILE}
@@ -2917,12 +3023,162 @@ ensure_ip_forwarding() {
 # reached through NPM at crowdsec.<domain>.
 #
 # CLEAN REMOVAL (nothing else depends on it):
-#   docker compose -p crowdsec-webui -f <STACK_DIR>/docker-compose.crowdsec-webui.yml down
+#   docker compose -p crowdsec-webui -f <STACK_DIR>/crowdsec-webui/compose.yaml down
 #   docker exec crowdsec cscli machines delete crowdsec-web-ui
-#   rm -rf <STACK_DIR>/crowdsec-webui <STACK_DIR>/docker-compose.crowdsec-webui.yml
+#   rm -rf <STACK_DIR>/crowdsec-webui
 #   ...then delete the crowdsec.<domain> proxy host in the NPM UI. Done.
 # Skip the install entirely with INSTALL_CROWDSEC_WEBUI=0.
 # -------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
+# Auto-issue missing Let's Encrypt certs once DNS points here (vps-npm-ssl-retry).
+# At deploy time a cert can only be issued for hosts whose DNS already resolves.
+# Instead of leaving the rest HTTP-only "until you add SSL in the UI" (impossible
+# on HSTS-preloaded TLDs like .dev, and impossible for SSO-gated hosts whose
+# auth_request 302s the ACME challenge), a root systemd timer re-tries every
+# 10 minutes: lifts the gate for the issuance, attaches the cert with SSL forced,
+# restores the gate, and disables itself once every host has a certificate.
+# -------------------------------------------------------------------------------
+setup_ssl_retry() {
+  step "SSL auto-retry (vps-npm-ssl-retry.timer)"
+  if [[ "${NPM_SKIP_SSL:-0}" == "1" ]]; then
+    info "NPM_SKIP_SSL=1 - not installing the SSL auto-retry timer"
+    return 0
+  fi
+  cat > /usr/local/bin/vps-npm-ssl-retry.sh << 'SSL_RETRY'
+#!/usr/bin/env bash
+# vps-npm-ssl-retry.sh - issue the Let's Encrypt certificate for every NPM proxy
+# host that still has none, as soon as its DNS resolves. Installed by the VPS
+# deploy scripts and run by vps-npm-ssl-retry.timer every 10 minutes; disables
+# the timer itself once every host has a certificate. Safe to run by hand:
+#   sudo vps-npm-ssl-retry.sh            (add -v for per-host detail)
+#
+# Why: on HSTS-preloaded TLDs (.dev/.app/.page/...) browsers refuse plain http
+# AND refuse to bypass a certificate error, so a host left HTTP-only at deploy
+# time (DNS not pointed yet) is unreachable in a browser - and the SSO auth gate
+# on the app host 302s the ACME challenge, so a later manual cert request from
+# the NPM UI fails too. This script lifts the gate for the ~30s of issuance,
+# attaches the cert with SSL forced, and puts the gate back.
+set -uo pipefail
+CONF="${VPS_NPM_SSL_RETRY_CONF:-/etc/vps-npm-ssl-retry.conf}"
+LOG="${VPS_NPM_SSL_RETRY_LOG:-/var/log/vps-npm-ssl-retry.log}"
+# shellcheck source=/dev/null
+[[ -f "$CONF" ]] && . "$CONF"
+STACK_DIR="${STACK_DIR:-}"; NPM_API_BASE="${NPM_API_BASE:-http://127.0.0.1:81/api}"
+NPM_IDENTITY="${NPM_IDENTITY:-}"; NPM_PASSWORD_FILE="${NPM_PASSWORD_FILE:-${STACK_DIR}/.npm_admin_password}"
+VERBOSE=0; [[ "${1:-}" == "-v" ]] && VERBOSE=1
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; [[ $VERBOSE -eq 1 ]] && printf '%s\n' "$*"; return 0; }
+
+[[ -s "$NPM_PASSWORD_FILE" ]] || { log "no NPM password file at $NPM_PASSWORD_FILE - nothing to do"; exit 0; }
+pass=$(tr -d '\n' < "$NPM_PASSWORD_FILE")
+tok=""
+for id in "$NPM_IDENTITY" "$(cat /etc/vps-deploy-email 2>/dev/null)" "admin@example.com"; do
+  [[ -n "$id" ]] || continue
+  tok=$(curl -s --max-time 20 -H 'Content-Type: application/json' -X POST "${NPM_API_BASE}/tokens" \
+        -d "$(jq -nc --arg i "$id" --arg s "$pass" '{identity:$i,secret:$s}')" | jq -r '.token // empty' 2>/dev/null)
+  [[ -n "$tok" ]] && break
+done
+[[ -n "$tok" ]] || { log "NPM login failed (identity/password) - will retry next run"; exit 0; }
+api() { local p="$1"; shift; curl -s --max-time "${T:-60}" -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' "${NPM_API_BASE}${p}" "$@"; }
+
+hosts=$(api /nginx/proxy-hosts) || hosts=""
+[[ -n "$hosts" ]] || { log "could not list proxy hosts"; exit 0; }
+certs=$(api /nginx/certificates) || certs="[]"
+pending=0; issued=0
+
+put_host() {  # put_host <host-json> <cert-id> <ssl-forced 0|1> <advanced_config>
+  local hj="$1" cid="$2" sslf="$3" adv="$4" body
+  body=$(jq -c --argjson cert "$cid" --argjson sslf "$sslf" --arg adv "$adv" '{
+    domain_names, forward_scheme, forward_host, forward_port,
+    access_list_id: (.access_list_id // 0),
+    certificate_id: (if $cert>0 then $cert else (.certificate_id // 0) end),
+    ssl_forced: ($sslf==1), caching_enabled: (.caching_enabled // false),
+    block_exploits: (.block_exploits // true), allow_websocket_upgrade: (.allow_websocket_upgrade // true),
+    http2_support: true, hsts_enabled: ($sslf==1), hsts_subdomains: false, advanced_config: $adv }' <<<"$hj")
+  [[ -n "$(api "/nginx/proxy-hosts/$(jq -r .id <<<"$hj")" -X PUT -d "$body" | jq -r '.id // empty')" ]]
+}
+
+while IFS= read -r hid; do
+  [[ -n "$hid" ]] || continue
+  hj=$(jq -c --argjson i "$hid" '.[] | select(.id==$i)' <<<"$hosts")
+  dn=$(jq -r '.domain_names[0] // empty' <<<"$hj"); [[ -n "$dn" ]] || continue
+  adv=$(jq -r '.advanced_config // ""' <<<"$hj")
+  if ! getent ahosts "$dn" >/dev/null 2>&1; then
+    log "$dn: no DNS record yet - skipped"; pending=$((pending+1)); continue
+  fi
+  # reuse an exact or wildcard Let's Encrypt cert if one already exists
+  parent="${dn#*.}"
+  cid=$(jq -r --arg d "$dn" --arg w "*.${parent}" \
+        '[.[]? | select(.provider=="letsencrypt") | select((.domain_names // [])==[$d] or ((.domain_names // []) | index($w))) | .id] | max // empty' <<<"$certs")
+  if [[ -z "$cid" ]]; then
+    # lift the SSO gate (auth_request 302s the ACME challenge) for the duration
+    if [[ -n "$adv" ]]; then
+      put_host "$hj" 0 0 "" || { log "$dn: could not lift the auth gate - skipped"; pending=$((pending+1)); continue; }
+    fi
+    # NPM 2.15+ rejects meta.letsencrypt_email / letsencrypt_agree ("must NOT have
+    # additional properties"); the account email comes from the logged-in user.
+    resp=$(T=240 api /nginx/certificates -X POST -d "$(jq -nc --arg d "$dn" \
+            '{provider:"letsencrypt", nice_name:$d, domain_names:[$d], meta:{dns_challenge:false}}')")
+    cid=$(jq -r '.id // empty' <<<"$resp" 2>/dev/null)
+    if [[ -z "$cid" ]]; then
+      [[ -n "$adv" ]] && put_host "$hj" 0 0 "$adv"
+      log "$dn: issuance failed ($(tr -d '\n' <<<"$resp" | cut -c1-160)) - gate restored, will retry"; pending=$((pending+1)); continue
+    fi
+    certs=$(api /nginx/certificates) || true
+  fi
+  if put_host "$hj" "$cid" 1 "$adv"; then
+    log "$dn: certificate $cid attached, SSL forced, gate restored"; issued=$((issued+1))
+  else
+    log "$dn: cert $cid issued but could not attach it - will retry"; pending=$((pending+1))
+  fi
+done < <(jq -r '.[] | select((.certificate_id // 0)==0) | .id' <<<"$hosts")
+
+if [[ $pending -eq 0 ]]; then
+  log "every proxy host has a certificate (issued now: $issued) - disabling vps-npm-ssl-retry.timer"
+  systemctl disable --now vps-npm-ssl-retry.timer >/dev/null 2>&1 || true
+else
+  log "$pending host(s) still without certificate (issued now: $issued) - next try in 10 min"
+fi
+exit 0
+SSL_RETRY
+  chmod 755 /usr/local/bin/vps-npm-ssl-retry.sh
+  ( umask 077; cat > /etc/vps-npm-ssl-retry.conf << SSL_RETRY_CONF
+STACK_DIR=${STACK_DIR}
+NPM_IDENTITY=${LETSENCRYPT_EMAIL}
+NPM_API_BASE=http://127.0.0.1:81/api
+SSL_RETRY_CONF
+  )
+  cat > /etc/systemd/system/vps-npm-ssl-retry.service << 'SSL_RETRY_SVC'
+[Unit]
+Description=Issue missing Let's Encrypt certs for NPM proxy hosts once DNS resolves
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vps-npm-ssl-retry.sh
+TimeoutStartSec=900
+SSL_RETRY_SVC
+  cat > /etc/systemd/system/vps-npm-ssl-retry.timer << 'SSL_RETRY_TIMER'
+[Unit]
+Description=Retry Let's Encrypt issuance for NPM hosts still without a certificate
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+SSL_RETRY_TIMER
+  systemctl daemon-reload 2>/dev/null || true
+  if systemctl enable --now vps-npm-ssl-retry.timer >>"$LOG_FILE" 2>&1; then
+    success "vps-npm-ssl-retry.timer active: hosts still HTTP-only get their cert automatically once DNS points here (every 10 min; log /var/log/vps-npm-ssl-retry.log)"
+  else
+    warn "Could not enable vps-npm-ssl-retry.timer - run /usr/local/bin/vps-npm-ssl-retry.sh -v by hand once DNS resolves"
+  fi
+}
+
 setup_crowdsec_webui() {
   step "CrowdSec Web UI (dashboard)"
   if [[ "${INSTALL_CROWDSEC_WEBUI:-1}" != "1" ]]; then
@@ -2945,7 +3201,7 @@ setup_crowdsec_webui() {
   if ! docker exec crowdsec cscli machines add crowdsec-web-ui --password "${ui_pass}" -f /dev/null &>/dev/null; then
     warn "Could not register the Web UI machine with the CrowdSec LAPI — skipping."
     warn "  Manual fix: docker exec crowdsec cscli machines add crowdsec-web-ui --password '<pw>' -f /dev/null"
-    warn "  then put that password in ${ui_dir}/webui.env and re-run: docker compose -p crowdsec-webui -f ${STACK_DIR}/docker-compose.crowdsec-webui.yml up -d"
+    warn "  then put that password in ${ui_dir}/webui.env and re-run: docker compose -p crowdsec-webui -f ${STACK_DIR}/crowdsec-webui/compose.yaml up -d"
     return 0
   fi
 
@@ -2962,7 +3218,7 @@ DB_DIR=/app/data
 WEBUI_ENV
   chmod 600 "${ui_dir}/webui.env"
 
-  cat > "${STACK_DIR}/docker-compose.crowdsec-webui.yml" << 'COMPOSE_WEBUI'
+  cat > "${ui_dir}/compose.yaml" << 'COMPOSE_WEBUI'
 services:
   crowdsec-web-ui:
     image: ghcr.io/theduffman85/crowdsec-web-ui:latest
@@ -2972,9 +3228,9 @@ services:
     security_opt:
       - no-new-privileges:true
     env_file:
-      - ./crowdsec-webui/webui.env
+      - ./webui.env
     volumes:
-      - ./crowdsec-webui/data:/app/data
+      - ./data:/app/data
     networks:
       - proxy
 networks:
@@ -2983,8 +3239,8 @@ networks:
 COMPOSE_WEBUI
 
   info "Pulling CrowdSec Web UI image..."
-  docker compose -p crowdsec-webui -f "${STACK_DIR}/docker-compose.crowdsec-webui.yml" pull >>"${LOG_FILE}" 2>&1 || true
-  if ! docker compose -p crowdsec-webui -f "${STACK_DIR}/docker-compose.crowdsec-webui.yml" up -d >>"${LOG_FILE}" 2>&1; then
+  docker compose -p crowdsec-webui -f "${STACK_DIR}/crowdsec-webui/compose.yaml" pull >>"${LOG_FILE}" 2>&1 || true
+  if ! docker compose -p crowdsec-webui -f "${STACK_DIR}/crowdsec-webui/compose.yaml" up -d >>"${LOG_FILE}" 2>&1; then
     warn "CrowdSec Web UI failed to start — check: docker logs crowdsec-web-ui"
     return 0
   fi
@@ -3049,6 +3305,7 @@ main() {
   setup_logrotate
   automate_npm
   setup_crowdsec_webui
+  setup_ssl_retry
   register_arcane_stacks
   install_verify_script
   verify_deployment

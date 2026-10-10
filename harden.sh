@@ -109,7 +109,7 @@ preflight() {
     # Detect if deployment scripts have been run first
     # ---------------------------------------------------------------------------
     local deployed=false
-    for d in /opt/apps/dockhand-stack /opt/dockhand-stack /opt/portainer-stack /opt/dockge-stack /opt/cosmos-stack /opt/coolify-stack /opt/dokploy-stack /opt/casaos-stack /opt/runtipi-stack /opt/yunohost-stack /opt/freedombox-stack /opt/netbird-stack; do
+    for d in /opt/apps/arcane-stack /opt/apps/dockhand-stack /opt/dockhand-stack /opt/portainer-stack /opt/dockge-stack /opt/cosmos-stack /opt/coolify-stack /opt/dokploy-stack /opt/casaos-stack /opt/runtipi-stack /opt/yunohost-stack /opt/freedombox-stack /opt/netbird-stack; do
         [[ -d "$d" ]] && deployed=true && break
     done
     command -v docker &>/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -E 'npm|portainer|dockge|coolify|dockhand|cosmos|dokploy|casaos|runtipi|yunohost|freedombox|netbird-server|traefik|authentik' >/dev/null 2>&1 && deployed=true
@@ -1099,11 +1099,11 @@ lockdown_npm_admin() {
         info "=== Exposing NPM admin panel on 0.0.0.0:81 ==="
         target='0.0.0.0:81:81';   want='0\.0\.0\.0:81:81'
     fi
-    local paths=(/opt/apps/dockhand-stack /opt/dockhand-stack /opt/portainer-stack /opt/dockge-stack /opt/cosmos-stack /opt/coolify-stack /opt/dokploy-stack /opt/casaos-stack /opt/runtipi-stack /opt/yunohost-stack /opt/freedombox-stack /opt/npm /root/npm /home/*/npm /opt/nginx-proxy-manager)
+    local paths=(/opt/apps/arcane-stack /opt/apps/dockhand-stack /opt/dockhand-stack /opt/portainer-stack /opt/dockge-stack /opt/cosmos-stack /opt/coolify-stack /opt/dokploy-stack /opt/casaos-stack /opt/runtipi-stack /opt/yunohost-stack /opt/freedombox-stack /opt/npm /root/npm /home/*/npm /opt/nginx-proxy-manager)
     [[ -n "${NPM_DIR:-}" ]] && paths=("$NPM_DIR" "${paths[@]}")
     local found=0 p dcf
     for p in "${paths[@]}"; do
-        for dcf in "$p"/docker-compose.npm.yml "$p"/docker-compose.npm.yaml "$p"/docker-compose.yml "$p"/docker-compose.yaml; do
+        for dcf in "$p"/npm/compose.yaml "$p"/docker-compose.npm.yml "$p"/docker-compose.npm.yaml "$p"/docker-compose.yml "$p"/docker-compose.yaml; do
             [[ -f "$dcf" ]] || continue
             # Only touch files that actually publish NPM's admin port 81.
             grep -qE '(^|[^0-9])81:81([^0-9]|$)' "$dcf" 2>/dev/null || continue

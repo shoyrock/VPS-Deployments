@@ -61,7 +61,7 @@ for c in npm "$APP" authentik-server authentik-worker authentik-postgres crowdse
   else fail "container $c NOT running"; fi
 done
 # CrowdSec Web UI is optional/removable: only check when its compose file exists.
-if [[ -f "${STACK_DIR}/docker-compose.crowdsec-webui.yml" ]]; then
+if [[ -f "${STACK_DIR}/docker-compose.crowdsec-webui.yml" || -f "${STACK_DIR}/crowdsec-webui/compose.yaml" ]]; then
   docker ps --format '{{.Names}}' 2>/dev/null | grep -qx crowdsec-web-ui && pass "container crowdsec-web-ui running" || warn "container crowdsec-web-ui NOT running (removed? see README to reinstall)"
 fi
 
