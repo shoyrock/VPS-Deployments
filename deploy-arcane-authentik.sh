@@ -616,23 +616,34 @@ setup_arcane() {
   # 2FA gates all access and the :ro mount removes the easiest abuse path.
   # If you genuinely need write access to host files from the Arcane UI,
   # change "/:/host:ro" to "/:/host" below and re-run:
-  #   docker compose -p arcane -f /opt/apps/arcane-stack/docker-compose.arcane.yml up -d --force-recreate
+  #   docker compose -p arcane -f /opt/apps/arcane-stack/arcane/compose.yaml up -d --force-recreate
   #
-  # /opt/apps mount (identical path, RW): EVERYTHING lives under /opt/apps now -
-  # the infra stacks at ${STACK_DIR} (= /opt/apps/arcane-stack) and host-deployed
-  # APP stacks at /opt/apps/<app>/. Their compose-project labels point at those
-  # HOST paths; Arcane's HostPath resolver can only reach them WRITABLY if
-  # /opt/apps is bind-mounted at the IDENTICAL path. Without it the stacks show
-  # UNTAGGED (see-but-not-edit via the read-only /host mount) and can't be adopted.
-  # With it, every stack under /opt/apps is editable + adoptable. docker.sock
-  # already makes Arcane root-equivalent, so this opens no new attack path.
+  # UI-MANAGEABLE STACKS (Arcane "Projects"). Three things must all hold or Arcane
+  # can see the containers but can NOT edit / redeploy / update them:
+  #   1. PROJECTS_DIRECTORY=/opt/apps, bind-mounted at the IDENTICAL host path (so
+  #      relative volume paths in the compose files resolve the same for Arcane
+  #      and for Docker). Every stack under /opt/apps - the infra projects below
+  #      AND your own /opt/apps/<app>/compose.yaml - is then a first-class project.
+  #   2. One folder per project holding a standard-named compose file
+  #      (${STACK_DIR}/npm/compose.yaml, crowdsec/, authentik/, arcane/,
+  #      crowdsec-webui/). Arcane discovers projects by scanning folders; several
+  #      custom-named *.yml in ONE folder are reported "ambiguous" and skipped.
+  #      Folder name == compose project name (-p) so Arcane adopts the running
+  #      containers instead of creating duplicates.
+  #   3. PUID=0 / PGID=0. Arcane runs as uid 65532 by default; ${STACK_DIR} is a
+  #      root-owned 750 dir and the env files are 600, so Arcane logged
+  #      "Skipping unreadable project directory during discovery" and the UI
+  #      showed nothing editable (updates of authentik/arcane/crowdsec-webui -
+  #      the ones with env_file - failed outright). Running Arcane as root in
+  #      its container is no new privilege: docker.sock already is root.
 
   # Arcane secrets: 32-byte ENCRYPTION_KEY + JWT_SECRET (both REQUIRED by Arcane).
   # Written to a locked-down env file so they never sit in the world-readable
   # compose YAML. Regenerated only if not already provided via the environment.
   ARCANE_ENCRYPTION_KEY="${ARCANE_ENCRYPTION_KEY:-$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
   ARCANE_JWT_SECRET="${ARCANE_JWT_SECRET:-$(rand_secret)}"
-  ( umask 077; cat > "${STACK_DIR}/.arcane.env" << EOF
+  mkdir -p "${STACK_DIR}/arcane"
+  ( umask 077; cat > "${STACK_DIR}/arcane/.arcane.env" << EOF
 ENVIRONMENT=production
 GIN_MODE=release
 PORT=3552
@@ -641,23 +652,30 @@ ENCRYPTION_KEY=${ARCANE_ENCRYPTION_KEY}
 JWT_SECRET=${ARCANE_JWT_SECRET}
 EOF
   )
-  chmod 600 "${STACK_DIR}/.arcane.env" 2>/dev/null || true
+  chmod 600 "${STACK_DIR}/arcane/.arcane.env" 2>/dev/null || true
 
-  cat > "${STACK_DIR}/docker-compose.arcane.yml" << 'COMPOSE_ARCANE'
+  cat > "${STACK_DIR}/arcane/compose.yaml" << 'COMPOSE_ARCANE'
 services:
   arcane:
     image: ghcr.io/getarcaneapp/manager:latest
     container_name: arcane
     hostname: arcane
     restart: unless-stopped
+    cgroup: host
     security_opt:
       - no-new-privileges:true
     env_file:
       - .arcane.env
+    environment:
+      # See the comment above: without these three, Arcane cannot read/edit the
+      # stacks under /opt/apps (it drops to uid 65532 and the dirs are root 750).
+      - PUID=0
+      - PGID=0
+      - PROJECTS_DIRECTORY=/opt/apps
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /opt/apps:/opt/apps
-      - ./arcane-data:/app/data
+      - ../arcane-data:/app/data
       - /:/host:ro
     networks:
       - proxy
@@ -667,8 +685,8 @@ networks:
 COMPOSE_ARCANE
 
   info "Pulling Arcane image..."
-  docker compose -p arcane -f "${STACK_DIR}/docker-compose.arcane.yml" pull
-  docker compose -p arcane -f "${STACK_DIR}/docker-compose.arcane.yml" up -d --force-recreate
+  docker compose -p arcane -f "${STACK_DIR}/arcane/compose.yaml" pull
+  docker compose -p arcane -f "${STACK_DIR}/arcane/compose.yaml" up -d --force-recreate
 
   info "Waiting for Arcane to be ready..."
   for i in $(seq 1 30); do
@@ -697,7 +715,8 @@ setup_stack() {
            "$AUTHENTIK_DIR" "$AUTHENTIK_MEDIA_DIR" "$AUTHENTIK_TEMPLATES_DIR" \
            "$AUTHENTIK_BLUEPRINTS_DIR" "$AUTHENTIK_CERTS_DIR" "$AUTHENTIK_SNIPPETS_DIR"
 
-  cat > "${STACK_DIR}/docker-compose.authentik.yml" << 'COMPOSE_AUTHENTIK'
+  mkdir -p "$AUTHENTIK_DIR"
+  cat > "${AUTHENTIK_DIR}/compose.yaml" << 'COMPOSE_AUTHENTIK'
 services:
   authentik-postgres:
     image: postgres:16-alpine
@@ -709,9 +728,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    env_file: ./authentik/authentik.env
+    env_file: ./authentik.env
     volumes:
-      - ./authentik/postgres:/var/lib/postgresql/data
+      - ./postgres:/var/lib/postgresql/data
     networks:
       - proxy
   # NOTE: authentik 2025.x+ removed the external Redis dependency (task queue moved
@@ -723,14 +742,14 @@ services:
     hostname: authentik-server
     restart: unless-stopped
     command: server
-    env_file: ./authentik/authentik.env
+    env_file: ./authentik.env
     ports:
       - "127.0.0.1:9000:9000"
     volumes:
-      - ./authentik/media:/media
-      - ./authentik/templates:/templates
-      - ./authentik/blueprints:/blueprints/custom
-      - ./authentik/certs:/certs
+      - ./media:/media
+      - ./templates:/templates
+      - ./blueprints:/blueprints/custom
+      - ./certs:/certs
     depends_on:
       authentik-postgres:
         condition: service_healthy
@@ -742,17 +761,17 @@ services:
     hostname: authentik-worker
     restart: unless-stopped
     command: worker
-    env_file: ./authentik/authentik.env
+    env_file: ./authentik.env
     user: root
     volumes:
       # docker.sock intentionally NOT mounted. The worker only needs it for the Docker
       # OUTPOST controller, which this stack does not use (embedded outpost runs inside
       # authentik-server). Dropping it removes root-equivalent host access from the
       # worker -- one less thing an attacker can pivot through.
-      - ./authentik/media:/media
-      - ./authentik/templates:/templates
-      - ./authentik/blueprints:/blueprints/custom
-      - ./authentik/certs:/certs
+      - ./media:/media
+      - ./templates:/templates
+      - ./blueprints:/blueprints/custom
+      - ./certs:/certs
     depends_on:
       authentik-postgres:
         condition: service_healthy
@@ -763,7 +782,8 @@ networks:
     external: true
 COMPOSE_AUTHENTIK
 
-  cat > "${STACK_DIR}/docker-compose.npm.yml" << 'COMPOSE_NPM'
+  mkdir -p "${STACK_DIR}/npm"
+  cat > "${STACK_DIR}/npm/compose.yaml" << 'COMPOSE_NPM'
 services:
   npm:
     image: jc21/nginx-proxy-manager:latest
@@ -778,8 +798,8 @@ services:
       # to be opened in the cloud firewall. The deploy's own API calls use 127.0.0.1:81.
       - 127.0.0.1:81:81
     volumes:
-      - ./data:/data
-      - ./letsencrypt:/etc/letsencrypt
+      - ../data:/data
+      - ../letsencrypt:/etc/letsencrypt
     networks:
       - proxy
 networks:
@@ -788,7 +808,7 @@ networks:
 COMPOSE_NPM
 
 
-  cat > "${STACK_DIR}/docker-compose.crowdsec.yml" << COMPOSE_CROWDSEC
+  cat > "${CROWDSEC_DIR}/compose.yaml" << COMPOSE_CROWDSEC
 services:
   crowdsec:
     image: crowdsecurity/crowdsec:latest
@@ -798,9 +818,9 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
-      - ./crowdsec/data:/var/lib/crowdsec/data
-      - ./crowdsec/config:/etc/crowdsec
-      - ./data/logs:/npm-logs:ro
+      - ./data:/var/lib/crowdsec/data
+      - ./config:/etc/crowdsec
+      - ../data/logs:/npm-logs:ro
       - /var/log:/var/log:ro
     environment:
       # http-cve adds known-CVE exploit-probing detection (Log4j etc). The base
@@ -837,11 +857,11 @@ COMPOSE_CROWDSEC
 
 
   info "Pulling images..."
-  docker compose -p npm -f "${STACK_DIR}/docker-compose.npm.yml" pull
-  docker compose -p crowdsec -f "${STACK_DIR}/docker-compose.crowdsec.yml" pull
+  docker compose -p npm -f "${STACK_DIR}/npm/compose.yaml" pull
+  docker compose -p crowdsec -f "${CROWDSEC_DIR}/compose.yaml" pull
 
   info "Starting NPM..."
-  docker compose -p npm -f "${STACK_DIR}/docker-compose.npm.yml" up -d
+  docker compose -p npm -f "${STACK_DIR}/npm/compose.yaml" up -d
   for i in $(seq 1 30); do
     local has_80=false has_443=false has_81=false
     ss -tlnp 2>/dev/null | grep -q ':80[[:space:]]' && has_80=true
@@ -864,8 +884,8 @@ COMPOSE_CROWDSEC
   info "Deploying Authentik (postgres + server + worker)..."
   gen_authentik_files
   setup_authentik_snippets      # write nginx forward-auth snippets into NPM custom dir
-  docker compose -p authentik -f "${STACK_DIR}/docker-compose.authentik.yml" pull
-  docker compose -p authentik -f "${STACK_DIR}/docker-compose.authentik.yml" up -d
+  docker compose -p authentik -f "${AUTHENTIK_DIR}/compose.yaml" pull
+  docker compose -p authentik -f "${AUTHENTIK_DIR}/compose.yaml" up -d
   info "Waiting for Authentik server (first boot runs migrations - up to ~3 min)..."
   # Probe from the HOST against the published API port (127.0.0.1:9000). The
   # goauthentik image ships NO curl, so 'docker exec ... curl' always failed in
@@ -921,7 +941,7 @@ COMPOSE_CROWDSEC
   printf "\r" >&2
 
   info "Starting CrowdSec..."
-  docker compose -p crowdsec -f "${STACK_DIR}/docker-compose.crowdsec.yml" up -d crowdsec
+  docker compose -p crowdsec -f "${CROWDSEC_DIR}/compose.yaml" up -d crowdsec
   for i in $(seq 1 30); do
     docker ps --format '{{.Names}}' | grep -qx "crowdsec" && { success "CrowdSec container running"; break; }
     printf "${C_DIM}  Waiting for CrowdSec container... (%d/30)${C_R}\r" "$i" >&2
@@ -1557,28 +1577,17 @@ SNIPPET
 }
 
 register_arcane_stacks() {
-  step "Registering editable stacks in Arcane"
-  info "Creating combined compose files in Arcane data directory..."
-
-  # Combine all compose files into one for easy editing
-  {
-    echo "# Combined stack - NPM + Authentik + CrowdSec"
-    echo "# Edit this file and run: docker compose -f ${STACK_DIR}/docker-compose.yml up -d"
-    echo ""
-    cat "${STACK_DIR}/docker-compose.npm.yml" 2>/dev/null || true
-    echo ""
-    # Extract the services from authentik compose (remove networks: section to avoid duplicates)
-    sed '1,/^services:/b;/^networks:/,$d' "${STACK_DIR}/docker-compose.authentik.yml" 2>/dev/null || true
-    echo ""
-    sed '1,/^services:/b;/^networks:/,$d' "${STACK_DIR}/docker-compose.crowdsec.yml" 2>/dev/null || true
-  } > "${ARCANE_DATA_DIR}/infrastructure.yml" 2>/dev/null || true
-
-  # Also copy individual compose files for reference
-  cp "${STACK_DIR}/docker-compose.npm.yml" "${ARCANE_DATA_DIR}/npm.yml" 2>/dev/null || true
-  cp "${STACK_DIR}/docker-compose.authentik.yml" "${ARCANE_DATA_DIR}/authentik.yml" 2>/dev/null || true
-  cp "${STACK_DIR}/docker-compose.crowdsec.yml" "${ARCANE_DATA_DIR}/crowdsec.yml" 2>/dev/null || true
-
-  success "Compose files available in Arcane file browser: ${ARCANE_DATA_DIR}"
+  step "Registering infra stacks as Arcane projects"
+  # Nothing to copy: each infra stack already lives in its own project folder
+  # under ${STACK_DIR} (= PROJECTS_DIRECTORY/arcane-stack), which Arcane scans.
+  # Edit / redeploy / update them from Arcane -> Projects, or from the CLI:
+  #   docker compose -p npm -f ${STACK_DIR}/npm/compose.yaml pull && ... up -d
+  local d
+  for d in npm crowdsec authentik arcane crowdsec-webui; do
+    [[ -f "${STACK_DIR}/${d}/compose.yaml" ]] && info "  project ${d}: ${STACK_DIR}/${d}/compose.yaml" || true
+  done
+  info "Your own stacks go in /opt/apps/<app>/compose.yaml - Arcane picks them up automatically."
+  success "Infra stacks are Arcane projects (Projects page: npm, crowdsec, authentik, arcane, crowdsec-webui)"
 }
 
 npm_purge_proxy_hosts() {
@@ -2030,7 +2039,7 @@ setup_cloudflare_bouncer() {
   # Drop the env line, recreate crowdsec, then delete the registration from
   # LAPI. A later re-run of this deploy re-adds both.
   _worker_lapi_clean() {
-    local cyml="${STACK_DIR}/docker-compose.crowdsec.yml" i
+    local cyml="${CROWDSEC_DIR}/compose.yaml" i
     if [[ -f "$cyml" ]] && grep -q 'BOUNCER_KEY_cloudflarebouncer' "$cyml"; then
       sed -i '/# Pre-register the Cloudflare Worker bouncer/,+1d;/BOUNCER_KEY_cloudflarebouncer/d' "$cyml"
       docker compose -p crowdsec -f "$cyml" up -d >>"$LOG_FILE" 2>&1 || true
@@ -2698,7 +2707,7 @@ for c in npm arcane authentik-server authentik-worker authentik-postgres crowdse
   if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$c"; then pass "container $c running"; else fail "container $c NOT running"; fi
 done
 # CrowdSec Web UI is optional/removable: only check when its compose file exists.
-if [[ -f "${STACK_DIR}/docker-compose.crowdsec-webui.yml" ]]; then
+if [[ -f "${STACK_DIR}/crowdsec-webui/compose.yaml" ]]; then
   docker ps --format '{{.Names}}' 2>/dev/null | grep -qx crowdsec-web-ui && pass "container crowdsec-web-ui running" || warn "container crowdsec-web-ui NOT running (removed? see README to reinstall)"
 fi
 hdr "Service health"
@@ -2879,7 +2888,8 @@ ${C_B}${C_YEL}Credential files (root-only, mode 600):${C_R}
 ${C_B}Troubleshooting:${C_R}
   Verify:  sudo bash ${STACK_DIR}/verify-stack.sh   (re-runnable health + security audit)
   Logs:    docker logs -f npm    docker logs -f arcane    docker logs -f authentik-server
-  Restart: docker compose -p npm -f ${STACK_DIR}/docker-compose.npm.yml restart   (per-stack project: -p npm|crowdsec|authentik|arcane)
+  Restart: docker compose -p npm -f ${STACK_DIR}/npm/compose.yaml restart   (one folder per project: npm|crowdsec|authentik|arcane|crowdsec-webui)
+  Update:  Arcane -> Projects (all infra stacks are editable/updatable there), or: docker compose -p npm -f ${STACK_DIR}/npm/compose.yaml pull && ... up -d
   FW:      ${fw_cmd}
   CrowdSec: docker exec crowdsec cscli metrics   docker exec crowdsec cscli alerts list
   Log:     ${LOG_FILE}
@@ -2917,9 +2927,9 @@ ensure_ip_forwarding() {
 # reached through NPM at crowdsec.<domain>.
 #
 # CLEAN REMOVAL (nothing else depends on it):
-#   docker compose -p crowdsec-webui -f <STACK_DIR>/docker-compose.crowdsec-webui.yml down
+#   docker compose -p crowdsec-webui -f <STACK_DIR>/crowdsec-webui/compose.yaml down
 #   docker exec crowdsec cscli machines delete crowdsec-web-ui
-#   rm -rf <STACK_DIR>/crowdsec-webui <STACK_DIR>/docker-compose.crowdsec-webui.yml
+#   rm -rf <STACK_DIR>/crowdsec-webui
 #   ...then delete the crowdsec.<domain> proxy host in the NPM UI. Done.
 # Skip the install entirely with INSTALL_CROWDSEC_WEBUI=0.
 # -------------------------------------------------------------------------------
@@ -2945,7 +2955,7 @@ setup_crowdsec_webui() {
   if ! docker exec crowdsec cscli machines add crowdsec-web-ui --password "${ui_pass}" -f /dev/null &>/dev/null; then
     warn "Could not register the Web UI machine with the CrowdSec LAPI — skipping."
     warn "  Manual fix: docker exec crowdsec cscli machines add crowdsec-web-ui --password '<pw>' -f /dev/null"
-    warn "  then put that password in ${ui_dir}/webui.env and re-run: docker compose -p crowdsec-webui -f ${STACK_DIR}/docker-compose.crowdsec-webui.yml up -d"
+    warn "  then put that password in ${ui_dir}/webui.env and re-run: docker compose -p crowdsec-webui -f ${STACK_DIR}/crowdsec-webui/compose.yaml up -d"
     return 0
   fi
 
@@ -2962,7 +2972,7 @@ DB_DIR=/app/data
 WEBUI_ENV
   chmod 600 "${ui_dir}/webui.env"
 
-  cat > "${STACK_DIR}/docker-compose.crowdsec-webui.yml" << 'COMPOSE_WEBUI'
+  cat > "${ui_dir}/compose.yaml" << 'COMPOSE_WEBUI'
 services:
   crowdsec-web-ui:
     image: ghcr.io/theduffman85/crowdsec-web-ui:latest
@@ -2972,9 +2982,9 @@ services:
     security_opt:
       - no-new-privileges:true
     env_file:
-      - ./crowdsec-webui/webui.env
+      - ./webui.env
     volumes:
-      - ./crowdsec-webui/data:/app/data
+      - ./data:/app/data
     networks:
       - proxy
 networks:
@@ -2983,8 +2993,8 @@ networks:
 COMPOSE_WEBUI
 
   info "Pulling CrowdSec Web UI image..."
-  docker compose -p crowdsec-webui -f "${STACK_DIR}/docker-compose.crowdsec-webui.yml" pull >>"${LOG_FILE}" 2>&1 || true
-  if ! docker compose -p crowdsec-webui -f "${STACK_DIR}/docker-compose.crowdsec-webui.yml" up -d >>"${LOG_FILE}" 2>&1; then
+  docker compose -p crowdsec-webui -f "${STACK_DIR}/crowdsec-webui/compose.yaml" pull >>"${LOG_FILE}" 2>&1 || true
+  if ! docker compose -p crowdsec-webui -f "${STACK_DIR}/crowdsec-webui/compose.yaml" up -d >>"${LOG_FILE}" 2>&1; then
     warn "CrowdSec Web UI failed to start — check: docker logs crowdsec-web-ui"
     return 0
   fi

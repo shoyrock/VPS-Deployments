@@ -2,6 +2,18 @@
 
 ## v4.11.1 — CrowdSec Console enroll fix ported everywhere + repo self-test
 
+### deploy-arcane-authentik.sh — infra stacks are now real Arcane Projects
+- **Bug:** Arcane could list the containers but not edit/redeploy/update the npm/authentik/crowdsec/arcane/crowdsec-webui stacks. Reproduced against `ghcr.io/getarcaneapp/manager` v2.15.1: Arcane runs as uid 65532 (no `PUID`/`PGID` was set), `STACK_DIR` is root-owned `chmod 750`, env files are `600` → `WRN Skipping unreadable project directory during discovery path=/opt/apps/arcane-stack error="permission denied"`. On top of that, five custom-named `docker-compose.<x>.yml` in one folder are what Arcane's scanner calls *ambiguous* ("reported rather than guessed").
+- **Fix:** Arcane compose gets `PUID=0`, `PGID=0`, `PROJECTS_DIRECTORY=/opt/apps` (+ `cgroup: host` per upstream example); every infra stack moves to its own folder with a standard file: `${STACK_DIR}/npm/compose.yaml` (`../data`, `../letsencrypt`), `crowdsec/compose.yaml` (`./config`, `./data`, `../data/logs`), `authentik/compose.yaml` (`./authentik.env`, `./postgres`, …), `arcane/compose.yaml` (`./.arcane.env`, `../arcane-data`), `crowdsec-webui/compose.yaml` (`./webui.env`, `./data`). Folder name == `-p` project name, so Arcane adopts the running containers. Verified: `docker compose config` resolves every bind source to the same host paths as before, and Arcane logs `Discovered new project` for all five.
+- `register_arcane_stacks` no longer copies compose files into `arcane-data/` (those copies pointed at a non-existent `docker-compose.yml`, used relative paths that would have created empty data dirs, and clashed on `container_name`); it now just lists the project folders.
+- Summary/restart hints, worker-bouncer cleanup (`crowdsec/compose.yaml`), the embedded `verify-stack.sh` and the Web-UI removal notes all updated.
+
+### deploy-dockhand-authentik.sh / deploy-dockhand.sh / deploy-netbird.sh — Dockhand can edit the stacks
+- Dockhand's entrypoint drops to uid 1001 unless `PUID=0`; same root-owned-750 problem as above. All three now set `PUID=0`/`PGID=0`. `deploy-dockhand.sh` and `deploy-netbird.sh` additionally bind-mount the stack dir RW at the identical host path (`/opt/dockhand-stack`, `/opt/netbird-stack`) — the v4.9 "adoptable, not untagged" fix had only been applied to the authentik variant.
+
+### add-domain.sh / verify-stack.sh / harden.sh
+- Detect the per-project layout too (`<stack>/npm/compose.yaml`, `<stack>/crowdsec-webui/compose.yaml`); `harden.sh` also knows `/opt/apps/arcane-stack`.
+
 ### All 9 Authelia platform scripts + deploy-netbird.sh
 - **CrowdSec Console enrollment never worked** on these scripts: they still ran `cscli console enroll --auto` with no key (the v4.8.0 fix below was only applied to `deploy-dockhand-authentik.sh` / `deploy-arcane-authentik.sh`). Console enroll requires a per-account key, so this failed every time while the summary still read "enrolled in the Console". Ported the fixed flow: `CROWDSEC_ENROLL_KEY=<key>` enrolls automatically, otherwise the correct 3-step manual flow is printed (and the summary / "Done automatically" lines no longer claim enrollment).
 - Header env-var docs + README updated accordingly.

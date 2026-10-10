@@ -508,8 +508,19 @@ services:
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+    environment:
+      # Dockhand's entrypoint drops to uid 1001 unless PUID=0. The stack dir is a
+      # root-owned 750 directory (env/secret files 600), so as 1001 Dockhand can
+      # see the containers but cannot read/edit/redeploy their compose files.
+      # docker.sock already makes it root-equivalent; this adds no new privilege.
+      - PUID=0
+      - PGID=0
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # Stack dir mounted RW at the IDENTICAL host path: the compose-project labels
+      # on npm/authelia/crowdsec point here, and Dockhand can only edit/redeploy
+      # them (instead of showing them "untagged") when it reaches that same path.
+      - /opt/dockhand-stack:/opt/dockhand-stack
       - ./dockhand-data:/app/data
       - /:/host:ro
     networks:

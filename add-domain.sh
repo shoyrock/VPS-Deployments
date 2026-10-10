@@ -82,12 +82,12 @@ for b in jq curl docker; do command -v "$b" &>/dev/null || fatal "Missing depend
 
 # ---- locate the live stack -------------------------------------------------
 detect_stack() {
-  [[ -n "$STACK_DIR" && -f "$STACK_DIR/docker-compose.npm.yml" ]] && return 0
+  [[ -n "$STACK_DIR" && ( -f "$STACK_DIR/docker-compose.npm.yml" || -f "$STACK_DIR/npm/compose.yaml" ) ]] && return 0
   local d
-  for d in /opt/*-stack /opt/npm; do
-    [[ -f "$d/docker-compose.npm.yml" ]] && { STACK_DIR="$d"; return 0; }
+  for d in /opt/apps/*-stack /opt/*-stack /opt/npm; do
+    [[ -f "$d/docker-compose.npm.yml" || -f "$d/npm/compose.yaml" ]] && { STACK_DIR="$d"; return 0; }
   done
-  fatal "Could not find an NPM stack under /opt (looked for docker-compose.npm.yml). Pass --stack DIR."
+  fatal "Could not find an NPM stack under /opt (looked for docker-compose.npm.yml or npm/compose.yaml). Pass --stack DIR."
 }
 detect_stack
 AUTHELIA_CFG="${STACK_DIR}/authelia/config/configuration.yml"

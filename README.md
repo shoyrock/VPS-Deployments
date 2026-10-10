@@ -18,6 +18,12 @@ One-shot, hardened deployment scripts for fresh VPS instances. Every script depl
 
 ## What's New in v4.11.1
 
+- **Arcane / Dockhand could not edit, redeploy or update the infra stacks** (npm, authentik, crowdsec, …) from their UI. Root cause (reproduced against the real Arcane v2.15 image): both managers drop to a non-root uid (Arcane 65532, Dockhand 1001) while the stack dir is root-owned `750` with `600` env files, so they could see the containers but not read their compose files (Arcane logged `Skipping unreadable project directory during discovery … permission denied`). Fixes:
+  - `deploy-arcane-authentik.sh`: Arcane now runs with `PUID=0`/`PGID=0`, `PROJECTS_DIRECTORY=/opt/apps` (mounted at the identical path), and each infra stack lives in **its own project folder with a standard `compose.yaml`** — `/opt/apps/arcane-stack/{npm,crowdsec,authentik,arcane,crowdsec-webui}/compose.yaml` (folder name = compose project name, so Arcane adopts the running containers). Arcane's scanner treats several custom-named `*.yml` in one folder as *ambiguous* and skips them, which is why the old layout never showed up as projects. Your own stacks under `/opt/apps/<app>/compose.yaml` are picked up automatically.
+  - `deploy-dockhand-authentik.sh`, `deploy-dockhand.sh`, `deploy-netbird.sh`: Dockhand now runs with `PUID=0`/`PGID=0`; the two scripts that lacked it also get the stack dir bind-mounted RW at the identical host path (the v4.9 "adoptable, not untagged" fix was only in the authentik variant).
+  - The old "Registering editable stacks" step, which copied compose files into the manager's data dir with a header pointing at a file that never existed (and whose copies could not be run: relative paths + fixed `container_name`), is gone from the Arcane script.
+  - `add-domain.sh`, `verify-stack.sh`, `harden.sh` recognise the new `npm/compose.yaml` layout (and still the old flat one).
+  - Existing Arcane deployments: re-run the deploy on a fresh box, or migrate by hand — move each `docker-compose.<x>.yml` into `<x>/compose.yaml`, fix the relative volume paths (`./data` → `../data` for npm; `./crowdsec/…` → `./…`), add the three env vars to Arcane's compose, then `docker compose -p <x> -f <x>/compose.yaml up -d` for each.
 - **CrowdSec Console enrollment fixed on all non-Authentik scripts** (the 9 Authelia stacks + NetBird): they still ran the key-less `cscli console enroll --auto`, which the v4.8.0 notes already established *always* fails — so enrollment silently never happened while the summary claimed the instance was enrolled. They now use the same flow as the Authentik variants: pass `CROWDSEC_ENROLL_KEY=<key>` to enroll automatically, otherwise the correct 3-step manual flow is printed.
 - **`deploy-yunohost.sh` / `deploy-freedombox.sh`** defined `setup_crowdsec_console` but never called it from `main()` — now wired in like the other scripts.
 - **`deploy-dokploy.sh`**: removed a dead `setup_portainer` leftover that referenced an undefined `PORTAINER_DIR`.
@@ -385,7 +391,7 @@ Every NPM-based deploy also installs **[CrowdSec Web UI](https://github.com/TheD
 
 ```bash
 cd /opt/apps/dockhand-stack    # or your platform's STACK_DIR
-docker compose -p crowdsec-webui -f docker-compose.crowdsec-webui.yml down
+docker compose -p crowdsec-webui -f docker-compose.crowdsec-webui.yml down   # arcane-authentik: -f crowdsec-webui/compose.yaml
 docker exec crowdsec cscli machines delete crowdsec-web-ui
 rm -rf crowdsec-webui docker-compose.crowdsec-webui.yml
 # finally: delete the crowdsec.<domain> proxy host in the NPM UI
@@ -500,7 +506,7 @@ Failures are non-fatal (warn level) with exact debug commands printed.
 Each stack directory contains:
 ```
 STACK_DIR/
-├── docker-compose.npm.yml
+├── docker-compose.npm.yml               (arcane-authentik: one folder per project instead — npm/, crowdsec/, authentik/, arcane/, crowdsec-webui/ each with compose.yaml — so Arcane manages them as Projects)
 ├── docker-compose.authelia.yml          (or docker-compose.authentik.yml)
 ├── docker-compose.crowdsec.yml
 ├── docker-compose.crowdsec-webui.yml    (CrowdSec dashboard — remove cleanly anytime)
@@ -567,7 +573,7 @@ STACK_DIR/
 
 ```bash
 cd /opt/<platform>-stack
-docker compose -f docker-compose.npm.yml restart
+docker compose -f docker-compose.npm.yml restart              # arcane-authentik: -p npm -f npm/compose.yaml
 docker compose -f docker-compose.authelia.yml restart       # or docker-compose.authentik.yml
 docker compose -f docker-compose.crowdsec.yml restart
 ```
