@@ -173,16 +173,28 @@ _on_exit() {
   printf "${C_B}  External: %s${C_R}\n" "$ext_ip"
   printf "${C_B}  Domain:   %s${C_R}\n" "${DOMAIN:-<not set>}"
   printf '%s\n' "${C_B}------------------------------------------------------------------------------${C_R}"
-  printf "${C_B}  ${C_RED}>> Use http:// (NOT https://) — SSL is not configured yet. See the SSL note below.${C_R}\n"
+  local _scheme="http"
+  if _is_hsts_tld "${DOMAIN:-}"; then
+    _scheme="https"
+    printf "${C_B}  ${C_RED}>> '.%s' is HSTS-preloaded: browsers only ever open https:// here. Hosts whose DNS already${C_R}\n" "${DOMAIN##*.}"
+    printf "${C_B}  ${C_RED}   pointed at this box got their cert now; the rest are issued automatically by${C_R}\n"
+    printf "${C_B}  ${C_RED}   vps-npm-ssl-retry.timer (every 10 min) once DNS resolves. See the SSL note below.${C_R}\n"
+  else
+    printf "${C_B}  ${C_RED}>> Hosts without a cert yet are reachable over http:// only; https:// comes up by itself${C_R}\n"
+    printf "${C_B}  ${C_RED}   once DNS points here (vps-npm-ssl-retry.timer, every 10 min). See the SSL note below.${C_R}\n"
+  fi
   if [[ "${EXPOSE_NPM_ADMIN:-1}" == "1" && -n "${DOMAIN:-}" ]]; then
-    printf "${C_B}  NPM Admin:     http://npm.%s   (turn ON NPM's 2FA — it's internet-facing)${C_R}\n" "$DOMAIN"
+    printf "${C_B}  NPM Admin:     %s://npm.%s   (turn ON NPM's 2FA — it's internet-facing)${C_R}\n" "$_scheme" "$DOMAIN"
   else
     printf "${C_B}  NPM Admin:     SSH tunnel: ssh -L 8181:127.0.0.1:81 ubuntu@%s -> http://localhost:8181${C_R}\n" "$ip"
   fi
+  if _is_hsts_tld "${DOMAIN:-}"; then
+    printf "${C_B}  NPM (fallback): ssh -L 8181:127.0.0.1:81 <user>@%s -> http://localhost:8181  (works before certs exist)${C_R}\n" "$ip"
+  fi
   printf "${C_B}  NPM Login:     %s / %s${C_R}\n" "${LETSENCRYPT_EMAIL:-admin@example.com}" "$npm_pass"
   if [[ "$DEPLOY_STATUS" == "success" ]]; then
-    printf "${C_B}  Dockhand:      http://dockhand.%s${C_R}\n" "$DOMAIN"
-    printf "${C_B}  Authentik:     http://authentik.%s${C_R}\n" "$DOMAIN"
+    printf "${C_B}  Dockhand:      %s://dockhand.%s${C_R}\n" "$_scheme" "$DOMAIN"
+    printf "${C_B}  Authentik:     %s://authentik.%s${C_R}\n" "$_scheme" "$DOMAIN"
     printf '%s\n' "${C_B}------------------------------------------------------------------------------${C_R}"
     printf "${C_B}${C_YEL}  Containers (hostname = container name, via NPM proxy network):${C_R}\n"
     printf "${C_B}    npm                  ->  ports 80, 443, 81 (admin)${C_R}\n"
@@ -197,7 +209,7 @@ _on_exit() {
     printf "${C_B}  ${C_RED}Change this password after first login!${C_R}\n"
     printf "\n"
     printf "${C_B}  ${C_YEL}-- First login / MFA (ENFORCED) --${C_R}\n"
-    printf "${C_B}  Browse to http://authentik.%s and log in as akadmin.${C_R}\n" "$DOMAIN"
+    printf "${C_B}  Browse to %s://authentik.%s and log in as akadmin.${C_R}\n" "$_scheme" "$DOMAIN"
     printf "${C_B}  MFA is ENFORCED: you are REQUIRED to enroll a TOTP authenticator on first\n"
     printf "  login (have your authenticator app ready). Applies to every user.${C_R}\n"
     if [[ -s "${AUTHENTIK_DIR}/.akadmin_recovery_url" ]]; then
@@ -206,11 +218,17 @@ _on_exit() {
     fi
     printf "\n"
     printf "${C_B}  ${C_YEL}-- HTTPS / SSL (read this) --${C_R}\n"
-    printf "${C_B}  Proxy hosts are ${C_RED}HTTP-only right now${C_R}${C_B} (no certificate). Your browser defaults\n"
-    printf "  to https, which will FAIL with no cert — so use ${C_RED}http://${C_R}${C_B} for every URL above\n"
-    printf "  until you add SSL. To enable HTTPS: open NPM admin -> the host -> SSL tab ->\n"
-    printf "  'Request a new SSL Certificate' (Let's Encrypt; DNS must point at this server,\n"
-    printf "  port 80 reachable). After that the host auto-redirects http -> https.${C_R}\n"
+    printf "${C_B}  Certs are issued via Let's Encrypt HTTP-01 for every host whose DNS already points\n"
+    printf "  at this server (port 80 reachable). Hosts whose DNS was not ready stay HTTP-only\n"
+    printf "  for now: ${C_YEL}vps-npm-ssl-retry.timer${C_R}${C_B} re-tries them every 10 min and attaches the cert\n"
+    printf "  (SSL forced) by itself - no UI steps. Status: journalctl -u vps-npm-ssl-retry,\n"
+    printf "  log /var/log/vps-npm-ssl-retry.log, or run: vps-npm-ssl-retry.sh -v\n"
+    if _is_hsts_tld "${DOMAIN:-}"; then
+      printf "  ${C_RED}'.%s' is HSTS-preloaded: a host without its cert cannot be opened in a browser at\n" "${DOMAIN##*.}"
+      printf "  all (no http://, no 'proceed anyway'). Point DNS, wait for the timer, then use https://.${C_R}\n"
+    else
+      printf "  Until then use http:// for that host; it auto-redirects to https once the cert lands.${C_R}\n"
+    fi
     printf "\n"
     printf "${C_B}  All credentials are stored (mode 600) under: %s${C_R}\n" "$STACK_DIR"
   fi
@@ -367,6 +385,10 @@ idempotent_cleanup() {
   rm -f /usr/local/bin/crowdsec-firewall-bouncer 2>/dev/null || true
   rm -f /etc/crowdsec/crowdsec-firewall-bouncer.yaml 2>/dev/null || true
   rm -rf /etc/crowdsec 2>/dev/null || true
+  # vps-npm-ssl-retry (cert auto-retry) from a prior run
+  systemctl disable --now vps-npm-ssl-retry.timer vps-npm-ssl-retry.service 2>/dev/null || true
+  rm -f /etc/systemd/system/vps-npm-ssl-retry.service /etc/systemd/system/vps-npm-ssl-retry.timer \
+        /usr/local/bin/vps-npm-ssl-retry.sh /etc/vps-npm-ssl-retry.conf 2>/dev/null || true
 
   # vps-blocklist (third-party blocklist refresher) from a prior run. Rules
   # must go before the sets - ipset refuses to destroy a set in use.
@@ -521,6 +543,28 @@ setup_docker_network() {
   success "Network 'proxy' ready"
 }
 
+# HSTS-preloaded TLDs (Google-owned: .dev/.app/.page/...) are hardcoded HTTPS-only in
+# every browser: http:// is rewritten to https:// before the request is sent AND a
+# certificate error cannot be bypassed. A host left HTTP-only (DNS not pointed yet)
+# is therefore unreachable in a browser until its cert is issued - which the
+# vps-npm-ssl-retry.timer does automatically (every 10 min) once DNS resolves.
+_is_hsts_tld() {
+  case ".${1##*.}" in
+    .dev|.app|.page|.foo|.zip|.mov|.new|.day|.boo|.rsvp|.meme|.dad|.phd|.esq|.prof|.how|.nexus|.channel|.search|.ing|.gle|.prod|.chrome|.google|.youtube|.android|.gmail|.play) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+_warn_hsts_tld() {
+  _is_hsts_tld "$DOMAIN" || return 0
+  warn "'.${DOMAIN##*.}' is an HSTS-preloaded TLD: browsers FORCE https:// and will NOT let you"
+  warn "  bypass a certificate error - so nothing is reachable in a browser until its"
+  warn "  Let's Encrypt cert exists. Point each subdomain (or a wildcard A record) at THIS"
+  warn "  server BEFORE/while this runs; certs issue via HTTP-01 (port 80) at deploy, and"
+  warn "  vps-npm-ssl-retry.timer keeps retrying every 10 min for any host whose DNS"
+  warn "  arrives later (log: /var/log/vps-npm-ssl-retry.log). Meanwhile reach NPM via"
+  warn "  SSH tunnel: ssh -L 8181:127.0.0.1:81 <user>@<vps>  ->  http://localhost:8181"
+}
+
 get_user_domain() {
   step "Domain Configuration"
   if [[ -f "${DOMAIN_PERSIST_FILE}" ]]; then
@@ -531,7 +575,7 @@ get_user_domain() {
       printf "${C_YEL}   Press ${C_B}Y${C_R}${C_YEL} + Enter to REUSE this domain${C_R}\n" >&2
       printf "${C_YEL}   Press ${C_B}N${C_R}${C_YEL} + Enter to enter a NEW domain${C_R}\n\n" >&2
       read -rp "Reuse '${existing_domain}'? [Y/n]: " use_existing
-      [[ "$use_existing" =~ ^[Nn]$ ]] || { DOMAIN="$existing_domain"; success "Domain set to: $DOMAIN"; return 0; }
+      [[ "$use_existing" =~ ^[Nn]$ ]] || { DOMAIN="$existing_domain"; success "Domain set to: $DOMAIN"; _warn_hsts_tld; return 0; }
       printf "\n${C_CYN}Switching to new domain entry...${C_R}\n" >&2
     fi
   fi
@@ -545,19 +589,7 @@ get_user_domain() {
   printf '%s' "$DOMAIN" > "${DOMAIN_PERSIST_FILE}" || warn "Could not persist domain to ${DOMAIN_PERSIST_FILE}"
   success "Domain set to: $DOMAIN"
 
-  # HSTS-preloaded TLDs (Google-owned: .dev/.app/.page/... ) are hardcoded HTTPS-only
-  # inside every browser - http:// is rewritten to https:// before the request is even
-  # sent, so there is NO http fallback. Tell the user SSL is mandatory here; the deploy
-  # auto-issues ONE wildcard cert (needs a Cloudflare token with Zone:DNS:Edit).
-  case ".${DOMAIN##*.}" in
-    .dev|.app|.page|.foo|.zip|.mov|.new|.day|.boo|.rsvp|.meme|.dad|.phd|.esq|.prof|.how|.nexus|.channel|.search|.ing|.gle|.prod)
-      warn "'.${DOMAIN##*.}' is an HSTS-preloaded TLD: browsers FORCE https:// (no http fallback)."
-      warn "  So HTTPS is REQUIRED here. This deploy auto-issues Let's Encrypt certs via HTTP-01"
-      warn "  (no DNS API needed) - just make sure each subdomain (or a wildcard A record) points"
-      warn "  at THIS server and port 80 is reachable. (Prefer one wildcard cert? re-run with"
-      warn "  SSL_WILDCARD=1 + a Cloudflare token that has Zone:DNS:Edit.)"
-      ;;
-  esac
+  _warn_hsts_tld
 }
 
 # Validate an email for Let's Encrypt: must look like a real address AND must NOT
@@ -2946,6 +2978,156 @@ ensure_ip_forwarding() {
 #   ...then delete the crowdsec.<domain> proxy host in the NPM UI. Done.
 # Skip the install entirely with INSTALL_CROWDSEC_WEBUI=0.
 # -------------------------------------------------------------------------------
+# -------------------------------------------------------------------------------
+# Auto-issue missing Let's Encrypt certs once DNS points here (vps-npm-ssl-retry).
+# At deploy time a cert can only be issued for hosts whose DNS already resolves.
+# Instead of leaving the rest HTTP-only "until you add SSL in the UI" (impossible
+# on HSTS-preloaded TLDs like .dev, and impossible for SSO-gated hosts whose
+# auth_request 302s the ACME challenge), a root systemd timer re-tries every
+# 10 minutes: lifts the gate for the issuance, attaches the cert with SSL forced,
+# restores the gate, and disables itself once every host has a certificate.
+# -------------------------------------------------------------------------------
+setup_ssl_retry() {
+  step "SSL auto-retry (vps-npm-ssl-retry.timer)"
+  if [[ "${NPM_SKIP_SSL:-0}" == "1" ]]; then
+    info "NPM_SKIP_SSL=1 - not installing the SSL auto-retry timer"
+    return 0
+  fi
+  cat > /usr/local/bin/vps-npm-ssl-retry.sh << 'SSL_RETRY'
+#!/usr/bin/env bash
+# vps-npm-ssl-retry.sh - issue the Let's Encrypt certificate for every NPM proxy
+# host that still has none, as soon as its DNS resolves. Installed by the VPS
+# deploy scripts and run by vps-npm-ssl-retry.timer every 10 minutes; disables
+# the timer itself once every host has a certificate. Safe to run by hand:
+#   sudo vps-npm-ssl-retry.sh            (add -v for per-host detail)
+#
+# Why: on HSTS-preloaded TLDs (.dev/.app/.page/...) browsers refuse plain http
+# AND refuse to bypass a certificate error, so a host left HTTP-only at deploy
+# time (DNS not pointed yet) is unreachable in a browser - and the SSO auth gate
+# on the app host 302s the ACME challenge, so a later manual cert request from
+# the NPM UI fails too. This script lifts the gate for the ~30s of issuance,
+# attaches the cert with SSL forced, and puts the gate back.
+set -uo pipefail
+CONF="${VPS_NPM_SSL_RETRY_CONF:-/etc/vps-npm-ssl-retry.conf}"
+LOG="${VPS_NPM_SSL_RETRY_LOG:-/var/log/vps-npm-ssl-retry.log}"
+# shellcheck source=/dev/null
+[[ -f "$CONF" ]] && . "$CONF"
+STACK_DIR="${STACK_DIR:-}"; NPM_API_BASE="${NPM_API_BASE:-http://127.0.0.1:81/api}"
+NPM_IDENTITY="${NPM_IDENTITY:-}"; NPM_PASSWORD_FILE="${NPM_PASSWORD_FILE:-${STACK_DIR}/.npm_admin_password}"
+VERBOSE=0; [[ "${1:-}" == "-v" ]] && VERBOSE=1
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; [[ $VERBOSE -eq 1 ]] && printf '%s\n' "$*"; return 0; }
+
+[[ -s "$NPM_PASSWORD_FILE" ]] || { log "no NPM password file at $NPM_PASSWORD_FILE - nothing to do"; exit 0; }
+pass=$(tr -d '\n' < "$NPM_PASSWORD_FILE")
+tok=""
+for id in "$NPM_IDENTITY" "$(cat /etc/vps-deploy-email 2>/dev/null)" "admin@example.com"; do
+  [[ -n "$id" ]] || continue
+  tok=$(curl -s --max-time 20 -H 'Content-Type: application/json' -X POST "${NPM_API_BASE}/tokens" \
+        -d "$(jq -nc --arg i "$id" --arg s "$pass" '{identity:$i,secret:$s}')" | jq -r '.token // empty' 2>/dev/null)
+  [[ -n "$tok" ]] && break
+done
+[[ -n "$tok" ]] || { log "NPM login failed (identity/password) - will retry next run"; exit 0; }
+api() { local p="$1"; shift; curl -s --max-time "${T:-60}" -H "Authorization: Bearer $tok" -H 'Content-Type: application/json' "${NPM_API_BASE}${p}" "$@"; }
+
+hosts=$(api /nginx/proxy-hosts) || hosts=""
+[[ -n "$hosts" ]] || { log "could not list proxy hosts"; exit 0; }
+certs=$(api /nginx/certificates) || certs="[]"
+pending=0; issued=0
+
+put_host() {  # put_host <host-json> <cert-id> <ssl-forced 0|1> <advanced_config>
+  local hj="$1" cid="$2" sslf="$3" adv="$4" body
+  body=$(jq -c --argjson cert "$cid" --argjson sslf "$sslf" --arg adv "$adv" '{
+    domain_names, forward_scheme, forward_host, forward_port,
+    access_list_id: (.access_list_id // 0),
+    certificate_id: (if $cert>0 then $cert else (.certificate_id // 0) end),
+    ssl_forced: ($sslf==1), caching_enabled: (.caching_enabled // false),
+    block_exploits: (.block_exploits // true), allow_websocket_upgrade: (.allow_websocket_upgrade // true),
+    http2_support: true, hsts_enabled: ($sslf==1), hsts_subdomains: false, advanced_config: $adv }' <<<"$hj")
+  [[ -n "$(api "/nginx/proxy-hosts/$(jq -r .id <<<"$hj")" -X PUT -d "$body" | jq -r '.id // empty')" ]]
+}
+
+while IFS= read -r hid; do
+  [[ -n "$hid" ]] || continue
+  hj=$(jq -c --argjson i "$hid" '.[] | select(.id==$i)' <<<"$hosts")
+  dn=$(jq -r '.domain_names[0] // empty' <<<"$hj"); [[ -n "$dn" ]] || continue
+  adv=$(jq -r '.advanced_config // ""' <<<"$hj")
+  if ! getent ahosts "$dn" >/dev/null 2>&1; then
+    log "$dn: no DNS record yet - skipped"; pending=$((pending+1)); continue
+  fi
+  # reuse an exact or wildcard Let's Encrypt cert if one already exists
+  parent="${dn#*.}"
+  cid=$(jq -r --arg d "$dn" --arg w "*.${parent}" \
+        '[.[]? | select(.provider=="letsencrypt") | select((.domain_names // [])==[$d] or ((.domain_names // []) | index($w))) | .id] | max // empty' <<<"$certs")
+  if [[ -z "$cid" ]]; then
+    # lift the SSO gate (auth_request 302s the ACME challenge) for the duration
+    if [[ -n "$adv" ]]; then
+      put_host "$hj" 0 0 "" || { log "$dn: could not lift the auth gate - skipped"; pending=$((pending+1)); continue; }
+    fi
+    # NPM 2.15+ rejects meta.letsencrypt_email / letsencrypt_agree ("must NOT have
+    # additional properties"); the account email comes from the logged-in user.
+    resp=$(T=240 api /nginx/certificates -X POST -d "$(jq -nc --arg d "$dn" \
+            '{provider:"letsencrypt", nice_name:$d, domain_names:[$d], meta:{dns_challenge:false}}')")
+    cid=$(jq -r '.id // empty' <<<"$resp" 2>/dev/null)
+    if [[ -z "$cid" ]]; then
+      [[ -n "$adv" ]] && put_host "$hj" 0 0 "$adv"
+      log "$dn: issuance failed ($(tr -d '\n' <<<"$resp" | cut -c1-160)) - gate restored, will retry"; pending=$((pending+1)); continue
+    fi
+    certs=$(api /nginx/certificates) || true
+  fi
+  if put_host "$hj" "$cid" 1 "$adv"; then
+    log "$dn: certificate $cid attached, SSL forced, gate restored"; issued=$((issued+1))
+  else
+    log "$dn: cert $cid issued but could not attach it - will retry"; pending=$((pending+1))
+  fi
+done < <(jq -r '.[] | select((.certificate_id // 0)==0) | .id' <<<"$hosts")
+
+if [[ $pending -eq 0 ]]; then
+  log "every proxy host has a certificate (issued now: $issued) - disabling vps-npm-ssl-retry.timer"
+  systemctl disable --now vps-npm-ssl-retry.timer >/dev/null 2>&1 || true
+else
+  log "$pending host(s) still without certificate (issued now: $issued) - next try in 10 min"
+fi
+exit 0
+SSL_RETRY
+  chmod 755 /usr/local/bin/vps-npm-ssl-retry.sh
+  ( umask 077; cat > /etc/vps-npm-ssl-retry.conf << SSL_RETRY_CONF
+STACK_DIR=${STACK_DIR}
+NPM_IDENTITY=${LETSENCRYPT_EMAIL}
+NPM_API_BASE=http://127.0.0.1:81/api
+SSL_RETRY_CONF
+  )
+  cat > /etc/systemd/system/vps-npm-ssl-retry.service << 'SSL_RETRY_SVC'
+[Unit]
+Description=Issue missing Let's Encrypt certs for NPM proxy hosts once DNS resolves
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vps-npm-ssl-retry.sh
+TimeoutStartSec=900
+SSL_RETRY_SVC
+  cat > /etc/systemd/system/vps-npm-ssl-retry.timer << 'SSL_RETRY_TIMER'
+[Unit]
+Description=Retry Let's Encrypt issuance for NPM hosts still without a certificate
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+SSL_RETRY_TIMER
+  systemctl daemon-reload 2>/dev/null || true
+  if systemctl enable --now vps-npm-ssl-retry.timer >>"$LOG_FILE" 2>&1; then
+    success "vps-npm-ssl-retry.timer active: hosts still HTTP-only get their cert automatically once DNS points here (every 10 min; log /var/log/vps-npm-ssl-retry.log)"
+  else
+    warn "Could not enable vps-npm-ssl-retry.timer - run /usr/local/bin/vps-npm-ssl-retry.sh -v by hand once DNS resolves"
+  fi
+}
+
 setup_crowdsec_webui() {
   step "CrowdSec Web UI (dashboard)"
   if [[ "${INSTALL_CROWDSEC_WEBUI:-1}" != "1" ]]; then
@@ -3072,6 +3254,7 @@ main() {
   setup_logrotate
   automate_npm
   setup_crowdsec_webui
+  setup_ssl_retry
   register_dockhand_stacks
   install_verify_script
   verify_deployment

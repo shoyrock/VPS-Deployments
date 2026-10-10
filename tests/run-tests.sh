@@ -119,6 +119,35 @@ fi
 rm -rf "$tmp"
 [[ -z "$bad" ]] && pass "Arcane project compose files valid" || fail "Arcane compose files:$bad"
 
+echo "== 4f. SSL: auto-retry timer installed everywhere, NPM 2.15+ cert payload, real LE account email"
+bad=""
+NPM_SCRIPTS="deploy-arcane-authentik.sh deploy-dockhand-authentik.sh deploy-dockhand.sh deploy-portainer.sh deploy-dockge.sh deploy-cosmos.sh deploy-coolify.sh deploy-dokploy.sh deploy-casaos.sh deploy-runtipi.sh deploy-yunohost.sh deploy-freedombox.sh"
+for f in $NPM_SCRIPTS; do
+  grep -q '^setup_ssl_retry() {' "$f" || bad="$bad $f(no-setup_ssl_retry)"
+  awk '/^main\(\) \{/,/^\}/' "$f" | grep -q '^  setup_ssl_retry$' || bad="$bad $f(not-called)"
+  grep -q 'vps-npm-ssl-retry.timer vps-npm-ssl-retry.service' "$f" || bad="$bad $f(no-cleanup)"
+  grep -q '^_is_hsts_tld() {' "$f" || bad="$bad $f(no-hsts-helper)"
+  # NPM 2.15+ rejects these meta fields: they must not appear in any API payload
+  grep -vE '^\s*#' "$f" | grep -q 'letsencrypt_email\|letsencrypt_agree' && bad="$bad $f(rejected-cert-meta)"
+  # the NPM admin must never be created as admin@example.com (LE refuses that account email)
+  grep -q 'email:"admin@example.com"' "$f" && bad="$bad $f(admin@example.com-admin)"
+done
+grep -vE '^\s*#' add-domain.sh | grep -q 'letsencrypt_email' && bad="$bad add-domain.sh(rejected-cert-meta)"
+# the embedded retry script must be identical in every script and pass bash -n + shellcheck
+tmp=$(mktemp -d); ref=""
+for f in $NPM_SCRIPTS; do
+  awk '/<< .SSL_RETRY.$/{g=1;next} /^SSL_RETRY$/{g=0} g' "$f" > "$tmp/$f.retry"
+  [[ -s "$tmp/$f.retry" ]] || { bad="$bad $f(empty-retry-script)"; continue; }
+  [[ -z "$ref" ]] && ref="$tmp/$f.retry"
+  cmp -s "$ref" "$tmp/$f.retry" || bad="$bad $f(retry-script-differs)"
+done
+if [[ -n "$ref" ]]; then
+  bash -n "$ref" 2>/dev/null || bad="$bad retry-script(syntax)"
+  shellcheck -S warning "$ref" >/dev/null 2>&1 || bad="$bad retry-script(shellcheck)"
+fi
+rm -rf "$tmp"
+[[ -z "$bad" ]] && pass "SSL auto-retry + NPM 2.15 payload + LE account email consistent" || fail "SSL:$bad"
+
 echo "== 5. deploy.sh CLI: unknown tool exits 1 and lists tools"
 out=$(cd "$WORK" && bash deploy.sh not-a-real-tool 2>&1); rc=$?
 if [[ $rc -eq 1 && "$out" == *"Unknown tool"* && "$out" == *"dockhand-authentik"* ]]; then

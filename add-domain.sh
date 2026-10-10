@@ -113,9 +113,16 @@ _npm_try_login() {
   [[ -n "$NPM_TOKEN" ]]
 }
 npm_login() {
-  local pf="${STACK_DIR}/.npm_admin_password" id="admin@example.com"
-  # 1. Saved password (default identity), then 2. the factory default.
-  if [[ -f "$pf" ]] && _npm_try_login "$id" "$(tr -d '\n' < "$pf")"; then return 0; fi
+  local pf="${STACK_DIR}/.npm_admin_password" id="admin@example.com" saved_id=""
+  # The deploy persists the admin's login email (it is also the Let's Encrypt account).
+  saved_id=$(tr -d '\n' < /etc/vps-deploy-email 2>/dev/null || true)
+  [[ -n "$saved_id" ]] && id="$saved_id"
+  # 1. Saved password with the persisted identity (then the old default identity),
+  #    then 2. the factory default.
+  if [[ -f "$pf" ]]; then
+    _npm_try_login "$id" "$(tr -d '\n' < "$pf")" && return 0
+    [[ "$id" != "admin@example.com" ]] && _npm_try_login "admin@example.com" "$(tr -d '\n' < "$pf")" && { id="admin@example.com"; return 0; }
+  fi
   if _npm_try_login "$id" "changeme"; then return 0; fi
   # 3. Saved/default rejected -> the admin changed the NPM login. Do NOT assume the
   #    defaults: prompt for the real credentials (or fail clearly if no TTY).
@@ -155,12 +162,21 @@ npm_enable_ssl() {  # <id> <fqdn>
   local id="$1" fqdn="$2" cur json resp cert
   cur=$(_npm_api "/nginx/proxy-hosts/${id}" 2>/dev/null | jq -r '.certificate_id // 0' 2>/dev/null || echo 0)
   if [[ "$cur" =~ ^[0-9]+$ && "$cur" -gt 0 ]]; then info "SSL already enabled on ${fqdn} (cert ${cur})"; return 0; fi
-  json=$(jq -nc --arg e "$EMAIL" --arg d "$fqdn" '{provider:"letsencrypt", nice_name:$d, domain_names:[$d],
-    meta:{letsencrypt_email:$e, letsencrypt_agree:true, dns_challenge:false}}')
+  # NPM 2.15+ rejects meta.letsencrypt_email/letsencrypt_agree (HTTP 400); the LE
+  # account email is the NPM admin's own email.
+  json=$(jq -nc --arg d "$fqdn" '{provider:"letsencrypt", nice_name:$d, domain_names:[$d], meta:{dns_challenge:false}}')
   info "Requesting Let's Encrypt cert for ${fqdn} (up to ~2 min; DNS must already point here)..."
   resp=$(_npm_api /nginx/certificates --max-time 180 -X POST -d "$json") || true
   cert=$(echo "$resp" | jq -r '.id // empty')
-  [[ -n "$cert" ]] || { warn "Cert issuance failed for ${fqdn} (DNS not pointed yet?). Host stays HTTP-only — add SSL in the NPM UI once DNS resolves."; return 1; }
+  [[ -n "$cert" ]] || {
+    warn "Cert issuance failed for ${fqdn} (DNS not pointed yet?). Host stays HTTP-only for now."
+    if [[ -f /etc/systemd/system/vps-npm-ssl-retry.timer ]]; then
+      systemctl enable --now vps-npm-ssl-retry.timer >/dev/null 2>&1 \
+        && info "vps-npm-ssl-retry.timer re-armed: the cert is issued automatically once DNS resolves" || true
+    else
+      warn "Add SSL in the NPM UI once DNS resolves (or re-run this script)."
+    fi
+    return 1; }
   json=$(jq -nc --argjson c "$cert" '{certificate_id:$c, ssl_forced:true, hsts_enabled:true, hsts_subdomains:false, http2_support:true}')
   resp=$(_npm_api "/nginx/proxy-hosts/${id}" -X PUT -d "$json") || true
   [[ -n "$(echo "$resp" | jq -r '.id // empty')" ]] \
